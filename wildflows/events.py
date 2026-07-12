@@ -1,0 +1,98 @@
+"""The single event vocabulary (design invariant 2).
+
+Every primitive execution is one event in ONE vocabulary; resume = replay this log
+against the expression tree. `seq` is assigned by the journal on append. All events
+share a header (run_id/epoch/node_id/kind + ts/seq) and discriminate on `kind`.
+"""
+from __future__ import annotations
+
+import time
+from typing import Annotated, Any, Literal, Union
+
+from pydantic import BaseModel, Field
+
+
+class _Header(BaseModel):
+    seq: int = -1  # assigned by the journal on append
+    ts: float = Field(default_factory=time.time)
+    run_id: str
+    epoch: int
+    node_id: str
+
+
+class Boundary(_Header):
+    """An epoch opened or closed: the re-entry + durability point."""
+
+    kind: Literal["boundary"] = "boundary"
+    phase: Literal["opened", "closed"]
+    expr: dict[str, Any] | None = None  # the admitted tree (on opened)
+    rails: dict[str, Any] | None = None
+    reason: str | None = None  # e.g. deadline / budget / done (on closed)
+
+
+class Dispatched(_Header):
+    """A do/combine/inplace/setup started."""
+
+    kind: Literal["dispatched"] = "dispatched"
+    rig: str | None = None
+    task: str | None = None
+    cmd: str | None = None
+    workdir: str | None = None
+
+
+class ResultEvent(_Header):
+    """A primitive produced output."""
+
+    kind: Literal["result"] = "result"
+    ok: bool
+    text: str = ""
+    files: list[str] = Field(default_factory=list)
+    exit_code: int | None = None
+
+
+class Integrated(_Header):
+    """The core applied+committed a result (mediation proof; core-only)."""
+
+    kind: Literal["integrated"] = "integrated"
+    commit: str
+    paths: list[str] = Field(default_factory=list)
+
+
+class Judged(_Header):
+    """A do-as-judge produced a verdict (co-exists with its raw `result`)."""
+
+    kind: Literal["judged"] = "judged"
+    verdict: str
+    ok: bool
+    target_node: str
+
+
+class Asked(_Header):
+    """An ask parked, awaiting the owner."""
+
+    kind: Literal["asked"] = "asked"
+    question: str
+    options: list[str] = Field(default_factory=list)
+
+
+class Answered(_Header):
+    """The owner answered (or the ask expired -> synthetic empty answer)."""
+
+    kind: Literal["answered"] = "answered"
+    answer: str
+    ok: bool
+
+
+Event = Annotated[
+    Union[Boundary, Dispatched, ResultEvent, Integrated, Judged, Asked, Answered],
+    Field(discriminator="kind"),
+]
+
+
+class _EventHolder(BaseModel):
+    event: Event
+
+
+def parse_event(data: dict[str, Any]) -> Event:
+    """Parse raw data (e.g. one ndjson line) into the discriminated Event union."""
+    return _EventHolder.model_validate({"event": data}).event
