@@ -1042,3 +1042,67 @@ than patching each row. Both are the transaction model of record — not a later
     It preflights every manifest path and verifies every raw blob before the first deletion.
     A post-crash parent-symlink substitution or corrupt late blob therefore halts without
     losing live pre-existing bytes or following a path into an external directory.
+
+### Hand-12 calls (from the pass-8 correctness review) — ONE RECOVERY TRANSACTION
+
+59. **One lease-recovery transaction (hand-12, structural spine).** The duplicated live-
+    failure and dead-attempt cleanup state machines are deleted. `WorkspaceEffects.recover_lease`
+    is the sole destructive recovery authority; live do/inplace failure, dispatched-only
+    restart, inactive-certificate recovery, and persistent-unclean resume all submit a
+    `RecoveryRequest`. Its explicit phases are: **validate every durable record and
+    provenance input → capture every destructible byte → append-only quarantine every
+    observed/certified tip → reverse intent/reset exact committed-or-unborn state/sweep →
+    restore the lease baseline → VERIFY COMPLETE POSTCONDITIONS → publish a recovery
+    receipt and settle lease/intent → let the engine publish the halt-clear/final Result**.
+    Engine-side lease/intent loads, reversal decisions, and alternate preserve/reset paths
+    are gone; non-destructive Git/path primitives remain shared helpers, not state machines.
+
+60. **End-state proof, not command success (B1).** Recovery verifies exact `HEAD == pre_head`
+    (or both unborn), byte-mode clean tracked/index status, an empty lease-scoped attempt
+    leak set (including created empty directories), and byte-equivalence of every modern
+    pre-existing baseline before it can settle or clear. A successful `reset --hard` whose
+    non-invertible smudge filter leaves tracked dirt therefore becomes a persistent
+    `workspace_unclean` halt. Legacy no-record recovery remains conservative/no-sweep and
+    cannot claim a baseline it never recorded; this exception is available only when the
+    dispatch explicitly lacks the modern required-lease marker.
+
+61. **Reversal alias and portable case policy (B2/H5).** Intent validation re-stats every
+    existing canonical target immediately before expected/pre-state classification. A
+    regular file with `st_nlink != 1` is byte-captured and raises `WorkspaceFault` before
+    any overwrite or unlink, so a post-intent alias can never retain unrecorded engine
+    bytes. Initial planning uses `(st_dev, st_ino)` identity for existing targets and an
+    NFC+casefold canonical key for all declarations. **Documented conservative deviation:**
+    case-canonical declaration collisions are rejected on every filesystem, not only after
+    proving the workdir case-insensitive. A reliable absent-name case-sensitivity probe
+    would itself mutate the unleased workspace and platform case/normalization rules are
+    not uniform; portable deterministic rejection is narrower and fail-safe.
+
+62. **Checked, byte-safe, object-format-aware Git reads (B3/H1/H4).** Every `rev-list` and
+    `diff-tree` receipt read is checked; launch, nonzero, and decode failures become
+    `WorkspaceFault` and enter the same recovery transaction, never an effectless or
+    ownership-empty success. All `-z` pathname plumbing runs in bytes mode. UTF-8 paths
+    retain their ordinary wire spelling; arbitrary POSIX bytes use an escaped reserved
+    base64 prefix (the prefix itself is escaped), consistently across leases, intents,
+    manifests, Results, and receipts. Repository object format is read with checked
+    `rev-parse --show-object-format`; null OID width and empty-tree OID are selected for
+    SHA-1 or SHA-256 rather than hard-coded to SHA-1.
+
+63. **Required modern leases and settle-before-clear (H2/H3).** New `Dispatched` events
+    carry `lease_required=True`; a missing current lease with neither a matching immutable
+    settled-lease certificate nor recovery receipt fails closed. No global schema integer
+    is needed: absence of the additive marker identifies the conservative legacy path.
+    After postcondition verification, recovery writes an integrity-bound, create-once
+    `recoveries/<attempt>.json` containing the complete lease and deterministic fail/retry
+    Result, then archives the signed lease and unlinks/fsyncs lease+intent, and only then
+    returns for Result publication. A settlement failure leaves the prior unclean marker;
+    death after settlement but before Result is completed from the retained receipt after
+    re-verifying final state. Recovery and settled-lease receipts are retained as immutable
+    settlement certificates; garbage collection is a separate future transaction. This
+    supersedes hand-11 entry 55's result-before-record-unlink ordering for recovery paths.
+
+64. **Uniform capture integrity (H6).** Baseline, failed-diff, quarantine, and intent-
+    reversal manifests all carry a canonical outer SHA-256 digest. One checked loader
+    validates manifest identity/path topology plus every file blob's size and SHA-256;
+    baseline restoration and public forensic round trips share it. Atomic publication
+    remains the torn-write defense; the digest/blob checks add post-publication corruption
+    detection. No pass-8 intended direction was otherwise changed.
