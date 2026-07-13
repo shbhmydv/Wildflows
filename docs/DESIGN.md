@@ -1124,3 +1124,24 @@ than patching each row. Both are the transaction model of record — not a later
     baseline restoration and public forensic round trips share it. Atomic publication
     remains the torn-write defense; the digest/blob checks add post-publication corruption
     detection. No pass-8 intended direction was otherwise changed.
+
+### Hand-13 calls (from the pass-9 correctness review) — CLOSE THE TWO TEARS
+
+65. **Per-path sweep proof (hand-13).** Every absent-prestate inplace target receives a
+    signed `IntentWrite.swept=True` update, fsynced immediately before the checked leak
+    unlink that covers that path. Restart accepts a disappeared started target only when
+    this per-path proof (or the legacy aggregate completed-sweep proof) is durable; an
+    unmarked disappearance remains the hidden-hard-link ambiguity and fails closed. Sweep
+    preparation revalidates target topology/link counts before publishing each proof, and
+    directory leak roots mark every intent target they contain. The aggregate `swept`
+    marker remains the all-path completion boundary, not the only redo classifier.
+
+66. **Required-record settlement before torn integration (hand-13).** A torn OK
+    `result` may reconstruct `pre_head..post_head`, but before publishing its recovered
+    `Integrated` it must validate the dispatch's required lease/intent records (or an
+    immutable settled/recovery replacement). It then publishes an integrity-bound,
+    create-once completion-settlement certificate containing those validated records and
+    settles the active records *before* `Integrated`. A crash during settlement or after
+    settlement but before integration reuses that certificate and safely redoes both;
+    missing marked records with no replacement raise `WorkspaceFault` and leave the epoch
+    open. This extends hand-12 H3's settle-before-publication rule to the success tear.

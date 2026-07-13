@@ -240,6 +240,14 @@ class Engine:
         if not receipt.commits or not active:
             self._recover_inactive_certificate(key, node.result_post_head)
             return False
+        try:
+            epoch, node_id = key
+            self.ws.settle_completed_attempt(
+                epoch, node_id, node.dispatch_count - 1, node.dispatched_pre_head,
+                lease_required=node.lease_required, intent_required=node.intent_required,
+            )
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, "result record settlement", fault, "retry")
         self.rec.record_integrated(key, receipt)
         return True
 
@@ -329,7 +337,6 @@ class Engine:
     def _exec_do(self, node: Do, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if self._recover_committed_attempt(key, floor):
-            self._settle(key)
             return ExecutionOutcome(key=key)
         attempt = self._proj.node(key).dispatch_count
         lease = self._open_lease_or_fail(key, floor, attempt)
@@ -435,7 +442,6 @@ class Engine:
     def _exec_inplace(self, node: Inplace, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if self._recover_committed_attempt(key, floor):
-            self._settle(key)
             return ExecutionOutcome(key=key)
         attempt = self._proj.node(key).dispatch_count
         lease = self._open_lease_or_fail(key, floor, attempt)

@@ -187,6 +187,19 @@ class RecoveryRecord(BaseModel):
     integrity: str | None = None
 
 
+class CompletionSettlement(BaseModel):
+    """Create-once proof that required records were validated before integration."""
+
+    epoch: int
+    node_id: str
+    attempt: int
+    pre_head: str | None
+    lease: LeaseRecord | None
+    intent: InplaceIntent | None
+    recovery_integrity: str | None = None
+    integrity: str | None = None
+
+
 @dataclass
 class Lease:
     """A node attempt's workspace lease: the shared workdir + its pre-run HEAD.
@@ -497,6 +510,84 @@ class WorkspaceEffects:
             except OSError as exc:
                 raise WorkspaceFault(f"record settlement failed for {path}: {exc}") from exc
 
+    def settle_completed_attempt(
+        self, epoch: int, node_id: str, attempt: int, expected_pre_head: str | None,
+        *, lease_required: bool, intent_required: bool,
+    ) -> None:
+        """Validate required records and durably begin settlement before integration.
+
+        The create-once certificate closes the settlement→Integrated crash window: it
+        retains the validated records while active-record unlink is redone idempotently.
+        """
+        settled = self._load_completion_settlement(epoch, node_id, attempt)
+        if settled is None:
+            recovery = self._load_recovery_record(epoch, node_id, attempt)
+            lease = self.load_lease_record(epoch, node_id, attempt)
+            if lease is None:
+                lease = self._load_settled_lease(
+                    epoch, node_id, attempt, expected_pre_head
+                )
+            if recovery is not None:
+                if recovery.lease.pre_head != expected_pre_head:
+                    raise WorkspaceFault(
+                        "recovery receipt contradicts dispatched provenance"
+                    )
+                lease = recovery.lease
+            if lease is None and lease_required:
+                raise WorkspaceFault("required modern lease record is missing")
+            if lease is not None and lease.pre_head != expected_pre_head:
+                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
+            intent = self.load_intent(epoch, node_id, attempt)
+            if intent is None and intent_required and recovery is None:
+                raise WorkspaceFault("required modern inplace intent record is missing")
+            settled = CompletionSettlement(
+                epoch=epoch, node_id=node_id, attempt=attempt,
+                pre_head=expected_pre_head, lease=lease, intent=intent,
+                recovery_integrity=None if recovery is None else recovery.integrity,
+            )
+            settled.integrity = self._record_integrity(settled)
+            self._publish_completion_settlement(settled)
+        if settled.pre_head != expected_pre_head:
+            raise WorkspaceFault("completion settlement contradicts dispatched provenance")
+        if lease_required and settled.lease is None:
+            raise WorkspaceFault("required modern lease settlement is missing")
+        if intent_required and settled.intent is None and settled.recovery_integrity is None:
+            raise WorkspaceFault("required modern inplace intent settlement is missing")
+        self.settle_records(epoch, node_id, attempt)
+
+    def _completion_settlement_path(self, epoch: int, node_id: str, attempt: int) -> Path:
+        return self._record_path("settlements", epoch, node_id, attempt)
+
+    def _load_completion_settlement(
+        self, epoch: int, node_id: str, attempt: int
+    ) -> CompletionSettlement | None:
+        path = self._completion_settlement_path(epoch, node_id, attempt)
+        if not os.path.lexists(path):
+            return None
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
+                raise WorkspaceFault(f"completion settlement is not a regular file: {path}")
+            record = CompletionSettlement.model_validate_json(path.read_bytes())
+            self._verify_record_integrity(record, path)
+            if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
+                raise WorkspaceFault(f"completion settlement identity mismatch: {path}")
+            return record
+        except WorkspaceFault:
+            raise
+        except (OSError, ValidationError) as exc:
+            raise WorkspaceFault(
+                f"completion settlement is unreadable or corrupt: {path}: {exc}"
+            ) from exc
+
+    def _publish_completion_settlement(self, record: CompletionSettlement) -> None:
+        path = self._completion_settlement_path(record.epoch, record.node_id, record.attempt)
+        prior = self._load_completion_settlement(record.epoch, record.node_id, record.attempt)
+        if prior is not None:
+            if prior != record:
+                raise WorkspaceFault(f"completion settlement collision: {path}")
+            return
+        self._fsync_json(path, record)
+
     @staticmethod
     def _lease_equivalent(left: LeaseRecord, right: LeaseRecord) -> bool:
         """Ignore publication time/path when the same attempt baseline was re-captured."""
@@ -520,9 +611,12 @@ class WorkspaceEffects:
         """
         epoch, node_id = request.node_key
         receipt = self._load_recovery_record(epoch, node_id, request.attempt)
+        settlement = self._load_completion_settlement(epoch, node_id, request.attempt)
+        if settlement is not None and settlement.pre_head != request.expected_pre_head:
+            raise WorkspaceFault("completion settlement contradicts dispatched provenance")
 
-        # Phase 1: validate every durable input before mutation.  A recovery receipt is a
-        # complete replacement for already-settled lease/intent records.
+        # Phase 1: validate every durable input before mutation.  Recovery/completion
+        # receipts replace records that their settlement already removed.
         lease = self.load_lease_record(epoch, node_id, request.attempt)
         if lease is None:
             lease = self._load_settled_lease(
@@ -535,7 +629,9 @@ class WorkspaceEffects:
             ):
                 raise WorkspaceFault("recovery receipt contradicts dispatched provenance")
             lease = receipt.lease
-        elif lease is None:
+        elif lease is None and settlement is not None:
+            lease = settlement.lease
+        if lease is None:
             if request.lease_required:
                 raise WorkspaceFault("required modern lease record is missing")
             lease = LeaseRecord(
@@ -546,7 +642,9 @@ class WorkspaceEffects:
         if lease.pre_head != request.expected_pre_head:
             raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
         intent = self.load_intent(epoch, node_id, request.attempt)
-        if intent is None and request.intent_required:
+        if intent is None and settlement is not None:
+            intent = settlement.intent
+        if intent is None and request.intent_required and receipt is None:
             raise WorkspaceFault("required modern inplace intent record is missing")
         if lease.baseline_manifest is not None:
             self._load_lease_baseline(lease.baseline_manifest, lease.baseline_digest)
