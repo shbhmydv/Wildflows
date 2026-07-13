@@ -512,11 +512,14 @@ class Engine:
         workdir = self.workdir.resolve()
         for edit in node.edits:
             resolved = self.ws.resolve_safe_path(edit.path)
-            canonical = resolved.relative_to(workdir).as_posix()
-            if canonical in resolved_paths:
-                raise ValueError(f"resolved target collision: {edit.path!r} -> {canonical!r}")
-            resolved_paths.add(canonical)
-            case_key = unicodedata.normalize("NFC", canonical).casefold()
+            canonical_fs = resolved.relative_to(workdir).as_posix()
+            if canonical_fs in resolved_paths:
+                raise ValueError(
+                    f"resolved target collision: {edit.path!r} -> {canonical_fs!r}"
+                )
+            resolved_paths.add(canonical_fs)
+            case_key = unicodedata.normalize("NFC", canonical_fs).casefold()
+            canonical = self.ws.encode_path(canonical_fs)
             if case_key in case_keys:
                 raise ValueError(
                     f"portable case-canonical target collision: {case_keys[case_key]!r} "
@@ -559,16 +562,16 @@ class Engine:
         root = self.workdir.resolve()
         created: set[str] = set()
         for write in writes:
-            parent = (root / write.path).parent
+            parent = (root / self.ws.decode_path(write.path)).parent
             while parent != root and not os.path.lexists(parent):
-                created.add(parent.relative_to(root).as_posix())
+                created.add(self.ws.encode_path(parent.relative_to(root).as_posix()))
                 parent = parent.parent
-        return sorted(created, key=lambda p: (len(Path(p).parts), p))
+        return sorted(created, key=lambda p: (len(Path(self.ws.decode_path(p)).parts), p))
 
     def _apply_inplace_writes(self, writes: list[IntentWrite]) -> None:
         """Write only canonical targets recorded in the durable intent."""
         for write in writes:
-            plain = self.workdir / write.path
+            plain = self.workdir / self.ws.decode_path(write.path)
             plain.parent.mkdir(parents=True, exist_ok=True)
             plain.write_text(write.content or "", encoding="utf-8")
 

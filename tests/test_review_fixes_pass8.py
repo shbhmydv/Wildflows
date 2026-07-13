@@ -318,6 +318,26 @@ def test_quarantine_capture_manifest_corruption_is_detected(tmp_path: Path) -> N
         WorkspaceEffects(workdir, run_dir).load_capture_manifest(manifest)
 
 
+def test_reserved_byte_path_prefix_roundtrips_inplace_recovery(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    literal = "@wildflows-bytes:literal"
+    tree = Inplace(edits=[Edit(path=literal, content="ENGINE")])
+
+    def die_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _exit_now)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_write) == 0
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert (workdir / literal).read_text(encoding="utf-8") == "ENGINE"
+    assert replay(run_dir).integrated[(0, "n0")] == [
+        "@wildflows-bytes:QHdpbGRmbG93cy1ieXRlczpsaXRlcmFs"
+    ]
+
+
 def test_non_utf8_receipt_certificate_detects_operator_revert(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)

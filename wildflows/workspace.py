@@ -241,6 +241,14 @@ class WorkspaceEffects:
         self.workdir = Path(workdir)
         self.run_dir = Path(run_dir)
 
+    @staticmethod
+    def encode_path(rel: str) -> str:
+        return _wire_path(os.fsencode(rel))
+
+    @staticmethod
+    def decode_path(wire: str) -> str:
+        return _fs_path(wire)
+
     def _work_path(self, wire: str) -> Path:
         return self.workdir / _fs_path(wire)
 
@@ -1293,15 +1301,16 @@ class WorkspaceEffects:
         """Commit ONLY the declared paths (an `inplace`), via a `--`-scoped pathspec so
         any pre-existing staged index is preserved. Git failures return
         status="failed"; nothing staged for our scope is a "noop". Never raises."""
-        add = self.git("add", "--", *declared)
+        pathspecs = [_fs_path(path) for path in declared]
+        add = self.git("add", "--", *pathspecs)
         if add.returncode != 0:
             return Integration("failed", stderr=add.stderr)
-        diff = self.git("diff", "--cached", "--quiet", "--", *declared)
+        diff = self.git("diff", "--cached", "--quiet", "--", *pathspecs)
         if diff.returncode == 0:
             return Integration("noop")
         if diff.returncode != 1:
             return Integration("failed", stderr=diff.stderr)
-        commit = self.git("commit", "-q", "-m", message, "--", *declared)
+        commit = self.git("commit", "-q", "-m", message, "--", *pathspecs)
         if commit.returncode != 0:
             return Integration("failed", stderr=commit.stderr)
         sha = self._cleanup_head()
