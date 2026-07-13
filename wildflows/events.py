@@ -62,6 +62,12 @@ class ResultEvent(_Header):
     text: str = ""
     files: list[str] = Field(default_factory=list)
     exit_code: int | None = None
+    # The SECOND durable boundary (hand-9, PROVENANCE-RANGE): the workdir HEAD at the
+    # moment the rig returned and this result was recorded (None on a pre-v1 line or an
+    # unborn repo). Resume reconstructs a torn receipt from EXACTLY `pre_head..post_head`,
+    # never `..HEAD`, so an operator commit made after process death is outside the range
+    # by construction and never misattributed to this attempt.
+    post_head: str | None = None
     # A loop's final result reuses this event but carries the last integrated
     # iteration's body artifact in text/files; the convergence/cap disposition rides
     # in this SEPARATE field so a downstream `combine` consumes the artifact, never the

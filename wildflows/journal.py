@@ -133,19 +133,20 @@ class Journal:
                 if i == last and not final_terminated:
                     break  # unterminated torn final record — drop it, no durable log
                 raise
-            # Recorded seq order must match physical record order — strictly increasing,
-            # no duplicates or reordering. The projection floors trust `seq`, so a
-            # reordered/duplicated stream (the parallel-writer corruption N2 warns of) is
-            # refused, not silently folded (hand-8). Gaps from a legitimately truncated
-            # tail are fine; an unassigned seq (< 0, only in hand-crafted pre-append
-            # lines) is exempt from the ordering check.
-            if event.seq >= 0:
-                if event.seq <= prev_seq:
-                    raise JournalCompatibilityError(
-                        f"journal seq {event.seq} at physical position {i} is not strictly "
-                        f"after {prev_seq}: reordered or duplicated stream"
-                    )
-                prev_seq = event.seq
+            # Recorded seq must be EXACTLY contiguous with physical record order: each seq
+            # is previous+1, starting at 0; negatives rejected (hand-9, SEQ+RECEIPT). Terra
+            # proved a torn TAIL cannot create a middle gap — after dropping the final
+            # partial record, the next append reuses `last_seq + 1` — so any gap can only
+            # hide a deleted/missing MIDDLE durability event. A reordered or duplicated
+            # stream (the parallel-writer corruption N2 warns of) is refused for the same
+            # reason: the projection floors trust `seq`.
+            expected = prev_seq + 1
+            if event.seq != expected:
+                raise JournalCompatibilityError(
+                    f"journal seq {event.seq} at physical position {i} is not contiguous "
+                    f"(expected {expected}): a gapped, reordered or duplicated stream"
+                )
+            prev_seq = event.seq
             j._events.append(event)
             raws.append(data)
             j.projection.apply(event)

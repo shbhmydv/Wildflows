@@ -14,6 +14,7 @@ failure) lives here and is superseded by discard-the-worktree once worktrees lan
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -75,14 +76,42 @@ class WorkspaceEffects:
 
     # -- lease ---------------------------------------------------------------
 
-    def open_lease(self, node_key: NodeKey) -> Lease:
-        """Begin a node attempt: snapshot pre-run HEAD (None on an unborn repo) and the
-        untracked+ignored file set, so failure cleanup can scope to this lease's leaks."""
+    def open_lease(self, node_key: NodeKey) -> Lease | None:
+        """Begin a node attempt, or REFUSE (None) on a dirty tracked/index worktree.
+
+        The clean-worktree precondition (hand-9, FAILURE-LEASE): a lease opens only when
+        the tracked + index state is clean (untracked files are allowed and snapshotted
+        per-file). This is the honest serial-M1 rule — it removes the reset-`--hard`
+        destruction class, because pre-existing tracked/staged user work can no longer
+        exist at open, so failure revert only ever undoes THIS attempt's own effects.
+        (M3 per-node worktree isolation makes the workdir engine-owned and retires this
+        precondition.) `preexisting` snapshots untracked+ignored PER FILE so an addition
+        under a pre-existing untracked directory is a distinct entry the sweep can detect.
+        """
+        if self.tracked_dirty():
+            return None
         return Lease(
             node_key=node_key,
             pre_head=self.head_commit(),
             preexisting=frozenset(self._untracked_ignored_paths()),
         )
+
+    def tracked_dirty(self) -> bool:
+        """True if the worktree has any uncommitted TRACKED or staged change (untracked
+        files excluded). The lease-open precondition."""
+        proc = self.git("status", "--porcelain", "--untracked-files=no")
+        return bool(proc.stdout.strip())
+
+    def clean_dispatched_residue(self) -> None:
+        """Clean a dead dispatched-only attempt's leftover DIRT before re-running (hand-9,
+        PROVENANCE-RANGE). Reverts uncommitted tracked changes to the CURRENT HEAD and
+        sweeps untracked/ignored leaks — but KEEPS committed history (`reset --hard HEAD`,
+        not `pre_head`): mid-rig checkpoint commits are accepted forensic residue (reachable
+        and identifiable via `pre_head` lineage), never reset away, since an operator commit
+        may sit above them. In the serial PoC the engine owns the workdir mid-run, so the
+        untracked leftovers ARE the dead attempt's; per-node worktrees (M3) retire this."""
+        self.git("reset", "--hard", "HEAD")
+        self._remove_leaks(self._untracked_ignored_paths())
 
     # -- do finalization -----------------------------------------------------
 
@@ -152,10 +181,12 @@ class WorkspaceEffects:
         return diff_path
 
     def _untracked_ignored_paths(self) -> list[str]:
-        """The untracked (`??`) and ignored (`!!`) paths git reports, EXCLUDING the
-        run_dir subtree. Untracked directories (incl a nested Git repo) appear as one
-        `dir/` entry — git does not recurse into them."""
-        status = self.git("status", "--ignored", "--porcelain", "-z")
+        """The untracked (`??`) and ignored (`!!`) paths git reports PER FILE
+        (`--untracked-files=all`), EXCLUDING the run_dir subtree, so an addition under a
+        pre-existing untracked directory is its own entry (hand-9, FAILURE-LEASE). A
+        nested Git repo still appears as ONE `dir/` entry — git never recurses into it —
+        and is walked/removed as a directory by the evidence/sweep helpers."""
+        status = self.git("status", "--ignored", "--porcelain", "-z", "--untracked-files=all")
         out: list[str] = []
         for entry in status.stdout.split("\0"):
             if not entry or entry[:2] not in ("??", "!!"):
@@ -182,8 +213,18 @@ class WorkspaceEffects:
 
     @staticmethod
     def _read_text(path: Path) -> str:
+        """Capture a leaked file's content, tolerating BINARY (hand-9, FAILURE-LEASE): a
+        decode failure records size + sha256 instead of raising, so no exception escapes
+        after `dispatched`. An unreadable path (permission/gone) is noted, not fatal."""
         try:
             return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                return "<binary or unreadable>"
+            digest = hashlib.sha256(data).hexdigest()
+            return f"<binary artifact: {len(data)} bytes, sha256={digest}>"
         except OSError:
             return "<binary or unreadable>"
 
@@ -210,13 +251,19 @@ class WorkspaceEffects:
             return False
         return resolved == run or resolved.is_relative_to(run) or run.is_relative_to(resolved)
 
-    def reconstruct_receipt(self, pre_head: str | None) -> IntegrationReceipt:
-        """The receipt for an attempt whose provenance anchor was `pre_head`: EVERY commit
-        in `pre_head..HEAD`, each with its paths. This is the resume recovery primitive —
-        the commits in that range are exactly the attempt's, so a crash anywhere in the
-        completion gap is reconstructed honestly (rig + core commits, and any revert the
-        range contains) instead of re-run (hand-8, RECEIPT-TEAR)."""
-        return IntegrationReceipt(commits=self._commit_receipts(pre_head, self.head_commit()))
+    def reconstruct_receipt(
+        self, pre_head: str | None, post_head: str | None
+    ) -> IntegrationReceipt:
+        """The receipt for an attempt bounded by its TWO durable heads: EVERY commit in
+        EXACTLY `pre_head..post_head`, each with its paths (hand-9, PROVENANCE-RANGE).
+
+        `post_head` is the workdir HEAD the attempt DURABLY recorded on its `result` — the
+        completion certificate. Reconstruction never uses live `HEAD`, so an operator commit
+        made after process death (above `post_head`) is outside the range by construction
+        and can never be misattributed to this attempt. Only a torn result-then-integrated
+        window (a durable result whose `integrated` was lost) is reconstructable; a
+        dispatched-only tail has no `post_head` and is re-run, not recovered."""
+        return IntegrationReceipt(commits=self._commit_receipts(pre_head, post_head))
 
     # -- inplace finalization ------------------------------------------------
 
@@ -235,6 +282,23 @@ class WorkspaceEffects:
             return Integration("failed", stderr=commit.stderr)
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         return Integration("committed", commit=sha, paths=list(declared))
+
+    def rollback_inplace(self, writes: list[tuple[str, str | None]]) -> None:
+        """Undo an inplace's partial writes on a failure AFTER the first write (a late
+        symlink rejection or a failed declared commit) — hand-9, INPLACE-TRANSACTIONAL.
+
+        `writes` is every path this inplace already wrote, in order, each with the content
+        that PRE-EXISTED (None if the file was created). Pre-existing files are restored to
+        that content; created files are deleted; then the declared paths are unstaged, so a
+        durable failed result leaves NO partial effect for a later node to claim."""
+        for rel, original in writes:
+            target = self.workdir / rel
+            if original is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_text(original, encoding="utf-8")
+        if writes:
+            self.git("reset", "-q", "--", *[rel for rel, _ in writes])
 
     # -- git plumbing --------------------------------------------------------
 
@@ -334,14 +398,21 @@ class CompletionRecorder:
         self.journal = journal
         self.run_id = run_id
 
-    def record_result(self, key: NodeKey, result: Result) -> None:
+    def record_result(
+        self, key: NodeKey, result: Result, post_head: str | None = None
+    ) -> None:
         """A terminal result with no integration (failure, effectless, or no-op)."""
-        self.journal.append(self._result_event(key, result))
+        self.journal.append(self._result_event(key, result, post_head=post_head))
 
-    def record_success(self, key: NodeKey, result: Result, receipt: IntegrationReceipt) -> None:
+    def record_success(
+        self, key: NodeKey, result: Result, receipt: IntegrationReceipt,
+        post_head: str | None = None,
+    ) -> None:
         """A successful result and, if it had a committed effect, its integrated receipt
-        (one event carrying every attributed commit) — result first, integrated second."""
-        self.journal.append(self._result_event(key, result))
+        (one event carrying every attributed commit) — result first, integrated second.
+        `post_head` is the workdir HEAD stamped on the result (the completion certificate
+        the torn-window receipt reconstruction is bounded by)."""
+        self.journal.append(self._result_event(key, result, post_head=post_head))
         if receipt.commits:
             epoch, node_id = key
             self.journal.append(Integrated(
@@ -365,11 +436,12 @@ class CompletionRecorder:
         self.journal.append(self._result_event(key, result, loop_status=loop_status))
 
     def _result_event(
-        self, key: NodeKey, result: Result, loop_status: str | None = None
+        self, key: NodeKey, result: Result, loop_status: str | None = None,
+        post_head: str | None = None,
     ) -> ResultEvent:
         epoch, node_id = key
         return ResultEvent(
             run_id=self.run_id, epoch=epoch, node_id=node_id,
             text=result.text, files=result.files, exit_code=result.exit_code,
-            outcome=result.outcome, loop_status=loop_status,
+            outcome=result.outcome, loop_status=loop_status, post_head=post_head,
         )

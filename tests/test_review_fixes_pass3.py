@@ -209,9 +209,10 @@ def test_compatibility_reader_folds_legacy_result_and_integrated_shapes() -> Non
     assert receipt.shas == ["deadbeef"] and receipt.paths == ["x.txt"]
 
 
-def test_reachable_marked_commit_still_reconciles(tmp_path: Path) -> None:
-    """The reachability fix must NOT break the legitimate commit-then-crash window: a
-    marked commit reachable from HEAD is still reconciled without re-running the rig."""
+def test_dispatched_only_reachable_commit_reruns_and_is_not_reconciled(tmp_path: Path) -> None:
+    """UPDATED to the hand-9 two-boundary contract (PROVENANCE-RANGE): a DISPATCHED-ONLY
+    tail — even with a reachable marked commit — has no completion certificate, so recovery
+    never blesses it as success. The node re-runs; the mid-rig commit is forensic residue."""
     workdir = tmp_path / "work"
     workdir.mkdir()
     _git_init(workdir)
@@ -230,5 +231,5 @@ def test_reachable_marked_commit_still_reconciles(tmp_path: Path) -> None:
     Engine(run_dir=run_dir, workdir=workdir, registry=RigRegistry({"c": rig2})).run_epoch(
         Do(task="work", rig=RigRef(name="c")), epoch=0
     )
-    assert rig2.calls == 0  # reconciled from the reachable marked commit
-    assert (0, "n0") in replay(run_dir).integrated
+    assert rig2.calls == 1  # no completion proof from a dispatched-only tail — it re-runs
+    assert (workdir / "c.txt").read_text() == "1"  # effect preserved (residue + rerun agree)

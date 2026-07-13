@@ -29,7 +29,7 @@ from wildflows.journal import Journal
 from wildflows.projection import ExecutionOutcome, Floor, RunProjection, replay
 from wildflows.result import CommitReceipt, IntegrationReceipt, Result
 from wildflows.rig import RigRegistry
-from wildflows.workspace import CompletionRecorder, WorkspaceEffects
+from wildflows.workspace import CompletionRecorder, Lease, WorkspaceEffects
 
 __all__ = ["Engine", "replay", "RunProjection"]
 
@@ -114,15 +114,18 @@ class Engine:
         not-yet-durable inner nodes. A fresh iteration (floor `None`) never resumes.
         """
         key = (epoch, node.node_id)
-        fresh = floor is None
         proj = self._proj
-        state = proj.node(key)
-        if not fresh and proj.has_result(key):
-            return ExecutionOutcome(key=key)  # the loop already produced its final result
-        resume_from = 0 if fresh else state.loop_iterations
-        partial_floor: Floor = -1 if fresh else state.loop_last_iter_seq
-        last_converged = False if fresh else state.loop_converged
-        last_body: Result | None = None if fresh else state.loop_last_body
+        lstate = proj.node(key)
+        # The loop's final result is durable for THIS invocation only if it was recorded
+        # within scope (result_seq > floor). A nested inner loop that produced a result in a
+        # PRIOR outer iteration (result_seq <= the resumed floor) is NOT done — it re-runs.
+        if floor is not None and lstate.result is not None and lstate.result_seq > floor:
+            return ExecutionOutcome(key=key)
+        # Floor-scoped resume: only loop_iters after `floor` belong to this invocation. A
+        # FRESH iteration (floor None) counts none and re-runs the whole body — a nested
+        # inner loop never treats a prior outer iteration's iters/result as its own
+        # (hand-9, LOOP-OUTCOME-TOTALITY nested-loop floor bug).
+        resume_from, partial_floor, last_converged, last_body = proj.loop_resume(key, floor)
 
         # A crash BETWEEN the last loop_iter and the loop's final ResultEvent must not
         # re-run a body that already converged or hit the cap: reconstruct from the
@@ -137,16 +140,21 @@ class Engine:
         for i in range(resume_from, node.cap):
             body_floor: Floor = partial_floor if i == resume_from else None
             outcome = self._exec(node.body, epoch, body_floor)
-            body_key = outcome.result_key()  # the body's declared outcome, by reference
+            # Admission's totality rule (finding 3a) guarantees the body's last positional
+            # child chain ends in a result-producing leaf, so `result_key()` is TOTAL and
+            # the body always has a journalled result — the loop_iter reference is never
+            # None on the live path (the None fallback in the projection is legacy-only).
+            body_key = outcome.result_key()
+            assert body_key is not None, "admission totality guarantees a resultful body"
             body_result = proj.result(body_key)
             if body_result is not None:
                 last_body = body_result
-            body_seq = proj.node(body_key).result_seq if body_key is not None else -1
+            body_seq = proj.node(body_key).result_seq
             converged = self.ws.run_predicate(self._until_cmd(node.until))
             self.journal.append(LoopIter(
                 run_id=self.run_id, epoch=epoch, node_id=node.node_id,
                 iteration=i, commit=self.ws.head_commit(), converged=converged,
-                body_result_seq=body_seq if body_seq >= 0 else None,
+                body_result_seq=body_seq,
             ))
             iterations = i + 1
             if converged:
@@ -177,41 +185,38 @@ class Engine:
         return until.cmd
 
     def _recover_committed_attempt(self, key: tuple[int, str], floor: Floor) -> bool:
-        """Provenance-based resume recovery (hand-8, RECEIPT-TEAR). A top-level node that
-        was `dispatched` but is not durable may have committed before its journal tail was
-        written (a crash anywhere in the completion gap). The commits in the attempt's
-        `pre_head..HEAD` range ARE that attempt's, so reconstruct the full receipt and
-        retro-journal it — never re-run. Returns True if recovered.
+        """Two-boundary provenance recovery (hand-9, PROVENANCE-RANGE). The ONLY torn
+        window that is recoverable as success is a durable OK `result` whose `integrated`
+        was lost: the result stamped a `post_head` completion certificate, so the commits
+        in EXACTLY `pre_head..post_head` are that attempt's and the receipt is reconstructed
+        and retro-journalled — never re-run, never `..HEAD` (an operator commit above
+        `post_head` is out of range by construction). Returns True if recovered.
 
-        - No commits in the range → the attempt did nothing durable → re-run (return False).
-        - Result already durable, its `integrated` lost → journal ONLY the receipt.
-        - Nothing journalled past `dispatched` → journal result THEN receipt.
-        This subsumes the old marker scan for the serial model; the marker survives in
-        commit messages as forensic metadata only.
+        A DISPATCHED-ONLY tail (no `result`) has NO completion proof — a mid-rig checkpoint
+        commit is not a certificate — so it is NEVER recovered as success: the caller cleans
+        its leftover dirt and RE-RUNS the node. A durable FAILED result is likewise not a
+        recovery (its effect was reverted). The `wf:` commit marker survives as forensic
+        metadata only.
         """
         if floor != -1:
             return False
         node = self._proj.node(key)
-        if not node.dispatched:
-            return False
-        receipt = self.ws.reconstruct_receipt(node.dispatched_pre_head)
+        if node.result is None or not node.result.ok:
+            return False  # dispatched-only or failed: no completion certificate to recover
+        receipt = self.ws.reconstruct_receipt(node.dispatched_pre_head, node.result_post_head)
         if not receipt.commits:
-            return False
-        if node.result is None:
-            self.rec.record_success(key, Result(
-                text=f"recovered from attempt provenance {receipt.shas[-1]}",
-                files=receipt.paths,
-            ), receipt)
-        else:
-            self.rec.record_integrated(key, receipt)
+            return False  # effectless result — durable on its own; resume_action handles it
+        self.rec.record_integrated(key, receipt)
         return True
 
     def _exec_do(self, node: Do, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if self._recover_committed_attempt(key, floor):
             return ExecutionOutcome(key=key)
+        lease = self._open_lease_or_fail(key, floor)
+        if lease is None:
+            return ExecutionOutcome(key=key)
         prompt = self._materialize_ctx(node, epoch)
-        lease = self.ws.open_lease(key)
         self.journal.append(Dispatched(
             run_id=self.run_id, epoch=epoch, node_id=node.node_id,
             rig=node.rig.name, task=node.task, workdir=str(self.workdir),
@@ -219,7 +224,8 @@ class Engine:
         ))
         if prompt is None:  # an unresolvable/escaping ctx ref is a failed RESULT
             self.rec.record_result(key, Result(
-                text=f"unresolved ctx for {node.node_id}", outcome="failed"))
+                text=f"unresolved ctx for {node.node_id}", outcome="failed"),
+                post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         diff_name = f"e{epoch}-{node.node_id}.diff"
         try:
@@ -227,14 +233,16 @@ class Engine:
         except Exception as exc:  # a rig exception never escapes after `dispatched`
             diff_path = self.ws.finalize_failure(lease, diff_name)
             self.rec.record_result(key, Result(
-                text=self._fail_text(f"rig raised: {exc}", diff_path), outcome="failed"))
+                text=self._fail_text(f"rig raised: {exc}", diff_path), outcome="failed"),
+                post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         if not result.ok:
             # The failed rig's effects (incl its own commits) are reverted + captured.
             diff_path = self.ws.finalize_failure(lease, diff_name)
             self.rec.record_result(key, Result(
                 text=self._fail_text(result.text, diff_path),
-                files=result.files, exit_code=result.exit_code, outcome=result.outcome))
+                files=result.files, exit_code=result.exit_code, outcome=result.outcome),
+                post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         integ = self.ws.finalize_do_success(lease, self._commit_msg("do", node.node_id, epoch))
         if not integ.ok:
@@ -244,55 +252,85 @@ class Engine:
             diff_path = self.ws.finalize_failure(lease, diff_name)
             self.rec.record_result(key, Result(
                 text=self._fail_text(f"do integration failed:\n{integ.stderr}", diff_path),
-                outcome="failed"))
+                outcome="failed"), post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         # Result.files is the artifact list (== the effect paths in the shared-workdir
-        # PoC); the receipt is the ownership record replay accumulates.
+        # PoC); the receipt is the ownership record replay accumulates. `post_head` is the
+        # completion certificate the torn-window receipt reconstruction is bounded by.
         self.rec.record_success(key, Result(
             text=result.text, files=integ.receipt.paths,
-            exit_code=result.exit_code, outcome=result.outcome), integ.receipt)
+            exit_code=result.exit_code, outcome=result.outcome), integ.receipt,
+            post_head=self.ws.head_commit())
         return ExecutionOutcome(key=key)
+
+    def _open_lease_or_fail(self, key: tuple[int, str], floor: Floor) -> Lease | None:
+        """Open a lease, first cleaning a dead dispatched-only attempt's leftover dirt on a
+        top-level resume (hand-9). A refused lease (dirty tracked/index worktree) records a
+        durable failed result and returns None — the honest serial-M1 rule."""
+        if floor == -1 and self._proj.node(key).dispatched:
+            self.ws.clean_dispatched_residue()
+        lease = self.ws.open_lease(key)
+        if lease is None:
+            self.rec.record_result(key, Result(
+                text="workdir has uncommitted tracked changes; lease refused",
+                outcome="failed"), post_head=self.ws.head_commit())
+        return lease
 
     def _exec_inplace(self, node: Inplace, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if self._recover_committed_attempt(key, floor):
             return ExecutionOutcome(key=key)
-        lease = self.ws.open_lease(key)
+        lease = self._open_lease_or_fail(key, floor)
+        if lease is None:
+            return ExecutionOutcome(key=key)
         self.journal.append(Dispatched(
             run_id=self.run_id, epoch=epoch, node_id=node.node_id,
             task=f"inplace: {len(node.edits)} edit(s)", workdir=str(self.workdir),
             pre_head=lease.pre_head,
         ))
         if not node.edits:  # an empty inplace is a no-op ok result with NO git calls
-            self.rec.record_result(key, Result(text="inplace: no edits", files=[]))
+            self.rec.record_result(key, Result(text="inplace: no edits", files=[]),
+                                   post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
+        # Track every write (path + the content it pre-existed with, None if created) so a
+        # failure AFTER the first write rolls back to leave NO partial effect (hand-9,
+        # INPLACE-TRANSACTIONAL).
         paths: list[str] = []
+        writes: list[tuple[str, str | None]] = []
         try:
             for edit in node.edits:
                 target = self.ws.resolve_safe_path(edit.path)
+                original = target.read_text(encoding="utf-8") if target.is_file() else None
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(edit.content, encoding="utf-8")
+                writes.append((edit.path, original))
                 paths.append(edit.path)
         except ValueError as exc:
             # A symlink resolving outside the workdir can only be caught at write time
-            # (admission cannot resolve symlinks); it is a durable FAILED result, never an
-            # exception escaping after `dispatched` (hand-8, ADMISSION-REFERENCE).
+            # (admission cannot resolve symlinks); roll back earlier edits, then a durable
+            # FAILED result — never an exception escaping after `dispatched`.
+            self.ws.rollback_inplace(writes)
             self.rec.record_result(key, Result(
-                text=f"inplace path rejected: {exc}", outcome="failed"))
+                text=f"inplace path rejected: {exc}", outcome="failed"),
+                post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         integ = self.ws.integrate_declared(paths, self._commit_msg("inplace", node.node_id, epoch))
         if integ.status == "failed":
+            self.ws.rollback_inplace(writes)  # no partial write survives a failed commit
             self.rec.record_result(key, Result(
-                text=f"inplace integration failed:\n{integ.stderr}", outcome="failed"))
+                text=f"inplace integration failed:\n{integ.stderr}", outcome="failed"),
+                post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         if integ.status == "noop":
             # An already-identical edit produced no diff: a DURABLE no-op (files=[]), so
             # resume never re-applies it (DESIGN §5).
             self.rec.record_result(key, Result(
-                text=f"inplace: no diff (already applied) for {', '.join(paths)}", files=[]))
+                text=f"inplace: no diff (already applied) for {', '.join(paths)}", files=[]),
+                post_head=self.ws.head_commit())
             return ExecutionOutcome(key=key)
         receipt = IntegrationReceipt(commits=[CommitReceipt(sha=integ.commit or "", paths=paths)])
-        self.rec.record_success(key, Result(text=f"wrote {', '.join(paths)}", files=paths), receipt)
+        self.rec.record_success(key, Result(text=f"wrote {', '.join(paths)}", files=paths),
+                                receipt, post_head=self.ws.head_commit())
         return ExecutionOutcome(key=key)
 
     def _materialize_ctx(self, node: Do, epoch: int) -> str | None:

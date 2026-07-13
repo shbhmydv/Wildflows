@@ -74,8 +74,8 @@ def test_same_engine_second_run_epoch_is_a_noop(tmp_path: Path) -> None:
 def test_load_handles_mid_utf8_unterminated_tail_and_rejects_newline_terminated_invalid_tail(
     tmp_path: Path,
 ) -> None:
-    good = json.dumps({"kind": "boundary", "run_id": "r", "epoch": 0, "node_id": "n0",
-                       "phase": "opened"})
+    good = json.dumps({"seq": 0, "kind": "boundary", "run_id": "r", "epoch": 0,
+                       "node_id": "n0", "phase": "opened"})
     # (a) A kill mid-multibyte-UTF-8 on the UNTERMINATED final record -> recovered.
     path = tmp_path / "a" / "events.ndjson"
     path.parent.mkdir(parents=True)
@@ -172,13 +172,13 @@ def test_resume_after_converged_loop_iter_does_not_run_body_again(tmp_path: Path
         loop, epoch=0
     )
     assert rig.calls == 1
-    # Crash after the converged loop_iter but before the loop's final result: drop the
-    # loop `result` and the closing boundary (keep the loop_iter).
+    # Crash after the converged loop_iter but before the loop's final result: TAIL-truncate
+    # at the loop's final `result` (node n0), dropping it and the closing boundary while
+    # keeping a contiguous prefix through the loop_iter (strict seq contiguity, hand-9).
     lines = (run_dir / "events.ndjson").read_text().splitlines()
-    keep = [ln for ln in lines
-            if not (json.loads(ln)["kind"] == "result" and json.loads(ln)["node_id"] == "n0")
-            and json.loads(ln)["kind"] != "boundary"]
-    (run_dir / "events.ndjson").write_text("\n".join(keep) + "\n")
+    cut = next(i for i, ln in enumerate(lines)
+               if json.loads(ln)["kind"] == "result" and json.loads(ln)["node_id"] == "n0")
+    (run_dir / "events.ndjson").write_text("\n".join(lines[:cut]) + "\n")
 
     rig2 = _CountingRig("artifact")
     Engine(run_dir=run_dir, workdir=workdir, registry=RigRegistry({"b": rig2})).run_epoch(
@@ -204,11 +204,12 @@ def test_resume_after_final_capped_loop_iter_preserves_last_body_artifact(
         loop, epoch=0
     )
     assert rig.calls == 1
+    # TAIL-truncate at the loop's final `result` (node n0): a crash after the final capped
+    # loop_iter but before the loop result, keeping a contiguous prefix (hand-9).
     lines = (run_dir / "events.ndjson").read_text().splitlines()
-    keep = [ln for ln in lines
-            if not (json.loads(ln)["kind"] == "result" and json.loads(ln)["node_id"] == "n0")
-            and json.loads(ln)["kind"] != "boundary"]
-    (run_dir / "events.ndjson").write_text("\n".join(keep) + "\n")
+    cut = next(i for i, ln in enumerate(lines)
+               if json.loads(ln)["kind"] == "result" and json.loads(ln)["node_id"] == "n0")
+    (run_dir / "events.ndjson").write_text("\n".join(lines[:cut]) + "\n")
 
     rig2 = _CountingRig("artifact")
     Engine(run_dir=run_dir, workdir=workdir, registry=RigRegistry({"b": rig2})).run_epoch(
@@ -244,13 +245,13 @@ def test_resume_after_do_commit_before_result_does_not_repeat_or_lose_the_commit
     Engine(run_dir=run_dir, workdir=workdir, registry=RigRegistry({"c": rig2})).run_epoch(
         Do(task="work", rig=RigRef(name="c")), epoch=0
     )
-    assert rig2.calls == 0  # reconciled from the marked commit, not re-run
-    head_after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workdir,
-                                capture_output=True, text=True).stdout.strip()
-    assert head_after == head  # no duplicate second commit
-    state = replay(run_dir)
-    assert (0, "n0") in state.integrated  # the committed effect is now attributable
-    assert (workdir / "do.txt").read_text() == "1"  # effect preserved, not doubled
+    # UPDATED to the hand-9 two-boundary contract (PROVENANCE-RANGE): a DISPATCHED-ONLY tail
+    # has NO completion certificate (a mid-rig commit is not proof), so it is NEVER blessed
+    # as success — the node RE-RUNS. The dead attempt's commit stays in history as forensic
+    # residue (reachable, harmless), never reset away. The rerun writes the same content, so
+    # the effect is not lost or doubled.
+    assert rig2.calls == 1  # dispatched-only re-runs; the mid-rig commit is not a certificate
+    assert (workdir / "do.txt").read_text() == "1"  # effect preserved (residue + rerun agree)
 
 
 # --------------------------------------------------------------------------- NB5

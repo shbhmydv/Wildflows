@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 # Outcome discriminator — the single terminal-status source:
 #   ok     — the primitive produced output and succeeded.
@@ -79,6 +79,16 @@ class CommitReceipt(BaseModel):
 
     sha: str
     paths: list[str] = Field(default_factory=list)
+
+    @field_validator("sha")
+    @classmethod
+    def _reject_blank_sha(cls, v: str) -> str:
+        # A receipt marks an effect DURABLE; an empty/blank sha proves no commit and would
+        # falsely bless a node (hand-9, SEQ+RECEIPT). Both the modern `commits=[{"sha":""}]`
+        # and a migrated legacy `commit:""` land here and are refused.
+        if not v.strip():
+            raise ValueError("commit sha must be a non-empty, non-blank string")
+        return v
 
 
 class IntegrationReceipt(BaseModel):

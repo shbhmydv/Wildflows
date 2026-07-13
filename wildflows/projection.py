@@ -14,7 +14,7 @@ through that reference, not a journal re-scan.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -60,23 +60,37 @@ class ExecutionOutcome:
 
 
 @dataclass
+class LoopIterRecord:
+    """One folded `loop_iter` event — enough to scope a loop's resume to a floor."""
+
+    seq: int
+    commit: str | None
+    converged: bool
+    body: Result | None
+
+
+@dataclass
 class NodeProjection:
     """Everything the fold knows about one `(epoch, node_id)`."""
 
     dispatched: bool = False
-    dispatched_pre_head: str | None = None  # provenance anchor for pre_head..HEAD recovery
+    dispatched_pre_head: str | None = None  # provenance anchor (range START)
     result: Result | None = None
     result_seq: int = -1
+    result_post_head: str | None = None  # HEAD when the result was recorded (range END)
     receipt: IntegrationReceipt | None = None  # accumulated effect record
     integrated_seq: int = -1  # seq of the LAST integrated event (the resume frontier)
     # Loop-only: completed-iteration count, last integrated commit, the seq of the last
     # loop_iter (the partial-iteration resume frontier), the last iteration's body
-    # artifact (recovered by reference from the live last-result), and convergence.
+    # artifact (recovered by reference from the live last-result), and convergence. The
+    # per-iteration `loop_iters` list backs floor-scoped resume (nested loops): only iters
+    # with seq > floor belong to the CURRENT invocation.
     loop_iterations: int = 0
     loop_last_commit: str | None = None
     loop_last_iter_seq: int = -1
     loop_last_body: Result | None = None
     loop_converged: bool = False
+    loop_iters: list[LoopIterRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -117,6 +131,7 @@ class RunProjection:
                 text=ev.text, files=ev.files, exit_code=ev.exit_code, outcome=ev.outcome,
             )
             node.result_seq = ev.seq
+            node.result_post_head = ev.post_head
             self._results_by_seq[ev.seq] = node.result
             self._last_result_seq = ev.seq
         elif isinstance(ev, Integrated):
@@ -134,6 +149,9 @@ class RunProjection:
             # documented old-journal semantics, never the live fold path.
             ref_seq = ev.body_result_seq if ev.body_result_seq is not None else self._last_result_seq
             node.loop_last_body = self._results_by_seq.get(ref_seq)
+            node.loop_iters.append(LoopIterRecord(
+                seq=ev.seq, commit=ev.commit, converged=ev.converged, body=node.loop_last_body,
+            ))
 
     # -- resume / durability decision ---------------------------------------
 
@@ -155,6 +173,28 @@ class RunProjection:
                 return "run"
         return "done"
 
+    def loop_resume(
+        self, key: NodeKey, floor: Floor
+    ) -> tuple[int, Floor, bool, Result | None]:
+        """Floor-scoped loop resume state: `(resume_from, partial_floor, converged, body)`.
+
+        Only `loop_iter` events with seq > `floor` belong to THIS invocation, so a nested
+        inner loop is scoped to its CURRENT outer iteration and a prior outer iteration's
+        inner iterations never make it skip (hand-9, nested-loop resume floor). `floor=None`
+        (a fresh iteration from a parent loop) counts none and runs the whole body fresh;
+        `floor=-1` (top-level) counts every iteration; `floor=k` counts iters after k.
+        `partial_floor` is the last counted iter's seq (marking earlier inner state stale),
+        or the incoming `floor` when none were counted.
+        """
+        if floor is None:
+            return 0, None, False, None
+        node = self.nodes.get(key)
+        counted = [] if node is None else [r for r in node.loop_iters if r.seq > floor]
+        if not counted:
+            return 0, floor, False, None
+        last = counted[-1]
+        return len(counted), last.seq, last.converged, last.body
+
     def node(self, key: NodeKey) -> NodeProjection:
         """The node's projection, or an empty default (never mutating the map)."""
         return self.nodes.get(key, NodeProjection())
@@ -164,10 +204,6 @@ class RunProjection:
             return None
         node = self.nodes.get(key)
         return node.result if node is not None else None
-
-    def has_result(self, key: NodeKey) -> bool:
-        node = self.nodes.get(key)
-        return node is not None and node.result is not None
 
     def result_text(self, key: NodeKey) -> str | None:
         node = self.nodes.get(key)

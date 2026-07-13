@@ -59,9 +59,9 @@ def test_load_ignores_only_an_unterminated_malformed_final_record(tmp_path: Path
 
 def test_load_still_rejects_a_malformed_middle_record(tmp_path: Path) -> None:
     path = tmp_path / "events.ndjson"
-    good = json.dumps({"kind": "boundary", "run_id": "r", "epoch": 0, "node_id": "n0",
-                       "phase": "opened"})
-    path.write_text(good + "\n" + "{garbage}\n" + good + "\n", encoding="utf-8")
+    good = json.dumps({"seq": 0, "kind": "boundary", "run_id": "r", "epoch": 0,
+                       "node_id": "n0", "phase": "opened"})
+    path.write_text(good + "\n" + "{garbage}\n", encoding="utf-8")
     with pytest.raises((json.JSONDecodeError, ValidationError)):
         Journal.load(tmp_path)
 
@@ -237,7 +237,11 @@ def test_effectful_do_is_core_integrated_and_remains_recoverable_after_worktree_
 
 # --------------------------------------------------------------------------- B6
 
-def test_inplace_preserves_a_preexisting_staged_index(tmp_path: Path) -> None:
+def test_inplace_refuses_to_open_on_a_preexisting_staged_index(tmp_path: Path) -> None:
+    """UPDATED to the hand-9 clean-worktree precondition (FAILURE-LEASE): a pre-existing
+    dirty TRACKED/index state (someone else's staged file) makes the lease REFUSE to open —
+    a durable failed result — rather than committing on top of an index the engine does not
+    own. The pre-existing staged file is left untouched (never destroyed)."""
     workdir = tmp_path / "work"
     workdir.mkdir()
     _git_init(workdir)
@@ -247,20 +251,16 @@ def test_inplace_preserves_a_preexisting_staged_index(tmp_path: Path) -> None:
     eng = Engine(run_dir=tmp_path / "run", workdir=workdir, registry=RigRegistry({}))
     eng.run_epoch(Inplace(edits=[Edit(path="declared.txt", content="d")]), epoch=0)
 
-    # The commit contains ONLY the declared path.
-    committed = subprocess.run(
-        ["git", "show", "--name-only", "--pretty=", "HEAD"], cwd=workdir,
-        capture_output=True, text=True,
-    ).stdout
-    assert "declared.txt" in committed
-    assert "outside.txt" not in committed
-    # outside.txt is still staged, uncommitted — its ownership record is intact.
+    assert not (workdir / "declared.txt").exists()  # the inplace never ran
+    # outside.txt is still staged, untouched — its ownership record is intact.
     staged = subprocess.run(
         ["git", "diff", "--cached", "--name-only"], cwd=workdir, capture_output=True, text=True
     ).stdout
     assert "outside.txt" in staged
     state = replay(tmp_path / "run")
-    assert state.integrated[(0, "n0")] == ["declared.txt"]
+    assert state.results[(0, "n0")].ok is False
+    assert "uncommitted tracked changes" in state.results[(0, "n0")].text
+    assert (0, "n0") not in state.integrated
 
 
 def test_inplace_treats_option_like_paths_as_literal_paths() -> None:

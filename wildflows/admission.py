@@ -22,6 +22,7 @@ from wildflows.expr import (
     Expr,
     Inplace,
     Loop,
+    Seq,
     assign_node_ids,
     children_of,
     parse_expr,
@@ -67,6 +68,37 @@ def _has_executable_leaf(node: Expr) -> bool:
     return any(_has_executable_leaf(c) for c in children_of(node))
 
 
+# Result-producing node kinds: a leaf (`do`/`inplace`) and a `loop` (journals a final
+# result) produce a durable result; `seq`/`dispatch` are structural (no node-level result),
+# and `combine`/`ask`/`setup` are not executable. A ctx ref may only target these.
+_RESULTFUL = (Do, Inplace, Loop)
+
+
+def _is_result_total(node: Expr) -> bool:
+    """True if `node`'s LAST positional child chain terminates in a result-producing leaf,
+    so `ExecutionOutcome.result_key()` over it is TOTAL (hand-9, LOOP-OUTCOME-TOTALITY).
+
+    A leaf/loop is result-total; a `seq`/`dispatch` is result-total only when it has
+    children AND its LAST child is result-total (recursively). An empty composite, or one
+    whose last child chain bottoms out at a resultless structural node, is NOT."""
+    if isinstance(node, _RESULTFUL):
+        return True
+    if isinstance(node, (Dispatch, Seq)):
+        return bool(node.children) and _is_result_total(node.children[-1])
+    return False
+
+
+def _check_result_total(node: Expr) -> None:
+    # Every composite must produce a defined outcome: its last positional child chain must
+    # end in an executable result-producing leaf. This makes result_key() total by
+    # construction, so an uninterrupted fold and a resumed fold always agree.
+    if isinstance(node, (Dispatch, Seq)) and not _is_result_total(node):
+        raise AdmissionError(
+            f"composite {node.node_id!r} ({node.kind}) has no result-producing last leaf: "
+            f"its final positional child chain must terminate in a do/inplace/loop"
+        )
+
+
 def _ancestor_paths(tree: Expr) -> dict[str, list[Expr]]:
     """Each node_id -> the list of expressions from root down to (and including) it."""
     paths: dict[str, list[Expr]] = {}
@@ -101,6 +133,7 @@ def admit_epoch(
     paths = _ancestor_paths(tree)
     for node in order:
         _check_capability(node)
+        _check_result_total(node)
         if isinstance(node, Do):
             if node.rig.name not in registry:
                 raise AdmissionError(f"unknown rig: {node.rig.name!r}")
@@ -136,6 +169,21 @@ def _check_upstream_ctx_ref(
         raise AdmissionError(
             f"ctx node ref {target!r} crosses a Dispatch (concurrent siblings, "
             f"non-deterministic completion order)"
+        )
+    # An ANCESTOR composite's result does not exist before the consumer runs (the consumer
+    # is inside it), so a ref to an enclosing node can never resolve (hand-9, finding 6).
+    if target in {n.node_id for n in pr[:-1]}:
+        raise AdmissionError(
+            f"ctx node ref {target!r} is an unfinished ancestor of {node.node_id!r} "
+            f"(its result does not exist before the consumer runs)"
+        )
+    # The target must PRODUCE a result: an executable leaf (do/inplace) or a loop. A
+    # structural seq/dispatch (or a non-executable combine/ask/setup) journals no result,
+    # so a ref to it would deterministically fail to resolve — reject it at admission.
+    target_node = pt[-1]
+    if not isinstance(target_node, _RESULTFUL):
+        raise AdmissionError(
+            f"ctx node ref {target!r} targets a {target_node.kind} which produces no result"
         )
 
 
