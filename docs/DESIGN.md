@@ -75,7 +75,14 @@ juniors fan out, the senior picks up junior failures).
 - **Failure modes / D5 (SETTLED):** live loop-session state dies with the process. On
   resume the loop **restarts its body from the last integrated iteration**, with the
   journal tail as the briefing. No session serialization, ever. The `cap` is enforced
-  by the core regardless of what the body claims.
+  by the core regardless of what the body claims. A command predicate is a **read-only,
+  idempotent check**: it runs in a durable lease and its exit code is accepted only when
+  tracked/index and untracked state are byte-identical to the lease snapshot. Mutation is
+  captured and reverted by the standard recovery transaction, then journalled as a failed
+  evaluation and raised as a typed error. External effects cannot be mediated (the same is
+  true of rig commands), so predicate authors own their idempotence. The exact redo window
+  is **predicate-executed → `loop_iter` durable**; a crash there reruns the check while the
+  verified in-tree postcondition makes that redo harmless to the worktree.
 
 ### `inplace(edit)`
 The planner's own hands — a small fix with no sub-agent.
@@ -353,6 +360,10 @@ replay rules:
   engine implements this by passing the last `loop_iter` seq as a resume *floor* into the
   partial iteration's body (state `seq <= floor` is stale); every subsequent fresh
   iteration re-runs its whole body (`floor=None`, the explicit never-resume scope).
+  Predicate completion is intentionally durable only with the corresponding `loop_iter`:
+  a crash after the leased check executes but before that append reruns the idempotent
+  predicate, after recovering any unfinished predicate lease, without rerunning a durable
+  body leaf.
 - **`ask`:** `asked` without `answered` → still parked; re-surface to the owner.
   `answered` present → the answer is durable, continue.
 - **`boundary(opened)` without `boundary(closed)`:** the epoch is incomplete; resume
@@ -399,6 +410,14 @@ covers **serial restarts only** — one append owner at a time. Parallel dispatc
 step 3) MUST introduce a single central append owner or an interprocess lock before any
 concurrent children/processes append; two live `Journal` instances over one run_dir
 would emit duplicate/reordered seqs. Not built this hand.
+
+**Failed-append poisoning (hand-14):** sequence assignment is serialized on a copy and
+live `_events`/projection state changes only after the line's write+flush+fsync (plus the
+first-file directory fsync) succeeds. Any durability exception leaves the live mirror at
+its prior durable prefix and permanently poisons that `Journal`; every later append raises
+`JournalPoisonedError`. Only `Journal.load` may classify the physical tail (the failed
+fsync may nevertheless have left a complete line) and create a fresh append owner. M2's
+central owner must discard, never retry through, a poisoned instance.
 
 ---
 
@@ -557,10 +576,10 @@ target-local run state, and the dashboard remain later steps.
    over an `iteration` field on every event, so replay folds iterations-completed + last
    commit in two lines and every other event stays single-shot.
 8. **`_commit` checks the STAGED diff only** (`git diff --cached --quiet`), not the whole
-   working tree (`git status --porcelain`). A loop's `until` predicate legitimately
-   leaves untracked iteration artifacts in the workdir; the old whole-tree check would
-   force a commit with nothing staged (git error). Staged-only is the correct
-   "did the declared edits change anything" test and keeps `inplace` re-apply idempotent.
+   working tree (`git status --porcelain`). **The predicate rationale here is REVERSED by
+   hand-14 entry 67:** `until` may no longer leave untracked artifacts. Staged-only remains
+   the correct "did the declared edits change anything" test and keeps `inplace` re-apply
+   idempotent.
 
 ### Hand-3 calls pending review
 
@@ -1145,3 +1164,26 @@ than patching each row. Both are the transaction model of record — not a later
     settlement but before integration reuses that certificate and safely redoes both;
     missing marked records with no replacement raise `WorkspaceFault` and leave the epoch
     open. This extends hand-12 H3's settle-before-publication rule to the success tear.
+
+### Hand-14 calls (from the pass-10 correctness review) — CLOSE THE EFFECT CHANNEL
+
+67. **Verified read-only predicates (hand-14).** Every command `until` runs under a
+    required durable lease keyed by the loop's internal `<node_id>.until` evaluation node.
+    The standard recovery postcondition proves exact HEAD, clean tracked/index state, no
+    new untracked/ignored paths or directories, and byte-identical pre-existing baselines
+    before accepting the exit code. Any mutation or unverifiable postcondition runs the
+    one recovery transaction (capture, revert, verify, settle), records a durable failed
+    evaluation, raises `PredicateEvaluationError`, and leaves the epoch open. Predicate
+    host/service effects remain outside engine mediation just like rig-command external
+    effects, so the command contract is an **idempotent check**. Its exact redo interval is
+    **predicate-executed → matching `loop_iter` durable**: restart recovers the unfinished
+    evaluation lease and reruns the predicate, while a completed body remains skipped.
+    This reverses entry 8's historical allowance for untracked predicate artifacts.
+
+68. **Append-owner poisoning (hand-14).** `Journal.append` computes/serializes the assigned
+    sequence without changing live state, then mutates `_events` and the projection only
+    after write+flush+fsync durability succeeds. Any durability exception poisons that
+    owner; subsequent appends raise typed `JournalPoisonedError` until the caller performs
+    a fresh `Journal.load`, which alone decides whether the uncertain tail is complete or
+    torn and therefore which contiguous sequence comes next. M2's central append owner
+    must replace a poisoned instance rather than reuse or retry through it.
