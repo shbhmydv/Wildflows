@@ -376,7 +376,7 @@ def test_inplace_unstage_failure_cannot_record_durable_failure(tmp_path: Path) -
     real_git = eng.ws.git
 
     def flaky_git(*args: str) -> subprocess.CompletedProcess[str]:
-        if args[:1] == ("reset",) and "--" in args:  # the rollback unstage
+        if "reset" in args and "--" in args:  # rollback unstage (global git opts allowed)
             return subprocess.CompletedProcess(list(args), 1, "", "index.lock exists")
         return real_git(*args)
 

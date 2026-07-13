@@ -169,7 +169,6 @@ class RecoveryRecord(BaseModel):
     action: Literal["fail", "retry"]
     lease: LeaseRecord
     result: Result
-    diff_path: str | None = None
     integrity: str | None = None
 
 
@@ -605,7 +604,6 @@ class WorkspaceEffects:
             receipt = RecoveryRecord(
                 epoch=epoch, node_id=node_id, attempt=request.attempt,
                 action=request.action, lease=lease, result=final_result,
-                diff_path=self._relative_evidence(diff_path),
             )
             receipt.integrity = self._record_integrity(receipt)
             self._publish_recovery_record(receipt)
@@ -750,14 +748,6 @@ class WorkspaceEffects:
         return result.model_copy(update={
             "text": f"{result.text}\n[workspace evidence captured: {diff_path}]"
         })
-
-    def _relative_evidence(self, path: Path | None) -> str | None:
-        if path is None:
-            return None
-        try:
-            return path.relative_to(self.run_dir).as_posix()
-        except ValueError as exc:
-            raise WorkspaceFault(f"recovery evidence escapes run directory: {path}") from exc
 
     def _capture_workspace(
         self, index_dir: Path, stem: str, tracked_base: str, leaks: list[str]
@@ -1258,7 +1248,8 @@ class WorkspaceEffects:
         if not paths:  # an active allow-empty commit still requires its history receipt
             return True
         active = self.git(
-            "diff", "--quiet", post_head, "--", *[_fs_path(path) for path in paths]
+            "--literal-pathspecs", "diff", "--quiet", post_head, "--",
+            *[_fs_path(path) for path in paths],
         )
         if active.returncode == 0:
             return True
@@ -1302,15 +1293,19 @@ class WorkspaceEffects:
         any pre-existing staged index is preserved. Git failures return
         status="failed"; nothing staged for our scope is a "noop". Never raises."""
         pathspecs = [_fs_path(path) for path in declared]
-        add = self.git("add", "--", *pathspecs)
+        add = self.git("--literal-pathspecs", "add", "--", *pathspecs)
         if add.returncode != 0:
             return Integration("failed", stderr=add.stderr)
-        diff = self.git("diff", "--cached", "--quiet", "--", *pathspecs)
+        diff = self.git(
+            "--literal-pathspecs", "diff", "--cached", "--quiet", "--", *pathspecs
+        )
         if diff.returncode == 0:
             return Integration("noop")
         if diff.returncode != 1:
             return Integration("failed", stderr=diff.stderr)
-        commit = self.git("commit", "-q", "-m", message, "--", *pathspecs)
+        commit = self.git(
+            "--literal-pathspecs", "commit", "-q", "-m", message, "--", *pathspecs
+        )
         if commit.returncode != 0:
             return Integration("failed", stderr=commit.stderr)
         sha = self._cleanup_head()
@@ -1355,7 +1350,10 @@ class WorkspaceEffects:
         self._remove_created_inplace_dirs(intent)
         if intent.writes:
             self._checked(
-                self.git("reset", "-q", "--", *[_fs_path(w.path) for w in intent.writes]),
+                self.git(
+                    "--literal-pathspecs", "reset", "-q", "--",
+                    *[_fs_path(w.path) for w in intent.writes],
+                ),
                 "inplace rollback unstage",
             )
 
@@ -1638,7 +1636,8 @@ class WorkspaceEffects:
         """Stage attempt effects, never unchanged preexisting untracked user paths."""
         if lease.preexisting:
             unstage = self.git(
-                "reset", "-q", "--", *[_fs_path(p) for p in sorted(lease.preexisting)]
+                "--literal-pathspecs", "reset", "-q", "--",
+                *[_fs_path(p) for p in sorted(lease.preexisting)],
             )
             if unstage.returncode != 0:
                 return Integration("failed", stderr=unstage.stderr)
@@ -1649,7 +1648,10 @@ class WorkspaceEffects:
             set(self._untracked_ignored_paths()) - set(lease.preexisting)
         )
         if new_paths:
-            add_new = self.git("add", "-f", "-A", "--", *[_fs_path(p) for p in new_paths])
+            add_new = self.git(
+                "--literal-pathspecs", "add", "-f", "-A", "--",
+                *[_fs_path(p) for p in new_paths],
+            )
             if add_new.returncode != 0:
                 return Integration("failed", stderr=add_new.stderr)
         staged = self.git("diff", "--cached", "--quiet")

@@ -318,6 +318,29 @@ def test_quarantine_capture_manifest_corruption_is_detected(tmp_path: Path) -> N
         WorkspaceEffects(workdir, run_dir).load_capture_manifest(manifest)
 
 
+def test_inplace_git_pathspec_magic_is_always_literal(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    (workdir / "victim").write_text("USER", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    magic = ":(glob)**"
+
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(
+        Inplace(edits=[Edit(path=magic, content="DECLARED")]), 0
+    )
+
+    assert replay(run_dir).integrated[(0, "n0")] == [magic]
+    assert subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "victim"], cwd=workdir,
+        capture_output=True,
+    ).returncode != 0
+    assert (workdir / "victim").read_text(encoding="utf-8") == "USER"
+    assert subprocess.run(
+        ["git", "--literal-pathspecs", "show", f"HEAD:{magic}"], cwd=workdir,
+        check=True, capture_output=True, text=True,
+    ).stdout == "DECLARED"
+
+
 def test_reserved_byte_path_prefix_roundtrips_inplace_recovery(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)

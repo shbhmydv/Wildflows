@@ -1083,7 +1083,9 @@ than patching each row. Both are the transaction model of record — not a later
     ownership-empty success. All `-z` pathname plumbing runs in bytes mode. UTF-8 paths
     retain their ordinary wire spelling; arbitrary POSIX bytes use an escaped reserved
     base64 prefix (the prefix itself is escaped), consistently across leases, intents,
-    manifests, Results, and receipts. Repository object format is read with checked
+    manifests, Results, and receipts. Every Git boundary treats decoded owner/Git-derived
+    names as literal pathspecs, so a filename such as `:(glob)**` cannot widen ownership.
+    Repository object format is read with checked
     `rev-parse --show-object-format`; null OID width and empty-tree OID are selected for
     SHA-1 or SHA-256 rather than hard-coded to SHA-1.
 

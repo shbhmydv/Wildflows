@@ -53,7 +53,8 @@ pytest
 mypy
 ```
 
-Target-repo run state lives under `.wildflows/`.
+The current shared-workdir PoC requires run state outside the target workdir.
+Target-local `.wildflows/` state lands with per-node worktree isolation (build step 5).
 
 ## Topics
 
