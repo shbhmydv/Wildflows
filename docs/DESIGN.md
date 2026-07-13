@@ -352,7 +352,7 @@ replay rules:
   journalled **after** the last `loop_iter` is durable for the current iteration. The
   engine implements this by passing the last `loop_iter` seq as a resume *floor* into the
   partial iteration's body (state `seq <= floor` is stale); every subsequent fresh
-  iteration re-runs its whole body (floor = +∞).
+  iteration re-runs its whole body (`floor=None`, the explicit never-resume scope).
 - **`ask`:** `asked` without `answered` → still parked; re-surface to the owner.
   `answered` present → the answer is durable, continue.
 - **`boundary(opened)` without `boundary(closed)`:** the epoch is incomplete; resume
@@ -393,8 +393,8 @@ torn FINAL record (it never durably completed, so the next append reuses its seq
 still raises on any malformed COMPLETE or MIDDLE record. fsync-on-append bounds the
 damage to the last line; it does not eliminate a partially written last record.
 
-**Single-writer precondition (N2, hand-4):** the journal derives `seq` from its
-in-memory length and has **no lock or writer queue**. `Engine`-load-continues-seq (B1)
+**Single-writer precondition (N2, hand-4):** the journal derives `seq` as one past the
+last loaded/appended event and has **no lock or writer queue**. `Engine`-load-continues-seq (B1)
 covers **serial restarts only** — one append owner at a time. Parallel dispatch (ladder
 step 3) MUST introduce a single central append owner or an interprocess lock before any
 concurrent children/processes append; two live `Journal` instances over one run_dir
@@ -723,8 +723,9 @@ target-local run state, and the dashboard remain later steps.
     (un-admitted raw dict, §4) deleted; the review-ticket comment labels
     (`B*`/`NB*`/`SF*`/`SHOULD-FIX`) stripped from source (history lives here); the stale
     `expr.py` docstring corrected. `RigRef.params`, the second `Judged` event,
-    `LoopIter.body_*`, the `ok`/`outcome` duplication, and `_capture_and_reset_dirty` are
-    intentionally LEFT for a later hand (they carry behavior/wire risk or await worktrees).
+    `LoopIter.body_*` and the `ok`/`outcome` duplication were intentionally left at that
+    point (then removed by later hands); the historical `_capture_and_reset_dirty` helper
+    was likewise deleted when `recover_lease` became the sole transaction in hand-12.
 
 ### Hand-7 calls (RAZE items 3+4 + pass-3 review) pending review
 
@@ -783,9 +784,10 @@ target-local run state, and the dashboard remain later steps.
     without integrated → journal the receipt; nothing past dispatched → journal result +
     receipt), which is the finding's real requirement (crash-recoverable receipts) with no
     collateral damage.
-37. **Lease-scoped failure transaction (FAILURE-TRANSACTION).** (a) A git failure
-    integrating a SUCCESSFUL rig's dirty state now routes through `finalize_failure`
-    (revert + capture), never a bare `ok=False`. (b) The `Lease` snapshots the untracked +
+37. **Lease-scoped failure transaction (FAILURE-TRANSACTION; historical, superseded by
+    hand-12 entry 59).** (a) At this point a git failure integrating a successful rig's
+    dirty state routed through the then-current `finalize_failure` (revert + capture),
+    never a bare `ok=False`; `recover_lease` now owns that route. (b) The `Lease` snapshots the untracked +
     ignored file set at open; failure cleanup removes ONLY paths absent from that snapshot
     (recomputed AFTER the index reset, so a staged-then-unstaged leak is swept), so
     pre-existing user files survive. **SUPERSEDED by hand-11 entry 56:** a run_dir inside
@@ -901,7 +903,8 @@ than patching each row. Both are the transaction model of record — not a later
       ref; pre-existing untracked → left in place), AND the *idempotent-rerun-absorbs-a-
       retained-commit* false success is impossible, because the rerun starts from `pre_head`
       and must produce its OWN receipt for any active effect.
-    - **Checked live failure/rollback.** `finalize_failure` keeps its revert, but EVERY git
+    - **Checked live failure/rollback (mechanism superseded by hand-12 entry 59).** The
+      then-current `finalize_failure` kept its revert; now `recover_lease` owns it. EVERY Git
       op in ANY cleanup/rollback path (reset, update-ref, clean, unstage) is CHECKED; a
       failure raises a typed `WorkspaceFault`. The engine then records a failed result
       explicitly marked **`workspace_unclean=True`** and re-raises to HALT the epoch (no
