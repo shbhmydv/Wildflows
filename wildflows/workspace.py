@@ -1,10 +1,4 @@
-"""The workspace effect transaction and completion recorder.
-
-WorkspaceEffects owns durable leases, checked capture/recovery, git mediation, and path
-containment over the serial shared workdir. CompletionRecorder owns result→integration
-event ordering. Effects are quarantined, never destroyed, and recovery depends only on
-fsynced records published before mutation.
-"""
+"""Durable workspace effect transaction and completion recorder."""
 from __future__ import annotations
 
 import base64
@@ -70,8 +64,6 @@ class WorkspaceFault(Exception):
 
 
 class LeaseRecord(BaseModel):
-    """Fsynced pre-mutation baseline used by idempotent restart recovery."""
-
     epoch: int
     node_id: str
     attempt: int
@@ -86,12 +78,11 @@ class LeaseRecord(BaseModel):
     index_snapshot: bool = False
     index_b64: str | None = None
     content_tree: str | None = None
+    raw_tree: str | None = None
     integrity: str | None = None
 
 
 class IntentWrite(BaseModel):
-    """One canonical inplace target's exact pre-state and expected written state."""
-
     path: str
     pre_kind: Literal["file", "dir", "absent", "other"]
     original: str | None = None  # legacy text; modern records use exact base64
@@ -103,9 +94,6 @@ class IntentWrite(BaseModel):
 
 
 class InplaceIntent(BaseModel):
-    """The durable inplace transaction intent (PRINCIPLE B): every target's original state,
-    fsynced BEFORE the first write so a crash mid-edit is reversed idempotently on restart."""
-
     epoch: int
     node_id: str
     attempt: int
@@ -121,8 +109,6 @@ class InplaceIntent(BaseModel):
 
 
 class CaptureEntry(BaseModel):
-    """One exactly recoverable filesystem object in an immutable capture."""
-
     path: str
     kind: Literal["file", "directory", "symlink", "absent"]
     size: int | None = None
@@ -132,15 +118,11 @@ class CaptureEntry(BaseModel):
 
 
 class CaptureManifest(BaseModel):
-    """Integrity-bound index for raw blobs copied before destructive recovery."""
-
     entries: list[CaptureEntry]
     integrity: str | None = None
 
 
 class RecoveryRecord(BaseModel):
-    """Create-once proof that recovery verified its end state and settled records."""
-
     epoch: int
     node_id: str
     attempt: int
@@ -151,8 +133,6 @@ class RecoveryRecord(BaseModel):
 
 
 class CompletionSettlement(BaseModel):
-    """Create-once proof that required records were validated before integration."""
-
     epoch: int
     node_id: str
     attempt: int
@@ -175,8 +155,6 @@ class PredicateProcessRecord(BaseModel):
 
 @dataclass
 class Lease:
-    """A durable node-attempt baseline over the serial shared workdir."""
-
     node_key: NodeKey
     pre_head: str | None
     attempt: int = 0
@@ -187,12 +165,11 @@ class Lease:
     index_snapshot: bool = False
     index_b64: str | None = None
     content_tree: str | None = None
+    raw_tree: str | None = None
 
 
 @dataclass
 class Integration:
-    """The outcome of a core-mediated declared-path (`inplace`) commit."""
-
     status: Literal["committed", "noop", "failed"]
     commit: str | None = None
     paths: list[str] = field(default_factory=list)
@@ -201,8 +178,6 @@ class Integration:
 
 @dataclass
 class DoIntegration:
-    """The outcome of finalizing a successful `do`: an accumulated receipt or a git error."""
-
     ok: bool
     receipt: IntegrationReceipt = field(default_factory=IntegrationReceipt)
     stderr: str = ""
@@ -210,8 +185,6 @@ class DoIntegration:
 
 @dataclass(frozen=True)
 class RecoveryRequest:
-    """The engine's semantic disposition; WorkspaceEffects owns every recovery phase."""
-
     node_key: NodeKey
     attempt: int
     expected_pre_head: str | None
@@ -230,8 +203,6 @@ class RecoveryOutcome:
 
 
 class WorkspaceEffects:
-    """Containment + git mediation + the effect transaction over one shared workdir."""
-
     def __init__(self, workdir: Path, run_dir: Path) -> None:
         self.workdir = Path(workdir)
         self.run_dir = Path(run_dir)
@@ -254,15 +225,7 @@ class WorkspaceEffects:
     # -- lease ---------------------------------------------------------------
 
     def open_lease(self, node_key: NodeKey, attempt: int) -> Lease | None:
-        """Begin a node attempt, or REFUSE (None) on a dirty tracked/index worktree.
-
-        The clean-worktree precondition (hand-9, FAILURE-LEASE): a lease opens only when
-        the tracked + index state is clean (untracked files are allowed and snapshotted
-        per-file). This is the honest serial-M1 rule. The durable lease record is fsynced
-        to run_dir BEFORE any mutation (hand-10, PRINCIPLE B) so restart cleanup loads
-        `pre_head` + the per-file `preexisting` snapshot off disk, never process memory.
-        (M3 per-node worktree isolation makes the workdir engine-owned and retires this.)
-        """
+        """Open a durable baseline, or refuse a dirty tracked/index worktree."""
         if self.tracked_dirty():
             return None
         index = self._index_bytes()
@@ -271,7 +234,7 @@ class WorkspaceEffects:
             preexisting=frozenset(self._untracked_ignored_paths()),
             preexisting_dirs=frozenset(self._workspace_dirs()), index_snapshot=True,
             index_b64=None if index is None else base64.b64encode(index).decode("ascii"),
-            content_tree=self._fresh_workspace_tree(),
+            content_tree=self._fresh_workspace_tree(), raw_tree=self._raw_tracked_snapshot()[0],
         )
         self._capture_lease_baseline(lease)
         self._write_lease_record(lease)
@@ -297,7 +260,10 @@ class WorkspaceEffects:
         expected = self._record_index_bytes(record)
         try:
             index_changed = self._index_bytes() != expected
-            content_changed = self._fresh_workspace_tree() != record.content_tree
+            content_changed = (
+                self._fresh_workspace_tree() != record.content_tree
+                or self._raw_tracked_snapshot()[0] != record.raw_tree
+            )
         finally:
             self._restore_index_snapshot(record)
         if index_changed or content_changed:
@@ -380,6 +346,7 @@ class WorkspaceEffects:
             baseline_manifest=lease.baseline_manifest,
             baseline_digest=lease.baseline_digest, index_snapshot=lease.index_snapshot,
             index_b64=lease.index_b64, content_tree=lease.content_tree,
+            raw_tree=lease.raw_tree,
         )
         record.integrity = self._record_integrity(record)
         return record
@@ -582,8 +549,8 @@ class WorkspaceEffects:
             and left.preexisting == right.preexisting
             and left.preexisting_dirs == right.preexisting_dirs
             and left.baseline_digest == right.baseline_digest
-            and (left.index_snapshot, left.index_b64, left.content_tree)
-            == (right.index_snapshot, right.index_b64, right.content_tree)
+            and (left.index_snapshot, left.index_b64, left.content_tree, left.raw_tree)
+            == (right.index_snapshot, right.index_b64, right.content_tree, right.raw_tree)
         )
 
     # -- the ONE lease-recovery transaction ---------------------------------
@@ -864,7 +831,10 @@ class WorkspaceEffects:
         if rec.index_snapshot:
             if self._index_bytes() != self._record_index_bytes(rec):
                 raise WorkspaceFault("recovery postcondition failed: index bytes differ", diff_path)
-            if self._fresh_workspace_tree() != rec.content_tree:
+            if (
+                self._fresh_workspace_tree() != rec.content_tree
+                or self._raw_tracked_snapshot()[0] != rec.raw_tree
+            ):
                 raise WorkspaceFault("recovery postcondition failed: workspace content differs", diff_path)
         elif self.tracked_dirty():
             raise WorkspaceFault("recovery postcondition failed: tracked/index state is dirty", diff_path)
@@ -877,7 +847,7 @@ class WorkspaceEffects:
                 preexisting_dirs=frozenset(rec.preexisting_dirs),
                 baseline_manifest=rec.baseline_manifest, baseline_digest=rec.baseline_digest,
                 index_snapshot=rec.index_snapshot, index_b64=rec.index_b64,
-                content_tree=rec.content_tree,
+                content_tree=rec.content_tree, raw_tree=rec.raw_tree,
             )
             if not self._preexisting_baseline_unchanged(lease):
                 raise WorkspaceFault(
@@ -1720,18 +1690,48 @@ class WorkspaceEffects:
             except UnicodeDecodeError as exc:
                 raise WorkspaceFault(f"temporary tree OID is invalid: {exc}") from exc
 
+    def _raw_tracked_snapshot(self) -> tuple[str, list[str]]:
+        head = self._cleanup_head()
+        names: list[bytes] = []
+        if head is not None:
+            listed = self.git_bytes("ls-tree", "-rz", "--name-only", head)
+            self._checked_bytes(listed, "enumerate tracked files for byte snapshot")
+            names = [name for name in listed.stdout.split(b"\0") if name]
+        digest = hashlib.sha256()
+        try:
+            for name in names:
+                target = self.workdir / os.fsdecode(name)
+                try:
+                    info = target.lstat()
+                except FileNotFoundError:
+                    kind, data = b"absent", b""
+                else:
+                    if stat.S_ISREG(info.st_mode):
+                        kind, data = b"file" + bytes([info.st_mode & 0o111]), target.read_bytes()
+                    elif stat.S_ISLNK(info.st_mode):
+                        kind, data = b"link", os.fsencode(os.readlink(target))
+                    else:
+                        kind, data = b"other", b""
+                digest.update(len(name).to_bytes(8, "big") + name + kind)
+                digest.update(len(data).to_bytes(8, "big") + data)
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot byte-snapshot tracked files: {exc}") from exc
+        return digest.hexdigest(), [_wire_path(name) for name in names]
+
     def _snapshot_changed_paths(self, rec: LeaseRecord) -> list[str]:
         if not rec.index_snapshot or rec.content_tree is None:
             return []
         current = self._fresh_workspace_tree()
-        if current == rec.content_tree:
-            return []
-        diff = self._git_index(
-            os.environ.copy(), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
-            rec.content_tree, current,
-        )
-        self._checked_bytes(diff, "compare temporary-index trees")
-        return [_wire_path(path) for path in diff.stdout.split(b"\0") if path]
+        raw_tree, raw_paths = self._raw_tracked_snapshot()
+        paths = raw_paths if raw_tree != rec.raw_tree else []
+        if current != rec.content_tree:
+            diff = self._git_index(
+                os.environ.copy(), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+                rec.content_tree, current,
+            )
+            self._checked_bytes(diff, "compare temporary-index trees")
+            paths += [_wire_path(path) for path in diff.stdout.split(b"\0") if path]
+        return sorted(set(paths))
 
     def _git_index(
         self, env: dict[str, str], *args: str

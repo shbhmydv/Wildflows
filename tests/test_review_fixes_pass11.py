@@ -57,13 +57,36 @@ def test_predicate_cannot_hide_tracked_mutation_with_index_flags(tmp_path: Path)
     assert not replay(run_dir).epoch_closed(0)
 
 
+def test_predicate_verification_compares_unfiltered_tracked_bytes(tmp_path: Path) -> None:
+    workdir = tmp_path / "work-filter"
+    _base_repo(workdir)
+    (workdir / ".gitattributes").write_text("base.txt text eol=lf\n", encoding="utf-8")
+    (workdir / "base.txt").write_bytes(b"base\n")
+    subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
+    subprocess.run(["git", "commit", "-qm", "filtered baseline"], cwd=workdir, check=True)
+    run_dir = tmp_path / "run-filter"
+    tree = Loop(
+        body=Inplace(edits=[]),
+        until=Until(kind="cmd", cmd="printf 'base\\r\\n' > base.txt"),
+        cap=1,
+    )
+
+    with pytest.raises(PredicateEvaluationError):
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert (workdir / "base.txt").read_bytes() == b"base\n"
+    assert _capture_bytes(run_dir, "base.txt") == [b"base\r\n"]
+    assert not replay(run_dir).epoch_closed(0)
+
+
 def test_killed_engine_reaps_inflight_predicate_before_recovery(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)
     run_dir = tmp_path / "run"
     marker = tmp_path / "predicate-started"
+    delayed_started = tmp_path / "delayed-writer-started"
     delayed_write = (
-        f"(sleep 1; printf ORPHAN > {shlex.quote(str(workdir / 'base.txt'))}) & sleep 20"
+        f"(: > {shlex.quote(str(delayed_started))}; sleep 1; "
+        f"printf ORPHAN > {shlex.quote(str(workdir / 'base.txt'))}) & sleep 20"
     )
     cmd = (
         f"if test ! -e {shlex.quote(str(marker))}; then : > {shlex.quote(str(marker))}; "
@@ -80,9 +103,9 @@ def test_killed_engine_reaps_inflight_predicate_before_recovery(tmp_path: Path) 
         finally:
             os._exit(90)
     deadline = time.monotonic() + 10
-    while not marker.exists() and time.monotonic() < deadline:
+    while not delayed_started.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
-    if not marker.exists():
+    if not delayed_started.exists():
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
         pytest.fail("predicate did not start")

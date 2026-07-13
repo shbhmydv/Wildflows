@@ -1193,7 +1193,8 @@ than patching each row. Both are the transaction model of record — not a later
 69. **Index-independent predicate verification (hand-15).** Lease open byte-snapshots the
     real repository index and hashes actual tracked worktree content through a fresh
     temporary index seeded from `HEAD`; pre/post write-tree OIDs are compared without
-    consulting live-index hints. Verification always restores the exact index bytes.
+    consulting live-index hints, and a raw-byte digest prevents clean filters from hiding
+    byte changes. Verification always restores the exact index bytes.
     Recovery captures paths from the temporary-tree delta, resets/restores content, restores
     the exact index snapshot last, and verifies both proofs. `assume-unchanged` and
     `skip-worktree` therefore cannot hide a predicate mutation or survive its recovery.
