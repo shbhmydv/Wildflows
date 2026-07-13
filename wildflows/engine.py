@@ -251,7 +251,11 @@ class Engine:
             ):
                 raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
             if intent is not None:
-                self.ws.rollback_inplace(intent)
+                self.ws.rollback_inplace(
+                    intent,
+                    None if lease_record is None or lease_record.preexisting_dirs is None
+                    else set(lease_record.preexisting_dirs),
+                )
             if lease_record is not None:
                 self.ws.quarantine_dead_attempt(lease_record)
             else:
@@ -268,8 +272,20 @@ class Engine:
         self.ws.settle_records(epoch, node_id, attempt)
         return action == "retry"
 
+    def _settle_cleared_retry(self, key: NodeKey, floor: Floor) -> None:
+        """Finish old-record settlement after a crash following the durable halt clear."""
+        node = self._proj.node(key)
+        if (
+            node.recovery_action == "retry"
+            and not node.workspace_unclean
+            and not node.has_unfinished_dispatch(floor)
+            and node.dispatch_count > 0
+        ):
+            self.ws.settle_records(key[0], key[1], node.dispatch_count - 1)
+
     def _exec_do(self, node: Do, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
+        self._settle_cleared_retry(key, floor)
         if self._recover_committed_attempt(key, floor):
             self._settle(key)
             return ExecutionOutcome(key=key)
@@ -398,6 +414,7 @@ class Engine:
 
     def _exec_inplace(self, node: Inplace, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
+        self._settle_cleared_retry(key, floor)
         if self._recover_committed_attempt(key, floor):
             self._settle(key)
             return ExecutionOutcome(key=key)
@@ -442,7 +459,7 @@ class Engine:
         try:
             self._apply_inplace_writes(writes)
         except Exception as exc:  # OSError/UnicodeError/... — a partial write is rolled back
-            self._rollback_inplace(intent, key)
+            self._rollback_inplace(intent, lease, key)
             self.rec.record_result(key, Result(
                 text=f"inplace write failed: {exc}", outcome="failed"),
                 post_head=self.ws.head_commit())
@@ -450,7 +467,9 @@ class Engine:
             return ExecutionOutcome(key=key)
         integ = self.ws.integrate_declared(paths, self._commit_msg("inplace", node.node_id, epoch))
         if integ.status == "failed":
-            self._rollback_inplace(intent, key)  # no partial write survives a failed commit
+            self._rollback_inplace(
+                intent, lease, key
+            )  # no partial write survives a failed commit
             self.rec.record_result(key, Result(
                 text=f"inplace integration failed:\n{integ.stderr}", outcome="failed"),
                 post_head=self.ws.head_commit())
@@ -528,15 +547,19 @@ class Engine:
                 raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
             intent = self.ws.load_intent(key[0], key[1], attempt)
             if intent is not None:
-                self.ws.rollback_inplace(intent)
+                self.ws.rollback_inplace(
+                    intent,
+                    None if lease_record is None or lease_record.preexisting_dirs is None
+                    else set(lease_record.preexisting_dirs),
+                )
         except WorkspaceFault as fault:
             self._halt_unclean(key, "pending inplace intent reversal", fault, "retry")
 
-    def _rollback_inplace(self, intent: InplaceIntent, key: NodeKey) -> None:
+    def _rollback_inplace(self, intent: InplaceIntent, lease: Lease, key: NodeKey) -> None:
         """Roll back from the durable intent; an unstage git-op failure HALTS the epoch
         (PRINCIPLE A) rather than record a durable failure that leaves a staged partial."""
         try:
-            self.ws.rollback_inplace(intent)
+            self.ws.rollback_inplace(intent, set(lease.preexisting_dirs))
         except WorkspaceFault as fault:
             self._halt_unclean(key, "inplace rollback", fault, "fail")
 

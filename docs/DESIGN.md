@@ -973,9 +973,9 @@ than patching each row. Both are the transaction model of record — not a later
 52. **Checked filesystem cleanup (hand-11).** Cleanup has no `ignore_errors`: status/diff
     enumeration, directory traversal, byte reads, capture publication, unlink/rmtree, and
     Git reset/ref operations are checked. Every removal has an `lexists` absence
-    postcondition. The lease additionally snapshots pre-existing directories, allowing a
-    new empty parent to be pruned without deleting a user's pre-existing empty directory;
-    legacy records lacking that snapshot conservatively do not prune. Any incomplete Git
+    postcondition. The lease additionally snapshots pre-existing directories, allowing
+    attempt-created empty directory roots to be captured/removed and new empty parents to
+    be pruned without deleting a user's pre-existing empty directory. Any incomplete Git
     status warning or filesystem failure raises `WorkspaceFault` and enters decision 49's
     persistent halt.
 
@@ -996,10 +996,12 @@ than patching each row. Both are the transaction model of record — not a later
 
 55. **Atomic durable-record lifecycle (hand-11).** Lease/intent and capture-manifest
     publication is same-directory temp write → file fsync → `os.replace` → parent-directory
-    fsync. Record unlink is followed by parent-directory fsync. A present non-regular,
-    unreadable, malformed, or schema-invalid record is a typed `WorkspaceFault`; it is
-    never confused with an absent legacy record and recovery performs no mutation after
-    such a load failure.
+    fsync. Record unlink is followed by parent-directory fsync. Records carry a canonical
+    SHA-256 integrity digest in addition to identity/provenance checks, so schema-valid
+    field corruption cannot reclassify user files or add rollback targets. A present
+    unsigned, non-regular, unreadable, malformed, integrity-invalid, or schema-invalid
+    record is a typed `WorkspaceFault`; it is never confused with an absent legacy record
+    and recovery performs no mutation after such a load failure.
 
 56. **Pass-7 crash proof (hand-11).** The transaction regressions use real `fork` plus
     `os._exit` at the record-publication, inplace-write, rig-death, quarantine-reset, and

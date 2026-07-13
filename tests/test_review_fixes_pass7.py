@@ -308,6 +308,42 @@ def test_unremovable_leak_marks_workspace_unclean_and_halts_resume(tmp_path: Pat
     assert replay(run_dir).epoch_closed(0)
 
 
+def test_failed_and_dead_rig_empty_directories_are_captured_and_removed(tmp_path: Path) -> None:
+    for mode in ("failed", "dead"):
+        case = tmp_path / mode
+        case.mkdir()
+        workdir = case / "work"
+        _base_repo(workdir)
+        run_dir = case / "run"
+        tree = Do(task=mode, rig=RigRef(name="rig"))
+        command = "mkdir -p empty/deep; exit 7" if mode == "failed" else "mkdir -p empty/deep"
+        rig = ShellRig(command, 30)
+        if mode == "dead":
+            class EmptyDirDeath:
+                name = "rig"
+
+                def run(self, prompt: str, workdir_arg: Path) -> Result:
+                    (Path(workdir_arg) / "empty" / "deep").mkdir(parents=True)
+                    os._exit(0)
+
+            assert _fork(lambda: Engine(
+                run_dir, workdir, RigRegistry({"rig": EmptyDirDeath()})
+            ).run_epoch(tree, 0)) == 0
+            Engine(run_dir, workdir, RigRegistry({"rig": _CountingRig("rerun")})).run_epoch(
+                tree, 0
+            )
+        else:
+            Engine(run_dir, workdir, RigRegistry({"rig": rig})).run_epoch(tree, 0)
+        assert not (workdir / "empty").exists()
+        manifests = [
+            json.loads(path.read_text(encoding="utf-8")) for path in run_dir.rglob("manifest.json")
+        ]
+        assert any(
+            entry["path"] == "empty" and entry["kind"] == "directory"
+            for manifest in manifests for entry in manifest["entries"]
+        )
+
+
 def test_failed_rig_net_zero_commits_remain_reachable_after_reset(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)
@@ -480,7 +516,7 @@ def test_schema_valid_lease_with_wrong_provenance_halts_before_cleanup(tmp_path:
     record["pre_head"] = "0" * 40  # schema-valid but contradicts Dispatched.pre_head
     lease.write_text(json.dumps(record), encoding="utf-8")
 
-    with pytest.raises(WorkspaceFault, match="pre_head"):
+    with pytest.raises(WorkspaceFault, match="integrity|pre_head"):
         Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("die")})).run_epoch(tree, 0)
     assert (workdir / "leak.txt").read_text() == "leak"
     assert replay(run_dir).node((0, "n0")).workspace_unclean is True
@@ -503,9 +539,58 @@ def test_schema_valid_intent_with_wrong_identity_halts_without_overwrite(tmp_pat
     record["node_id"] = "n999"
     intent.write_text(json.dumps(record), encoding="utf-8")
 
-    with pytest.raises(WorkspaceFault, match="identity mismatch"):
+    with pytest.raises(WorkspaceFault, match="integrity|identity mismatch"):
         Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
     assert (workdir / "base.txt").read_text() == "ENGINE"
+    assert replay(run_dir).node((0, "n0")).workspace_unclean is True
+
+
+def test_schema_valid_intent_cannot_delete_an_outside_created_directory(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    outside = tmp_path / "victim"
+    outside.mkdir()
+    (outside / "keep").write_text("SAFE", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="new/file", content="ENGINE")])
+
+    def crash_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(crash_after_write) == 0
+    intent = next((run_dir / "intents").glob("*.json"))
+    record = json.loads(intent.read_text(encoding="utf-8"))
+    record["created_dirs"] = ["../victim"]
+    record["integrity"] = None  # still schema-valid; unsigned records must fail closed
+    intent.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(WorkspaceFault, match="integrity|created directory"):
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert (outside / "keep").read_text() == "SAFE"
+    assert replay(run_dir).node((0, "n0")).workspace_unclean is True
+
+
+def test_schema_valid_lease_cannot_reclassify_preexisting_user_bytes(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    (workdir / "keep").write_text("USER", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    tree = Do(task="die", rig=RigRef(name="die"))
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": _DieAfterLeakRig("leak")})
+    ).run_epoch(tree, 0)) == 0
+    lease = next((run_dir / "leases").glob("*.json"))
+    record = json.loads(lease.read_text(encoding="utf-8"))
+    record["preexisting"] = []
+    record["integrity"] = None
+    lease.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(WorkspaceFault, match="integrity"):
+        Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("die")})).run_epoch(tree, 0)
+    assert (workdir / "keep").read_text() == "USER"
+    assert (workdir / "leak").read_text() == "leak"
     assert replay(run_dir).node((0, "n0")).workspace_unclean is True
 
 

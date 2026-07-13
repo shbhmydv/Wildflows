@@ -31,6 +31,8 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
+import json
 import os
 import re
 import shutil
@@ -81,10 +83,11 @@ class LeaseRecord(BaseModel):
     attempt: int
     pre_head: str | None
     preexisting: list[str] = Field(default_factory=list)
-    # None marks a legacy record that did not snapshot directories; recovery then refuses
-    # to prune empty parents because it cannot distinguish user-created empty directories.
+    # None is used only by the no-record journal fallback; persisted unsigned legacy
+    # records fail closed rather than guessing which empty directories pre-existed.
     preexisting_dirs: list[str] | None = None
     ts: float
+    integrity: str | None = None
 
 
 class IntentWrite(BaseModel):
@@ -110,6 +113,7 @@ class InplaceIntent(BaseModel):
     writes: list[IntentWrite]
     created_dirs: list[str] = Field(default_factory=list)
     ts: float
+    integrity: str | None = None
 
 
 class CaptureEntry(BaseModel):
@@ -252,16 +256,37 @@ class WorkspaceEffects:
     def _fsync_json(self, path: Path, model: BaseModel) -> None:
         self._atomic_write(path, model.model_dump_json().encode("utf-8"), "record")
 
+    @staticmethod
+    def _record_integrity(model: BaseModel) -> str:
+        payload = json.dumps(
+            model.model_dump(mode="json", exclude={"integrity"}),
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _verify_record_integrity(self, model: BaseModel, path: Path) -> None:
+        integrity = getattr(model, "integrity", None)
+        if integrity is None:
+            raise WorkspaceFault(f"durable record has no integrity digest: {path}")
+        if not hmac.compare_digest(integrity, self._record_integrity(model)):
+            raise WorkspaceFault(f"durable record integrity mismatch: {path}")
+
     def _write_lease_record(self, lease: Lease) -> None:
         epoch, node_id = lease.node_key
         self._fsync_json(
             self._record_path("leases", epoch, node_id, lease.attempt),
-            LeaseRecord(
-                epoch=epoch, node_id=node_id, attempt=lease.attempt,
-                pre_head=lease.pre_head, preexisting=sorted(lease.preexisting),
-                preexisting_dirs=sorted(lease.preexisting_dirs), ts=time.time(),
-            ),
+            self._signed_lease_record(lease),
         )
+
+    def _signed_lease_record(self, lease: Lease) -> LeaseRecord:
+        epoch, node_id = lease.node_key
+        record = LeaseRecord(
+            epoch=epoch, node_id=node_id, attempt=lease.attempt,
+            pre_head=lease.pre_head, preexisting=sorted(lease.preexisting),
+            preexisting_dirs=sorted(lease.preexisting_dirs), ts=time.time(),
+        )
+        record.integrity = self._record_integrity(record)
+        return record
 
     def load_lease_record(self, epoch: int, node_id: str, attempt: int) -> LeaseRecord | None:
         path = self._record_path("leases", epoch, node_id, attempt)
@@ -271,6 +296,7 @@ class WorkspaceEffects:
             if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
                 raise WorkspaceFault(f"lease record is not a regular file: {path}")
             record = LeaseRecord.model_validate_json(path.read_bytes())
+            self._verify_record_integrity(record, path)
             if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
                 raise WorkspaceFault(
                     f"lease record identity mismatch for {path}: "
@@ -283,8 +309,10 @@ class WorkspaceEffects:
             raise WorkspaceFault(f"lease record is unreadable or corrupt: {path}: {exc}") from exc
 
     def write_intent(self, intent: InplaceIntent) -> None:
+        signed = intent.model_copy(deep=True)
+        signed.integrity = self._record_integrity(signed)
         self._fsync_json(
-            self._record_path("intents", intent.epoch, intent.node_id, intent.attempt), intent
+            self._record_path("intents", intent.epoch, intent.node_id, intent.attempt), signed
         )
 
     def load_intent(self, epoch: int, node_id: str, attempt: int) -> InplaceIntent | None:
@@ -295,6 +323,7 @@ class WorkspaceEffects:
             if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
                 raise WorkspaceFault(f"intent record is not a regular file: {path}")
             record = InplaceIntent.model_validate_json(path.read_bytes())
+            self._verify_record_integrity(record, path)
             if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
                 raise WorkspaceFault(
                     f"intent record identity mismatch for {path}: "
@@ -392,7 +421,7 @@ class WorkspaceEffects:
                               "quarantine unborn update-ref -d", diff_path)
             self._checked(self.git("reset"), "quarantine unborn reset", diff_path)
         self._remove_leaks(
-            sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting)),
+            self._attempt_leaks(rec.preexisting, rec.preexisting_dirs),
             None if rec.preexisting_dirs is None else set(rec.preexisting_dirs),
         )
         return diff_path
@@ -414,7 +443,7 @@ class WorkspaceEffects:
         """Byte-exactly capture dirt before quarantine reset/sweep."""
         head = self._cleanup_head()
         base = "HEAD" if head is not None else _EMPTY_TREE
-        leaks = sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
+        leaks = self._attempt_leaks(rec.preexisting, rec.preexisting_dirs)
         return self._capture_workspace(
             self.run_dir / "quarantine",
             f"{rec.epoch}-{rec.node_id}-{rec.attempt}",
@@ -618,7 +647,9 @@ class WorkspaceEffects:
         # the empty tree when the lease opened on an unborn repo — captures committed AND
         # staged/tracked leaks; this lease's untracked/ignored are captured separately.
         base = pre if pre is not None else _EMPTY_TREE
-        leaks = sorted(set(self._untracked_ignored_paths()) - lease.preexisting)
+        leaks = self._attempt_leaks(
+            list(lease.preexisting), list(lease.preexisting_dirs)
+        )
         diff_path = self._capture_workspace(
             self.run_dir / "failed-diffs", Path(diff_name).stem, base, leaks
         )
@@ -651,7 +682,7 @@ class WorkspaceEffects:
         # had STAGED only surfaces as untracked once the index is reset. The sweep stays
         # lease-scoped — preexisting user files and the run_dir subtree are never touched.
         self._remove_leaks(
-            sorted(set(self._untracked_ignored_paths()) - lease.preexisting),
+            self._attempt_leaks(list(lease.preexisting), list(lease.preexisting_dirs)),
             set(lease.preexisting_dirs),
         )
         return diff_path
@@ -682,6 +713,19 @@ class WorkspaceEffects:
         if errors:
             raise WorkspaceFault(f"cannot snapshot workspace directories: {errors[0]}")
         return found
+
+    def _attempt_leaks(
+        self, preexisting: list[str], preexisting_dirs: list[str] | None
+    ) -> list[str]:
+        paths = set(self._untracked_ignored_paths()) - set(preexisting)
+        if preexisting_dirs is not None:
+            new_dirs = set(self._workspace_dirs()) - set(preexisting_dirs)
+            roots = {
+                rel for rel in new_dirs
+                if not any(parent.as_posix() in new_dirs for parent in Path(rel).parents)
+            }
+            paths.update(roots)
+        return sorted(paths, key=lambda rel: (len(Path(rel).parts), rel))
 
     def _untracked_ignored_paths(self) -> list[str]:
         """The untracked (`??`) and ignored (`!!`) paths git reports PER FILE
@@ -808,14 +852,16 @@ class WorkspaceEffects:
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         return Integration("committed", commit=sha, paths=list(declared))
 
-    def rollback_inplace(self, intent: InplaceIntent) -> None:
+    def rollback_inplace(
+        self, intent: InplaceIntent, preexisting_dirs: set[str] | None = None
+    ) -> None:
         """Reverse a durable intent without destroying post-crash operator bytes.
 
         Current state matching either the expected engine write or the recorded pre-state
         is an idempotent rollback case. Anything else is byte-captured first; only after
         that manifest is durable are canonical targets restored and unstaged.
         """
-        self._validate_intent_targets(intent)
+        self._validate_intent_targets(intent, preexisting_dirs)
         unexpected = [
             w.path for w in intent.writes
             if not self._matches_expected(w) and not self._matches_prestate(w)
@@ -845,8 +891,38 @@ class WorkspaceEffects:
                 "inplace rollback unstage",
             )
 
-    def _validate_intent_targets(self, intent: InplaceIntent) -> None:
+    def _validate_intent_targets(
+        self, intent: InplaceIntent, preexisting_dirs: set[str] | None
+    ) -> None:
         root = self.workdir.resolve()
+        allowed_dirs = {
+            parent.as_posix()
+            for write in intent.writes
+            for parent in Path(write.path).parents
+            if parent.as_posix() != "."
+        }
+        if len(intent.created_dirs) != len(set(intent.created_dirs)):
+            raise WorkspaceFault("inplace intent contains duplicate created directories")
+        for rel in intent.created_dirs:
+            lexical = Path(rel)
+            if (
+                not rel
+                or lexical.is_absolute()
+                or ".." in lexical.parts
+                or ".git" in lexical.parts
+                or rel not in allowed_dirs
+                or (preexisting_dirs is not None and rel in preexisting_dirs)
+            ):
+                raise WorkspaceFault(f"invalid created directory in inplace intent: {rel!r}")
+            expected_dir = root / rel
+            try:
+                actual_dir = (self.workdir / rel).resolve()
+            except OSError as exc:
+                raise WorkspaceFault(
+                    f"cannot resolve created inplace directory {rel}: {exc}"
+                ) from exc
+            if actual_dir != expected_dir or not actual_dir.is_relative_to(root):
+                raise WorkspaceFault(f"created inplace directory changed topology: {rel}")
         for write in intent.writes:
             expected = root / write.path
             try:
