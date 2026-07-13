@@ -1,0 +1,32 @@
+# Example wildflows rig registry (owner-facing config; YAML by policy).
+#
+# Each entry names a rig the planner can reference via RigRef(name=...). The `kind`
+# selects the implementation; per-kind fields configure it. Loaded by
+# wildflows.rigconfig.load_rigs(path) -> RigRegistry.
+rigs:
+  # Deterministic test substrate: echoes the prompt back. No process, no model.
+  echo:
+    kind: echo
+
+  # Shells out to a command template ({prompt} is substituted, shell-quoted). This
+  # is the light real path — here a placeholder `claude -p` invocation.
+  shell-claude:
+    kind: shell
+    template: "claude -p {prompt}"
+
+  # The production executor seam: a grindstone-contract request.sh script driven with
+  # --worktree/--prompt/--log-dir/--handle-out/--timeout. Real scripts live OUTSIDE
+  # this repo (e.g. grindstone's models/picodex/senior_request.sh), so the path below
+  # is a commented placeholder — uncomment and point it at a real script to enable.
+  #
+  # senior:
+  #   kind: script
+  #   script: /abs/path/to/senior_request.sh
+  #   log_dir: /abs/path/to/run/logs
+  #   timeout_s: 1800
+  #   env:
+  #     GRINDSTONE_SENIOR_MODEL: gpt-5.6-sol
+  #     GRINDSTONE_SENIOR_EFFORT: high
+  #   busy_patterns:      # optional; sensible rate/session defaults if omitted
+  #     - "usage limit"
+  #     - "429"
