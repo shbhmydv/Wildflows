@@ -157,9 +157,9 @@ scheduler / worktree / planner / dashboard steps each depend on one narrow seam:
 |---|---|
 | `engine.py` | epoch lifecycle, expression traversal, primitive orchestration |
 | `admission.py` | dealias + deterministic ids + whole-tree validation (`admit_epoch`) |
-| `projection.py` | the one live journal fold (`RunProjection.apply`), resume decisions, `replay` |
-| `workspace.py` | containment, git mediation, reconciliation (`Workspace`) |
-| `result.py` | the `Result` / `Outcome` value types |
+| `projection.py` | the one live journal fold (`RunProjection.apply`), resume decisions, `ExecutionOutcome`, `replay` |
+| `workspace.py` | the effect transaction (`WorkspaceEffects`: lease, git mediation, reconciliation, failure revert+capture, containment) + `CompletionRecorder` (event ordering) |
+| `result.py` | the `Result` / `Outcome` artifact value + `CommitReceipt` / `IntegrationReceipt` effect record |
 | `journal.py` | the single append owner: seq-assign + fsync + `projection.apply` |
 
 There is exactly ONE state system: the journal's live `RunProjection`, folded by one
@@ -212,10 +212,10 @@ types (in `wildflows/events.py`), each a Pydantic model sharing a header
 |--------------|-------------------------------------------|------------|
 | `boundary`   | an epoch opens / closes                   | `phase: opened\|closed`, `expr` (opened: the admitted tree) |
 | `dispatched` | a `do`/`combine`/`inplace`/`setup` starts | `rig`, `task`/`cmd`, `workdir` |
-| `result`     | an agent/primitive produced output        | `ok`, `text` tail, `files`, `exit_code?`, `loop_status?` |
-| `integrated` | the core applied+committed a result       | `commit`, `paths` (disjoint-ownership set) |
+| `result`     | an agent/primitive produced output        | `outcome` (source of truth; `ok` derived), `text` tail, `files` (artifacts), `exit_code?`, `loop_status?` |
+| `integrated` | the core applied+committed a result       | `commits` (every attributed commit + its paths; `commit`/`paths` derived) |
 | `judged`     | a `do`-as-judge produced a verdict         | `verdict`, `ok`, `target_node` |
-| `loop_iter`  | a `loop` completed one iteration          | `iteration`, `commit`, `converged` |
+| `loop_iter`  | a `loop` completed one iteration          | `iteration`, `commit`, `converged` (body outcome by reference, no payload) |
 | `asked`      | an `ask` parked                           | `question`, `options` |
 | `answered`   | the owner answered (or the ask expired)   | `answer`, `ok` |
 
@@ -235,12 +235,32 @@ Notes:
   lets replay expose "iterations-completed + last commit" (D5) in a two-line fold with
   no special case. Each iteration's inner nodes still emit their normal
   `dispatched`/`result`/`integrated`; `loop_iter` is the per-iteration cap/convergence
-  marker over them, not a replacement.
+  marker over them, not a replacement. **`loop_iter` carries NO body-artifact payload
+  copy (hand-7, item 3): it references the body outcome by journal position** — the body
+  leaf's `result` is the last one folded before the `loop_iter`, so the projection
+  recovers the iteration's body from its live last-result at fold time (old journals with
+  legacy `body_*` fields fold identically, since that same preceding `result` is present).
+- **Completion ordering (hand-7, item 4): ONE recorder, one order — `result` THEN
+  `integrated`, for every path** (do, inplace, reconciliation). This replaces three
+  inconsistent orderings. Result-before-integrated is the torn-tail contract: an effectful
+  result without its `integrated` reads as NOT durable (it re-runs / reconciles), never a
+  lost or duplicated effect.
 - `integrated` is emitted only by the **core**, never a rig — it is the mediation
   proof (invariant 1). This holds for **`do`** too (hand-4, B5): after a rig runs, the
   core stages + commits the worktree's changes (`git add -A -- .`, message keyed by
-  node_id) and emits `integrated` with the changed paths. An effectless `do` (no diff)
-  legitimately produces no `integrated`.
+  node_id) and emits `integrated`. **The `integrated` event carries an
+  `IntegrationReceipt` — EVERY commit in `pre..post` (a rig may legitimately author
+  several), each with its own changed paths (hand-7, item 3 / defect 4)**; `commit` (the
+  final sha) and `paths` (the order-preserving union — the disjoint-ownership set) are
+  derived. Replay **accumulates** a node's receipts (union of commits) — no last-write-wins
+  on a single `paths` list. An effectless `do` (no diff) legitimately produces no
+  `integrated`. **Result vs effect (hand-7):** `Result.files` is the AGENT ARTIFACT list
+  (== the effect paths in the shared-workdir PoC, distinct once per-node worktrees land);
+  the `IntegrationReceipt` is the ownership/commit ledger, and durability keys off the
+  receipt, not the artifact list.
+- **`result.outcome` is the single terminal-status source; `ok` is a derived convenience
+  (`outcome == "ok"`)** — the ok/outcome duplication is collapsed (hand-7, item 3). A loop
+  that hits its cap without converging is `outcome="failed"`. See the compatibility note (§6).
 - A **`loop`**'s final `result` carries the last integrated iteration's body artifact in
   `text`/`files`; the convergence/cap disposition rides in the SEPARATE `loop_status`
   field (SF6, hand-4), so a downstream `combine` consumes the artifact, never the status
@@ -334,6 +354,16 @@ discriminator; loading re-parses each line back into the typed union. The journa
 the *only* durable run state the dashboard and resume consume — everything else (git
 tip, worktree artifacts) hangs off node_ids recorded in it. The journal exposes:
 `append(event) -> seq`, `events() -> list[Event]`, and `load(run_dir) -> Journal`.
+
+**Event shape versioning + compatibility (hand-7).** Item 3 changed three event shapes
+(collapsed `result.ok`→`outcome`; `integrated.commit`/`paths`→`commits`; dropped
+`loop_iter.body_*`). There is no explicit schema-version integer yet (a later dashboard
+call); instead each changed model owns a `mode="before"` **compatibility reader** so an
+OLD journal folds unchanged: a bare `ok=False` (or the old loop-cap `ok=False,
+outcome="ok"` drift line) migrates to `outcome="failed"`; a single-commit `integrated`
+migrates to a one-element `commits`; a legacy `loop_iter.body_*` payload is ignored (the
+preceding `result` reconstructs the body). The frozen `tests/fixtures/journals/*.ndjson`
+are genuinely old-shape and prove these readers on every run.
 
 **Torn-tail tolerance (B2, hand-4):** a kill/power-loss during the final `write()` can
 leave the last ndjson line unterminated or malformed. `load` drops exactly that one
@@ -588,6 +618,11 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     instead of re-executing — no duplicated or lost effect. Reconciliation runs only for
     TOP-LEVEL nodes (resume floor `-1`); a loop body's per-iteration commits reuse the
     same marker, so loop resume is owned by the loop fold (NB3/B4), not the marker scan.
+    **Reachability rule (hand-7, defect 1):** the marked commit must be REACHABLE from
+    current `HEAD` (the scan is `git rev-list --grep=<marker> HEAD`, which walks only
+    HEAD's ancestry). A marked commit on an unrelated/side branch — absent from the
+    worktree — is NOT retro-integrated; it is left to normal re-execution, never false
+    durable attribution of an effect the worktree does not contain.
 
 22. **Rig-commit recording + shared-workdir reset policy (NB5).** After every `do` the
     core snapshots pre-run HEAD. On SUCCESS, commits the rig itself made (`pre..HEAD` —
@@ -667,3 +702,42 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     `expr.py` docstring corrected. `RigRef.params`, the second `Judged` event,
     `LoopIter.body_*`, the `ok`/`outcome` duplication, and `_capture_and_reset_dirty` are
     intentionally LEFT for a later hand (they carry behavior/wire risk or await worktrees).
+
+### Hand-7 calls (RAZE items 3+4 + pass-3 review) pending review
+
+32. **Result / effect / outcome separation (item 3).** (a) `Result.outcome` is the single
+    terminal-status source; `ok` is a derived `computed_field`, collapsing the ok/outcome
+    duplication (mirrored on `ResultEvent`). (b) The `integrated` event carries an
+    `IntegrationReceipt` = every commit in `pre..post` with per-commit paths; replay
+    ACCUMULATES a node's receipts (no last-write-wins on `paths`). `Result.files` is now
+    framed as the artifact list, the receipt as the ownership ledger; durability keys off
+    the receipt. (c) `_exec` returns an `ExecutionOutcome` — a leaf's result key, or
+    position-indexed child references for `seq`/`dispatch`; the loop reads its body's
+    outcome through that reference (the hand-6 `last_result_since` bridge is deleted) and
+    `loop_iter` drops its `body_*` payload copy for a by-position reference to the body's
+    journalled `result`.
+
+33. **Workspace effect transaction + completion recorder (item 4).** `WorkspaceEffects`
+    owns the per-node-attempt lease (pre/post HEAD over the shared workdir — the seam, not
+    yet a worktree), rig-commit discovery, staging/commit, failure evidence capture +
+    revert, marker reconciliation, and containment; the engine issues ZERO git commands.
+    `CompletionRecorder` owns the ONE event ordering (result then integrated). Per-node
+    worktree isolation later replaces the shared-workdir revert/clean policy with
+    discard-the-worktree.
+
+34. **Pass-3 defects, fixed inside 32/33.** (1) reconciliation requires the marked commit
+    reachable from HEAD (§5 entry 21). (2) a failed rig's OWN commits are reverted to the
+    lease's pre-HEAD after capturing them as evidence (shared-workdir policy; per-worktree
+    isolation later makes this discard-the-worktree). (3) failure evidence includes
+    untracked AND ignored artifacts (`git status --ignored`), and cleanup removes them
+    (`git clean -fdxq`). (4) a multi-commit rig run records every commit verifiably (§3).
+    (5) `ctx` file resolution rejects a symlink alias resolving into the git admin dir —
+    same path-safety home (`WorkspaceEffects`) as `inplace` edit resolution.
+
+35. **Deviation (bounded item-3 scope).** `Result.files` is NOT fully divorced from the
+    effect paths this hand: in the shared-workdir PoC the committed diff IS the do's
+    artifact, and the loop-artifact + resume-durability model depend on that coincidence
+    (none of which are the five pass-3 defects). The receipt is the separate ownership
+    record and durability predicate; the full artifact/effect divorce lands with per-node
+    worktrees (step 4), when the two genuinely diverge. Event-shape versioning is a
+    per-model compatibility reader, not yet an explicit schema integer (§6).
