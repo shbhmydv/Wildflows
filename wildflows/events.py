@@ -48,6 +48,12 @@ class ResultEvent(_Header):
     text: str = ""
     files: list[str] = Field(default_factory=list)
     exit_code: int | None = None
+    # A loop's final result reuses this event but carries the last integrated
+    # iteration's body artifact in text/files; the convergence/cap disposition rides
+    # in this SEPARATE field so a downstream `combine` consumes the artifact, never the
+    # status prose (SF6). None for every non-loop result. Journal-only (the dashboard
+    # reads it); replay's Result reconstruction ignores it.
+    loop_status: str | None = None
     # Outcome discriminator mirroring Result.outcome. A `busy` result (rate/session
     # wall) journals ok=False AND outcome="busy" so it is NOT confused with a task
     # failure; real backoff/re-entry on it is a later ladder step. Defaults to "ok"

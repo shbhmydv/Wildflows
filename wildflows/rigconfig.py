@@ -26,9 +26,10 @@ class EchoRigConfig(BaseModel):
 class ShellRigConfig(BaseModel):
     kind: Literal["shell"] = "shell"
     template: str
+    timeout_s: float  # required — an unbounded rig can hang an epoch forever (SF3)
 
     def build(self) -> Rig:
-        return ShellRig(template=self.template)
+        return ShellRig(template=self.template, timeout_s=self.timeout_s)
 
 
 class ScriptRigConfig(BaseModel):

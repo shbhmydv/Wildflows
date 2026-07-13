@@ -9,11 +9,16 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class RigRef(BaseModel):
-    """Names a rig implementation and its config; resolved via the rig registry."""
+    """Names a rig implementation and its config; resolved via the rig registry.
+
+    `params` is RESERVED for planner-integration and is NOT consumed by the engine yet
+    (it is not passed to the registry or the rig). It is admitted so the wire shape is
+    stable, but has no runtime effect until the planner-config seam lands (SF2, DESIGN §8).
+    """
 
     name: str
     params: dict[str, str] = Field(default_factory=dict)
@@ -32,12 +37,30 @@ class Edit(BaseModel):
     path: str
     content: str
 
+    @field_validator("path")
+    @classmethod
+    def _reject_option_like_path(cls, v: str) -> str:
+        # An edit path is a literal path, never a git option. `--all` / `-f` reaching
+        # `git add` would stage the whole tree (reviewer B6, scenario B); reject at
+        # admission so invalid expression data never reaches the engine.
+        if v.startswith("-"):
+            raise ValueError(f"edit path must not look like an option (leading dash): {v!r}")
+        return v
+
 
 class Until(BaseModel):
     """A loop predicate: a shell `cmd` (exit-0 = done) or planner-judged `flag`."""
 
     kind: Literal["cmd", "flag"]
     cmd: str | None = None
+
+    @model_validator(mode="after")
+    def _cmd_requires_command(self) -> "Until":
+        # A `cmd` predicate without a command is invalid expression data, not an engine
+        # crash after the epoch is already open (SF5). Reject it on admission.
+        if self.kind == "cmd" and self.cmd is None:
+            raise ValueError("until(kind='cmd') requires a `cmd`")
+        return self
 
 
 class Do(BaseModel):

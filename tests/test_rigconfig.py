@@ -16,6 +16,7 @@ rigs:
   local:
     kind: shell
     template: "printf '%s' {prompt}"
+    timeout_s: 60
   senior:
     kind: script
     script: /path/to/senior_request.sh

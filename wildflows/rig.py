@@ -65,20 +65,36 @@ class ShellRig:
 
     This is the real plug-in path (e.g. template='claude -p {prompt}'); the command
     runs with cwd=workdir so a real rig writes its files inside the worktree.
+
+    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever (SF3). A
+    timed-out command is reaped and returned as `outcome="failed"` with a `[timeout]`
+    marker (reaping the process GROUP is ladder step 4).
     """
 
-    def __init__(self, template: str) -> None:
+    def __init__(self, template: str, timeout_s: float) -> None:
         self.template = template
+        self.timeout_s = timeout_s
 
     def run(self, prompt: str, workdir: Path) -> Result:
         cmd = self.template.replace("{prompt}", shlex.quote(prompt))
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            err = exc.stderr or b""
+            stderr = err.decode() if isinstance(err, bytes) else err
+            return Result(
+                text=f"[timeout] command exceeded {self.timeout_s}s\n{stderr}",
+                ok=False,
+                exit_code=None,
+                outcome="failed",
+            )
         return Result(
             text=proc.stdout if proc.returncode == 0 else proc.stderr,
             ok=proc.returncode == 0,

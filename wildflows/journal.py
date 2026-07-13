@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from wildflows.events import Event, parse_event
 
 
@@ -36,10 +38,24 @@ class Journal:
 
     @classmethod
     def load(cls, run_dir: Path) -> "Journal":
-        """Reconstruct a journal from its ndjson alone (the resume/dashboard entrypoint)."""
+        """Reconstruct a journal from its ndjson alone (the resume/dashboard entrypoint).
+
+        Tolerates exactly ONE torn tail: a kill/power-loss during the final `write()`
+        can leave the last line unterminated or malformed (`{"kind":"result"` with no
+        newline). That last-line-only failure is dropped silently — the record never
+        durably completed, so the next append safely reuses its seq. A malformed
+        COMPLETE or MIDDLE record still raises: only the final line may be torn (B2).
+        """
         j = cls(run_dir)
-        if j.path.exists():
-            for line in j.path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    j._events.append(parse_event(json.loads(line)))
+        if not j.path.exists():
+            return j
+        lines = [ln for ln in j.path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        last = len(lines) - 1
+        for i, line in enumerate(lines):
+            try:
+                j._events.append(parse_event(json.loads(line)))
+            except (json.JSONDecodeError, ValidationError):
+                if i == last:
+                    break  # torn final record — drop it, no durable log
+                raise
         return j

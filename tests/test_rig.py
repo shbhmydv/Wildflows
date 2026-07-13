@@ -17,7 +17,7 @@ def test_echo_rig_is_deterministic(tmp_path: Path) -> None:
 
 
 def test_shell_rig_runs_command_template(tmp_path: Path) -> None:
-    rig = ShellRig(template="printf '%s' {prompt}")
+    rig = ShellRig(template="printf '%s' {prompt}", timeout_s=30)
     r = rig.run("wildflows", tmp_path)
     assert r.ok is True
     assert r.exit_code == 0
@@ -25,10 +25,20 @@ def test_shell_rig_runs_command_template(tmp_path: Path) -> None:
 
 
 def test_shell_rig_nonzero_exit_is_not_ok(tmp_path: Path) -> None:
-    rig = ShellRig(template="false")
+    rig = ShellRig(template="false", timeout_s=30)
     r = rig.run("x", tmp_path)
     assert r.ok is False
     assert r.exit_code != 0
+
+
+def test_shell_rig_timeout_is_reaped_and_journalled(tmp_path: Path) -> None:
+    # An unbounded rig can hang an epoch forever; timeout_s reaps it and returns a
+    # `failed` result with a [timeout] marker rather than blocking (SF3).
+    rig = ShellRig(template="sleep 99999", timeout_s=0.3)
+    r = rig.run("x", tmp_path)
+    assert r.ok is False
+    assert r.outcome == "failed"
+    assert "[timeout]" in r.text
 
 
 def test_registry_resolves_by_name(tmp_path: Path) -> None:

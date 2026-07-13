@@ -13,6 +13,7 @@ rigs:
   shell-claude:
     kind: shell
     template: "claude -p {prompt}"
+    timeout_s: 300        # required — no unbounded rig (a hung command must be reaped)
 
   # The production executor seam: a grindstone-contract request.sh script driven with
   # --worktree/--prompt/--log-dir/--handle-out/--timeout. Real scripts live OUTSIDE
