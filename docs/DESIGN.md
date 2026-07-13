@@ -136,10 +136,12 @@ predicate (`cmd` whose exit-0 means done, or `flag` meaning "planner-judged last
 result ok"); `Edit(path, content)`.
 
 Every node carries a stable **`node_id`** (assigned by the core when the expression
-tree is admitted, deterministic pre-order path like `n0.1.2`). The node_id is the
-join key between the expression tree and the journal — it is what makes resume =
-"replay the log against the tree." A rails block rides alongside the root expression,
-not inside it (§4).
+tree is admitted, deterministic pre-order path like `n0.1.2`). The cross-epoch join
+key between the expression tree and the journal is **`(epoch, node_id)`**, NOT
+`node_id` alone: one epoch's `n0` must never inherit an earlier epoch's `n0` result, so
+replay scopes every folded fact by `(epoch, node_id)` (B3, hand-4). This is what makes
+resume = "replay the log against the tree." A rails block will ride alongside the root
+expression, not inside it (§4, deferred).
 
 One expression tree = one **epoch** = one planner re-entry point + one durability
 point (§3). The tree is validated by Pydantic on admission; `do`, `inplace`, `seq`, `dispatch`, and
@@ -166,7 +168,7 @@ types (in `wildflows/events.py`), each a Pydantic model sharing a header
 |--------------|-------------------------------------------|------------|
 | `boundary`   | an epoch opens / closes                   | `phase: opened\|closed`, `expr` (opened: the admitted tree), `rails` |
 | `dispatched` | a `do`/`combine`/`inplace`/`setup` starts | `rig`, `task`/`cmd`, `workdir` |
-| `result`     | an agent/primitive produced output        | `ok`, `text` tail, `files`, `exit_code?` |
+| `result`     | an agent/primitive produced output        | `ok`, `text` tail, `files`, `exit_code?`, `loop_status?` |
 | `integrated` | the core applied+committed a result       | `commit`, `paths` (disjoint-ownership set) |
 | `judged`     | a `do`-as-judge produced a verdict         | `verdict`, `ok`, `target_node` |
 | `loop_iter`  | a `loop` completed one iteration          | `iteration`, `commit`, `converged` |
@@ -191,7 +193,15 @@ Notes:
   `dispatched`/`result`/`integrated`; `loop_iter` is the per-iteration cap/convergence
   marker over them, not a replacement.
 - `integrated` is emitted only by the **core**, never a rig — it is the mediation
-  proof (invariant 1).
+  proof (invariant 1). This holds for **`do`** too (hand-4, B5): after a rig runs, the
+  core stages + commits the worktree's changes (`git add -A -- .`, message keyed by
+  node_id) and emits `integrated` with the changed paths. An effectless `do` (no diff)
+  legitimately produces no `integrated`.
+- A **`loop`**'s final `result` carries the last integrated iteration's body artifact in
+  `text`/`files`; the convergence/cap disposition rides in the SEPARATE `loop_status`
+  field (SF6, hand-4), so a downstream `combine` consumes the artifact, never the status
+  prose. `loop_status` is `None` on every non-loop result and is journal-only (the
+  dashboard reads it; replay's `Result` reconstruction ignores it).
 - Sequence numbers (`seq`) are a strictly increasing per-run integer; the journal is
   append-only ndjson plus an in-memory mirror (§6).
 
@@ -202,10 +212,10 @@ or gates — those are the mind's choices, not invariants.
 
 ---
 
-## 4. Rails (SETTLED invariant 3)
+## 4. Rails (SETTLED invariant 3) — DEFERRED to ladder step 4
 
-The planner declares rails **up front** with each epoch; the **core enforces** them. A
-confidently-wrong mind needs a wall.
+The planner will declare rails **up front** with each epoch and the **core will
+enforce** them — a confidently-wrong mind needs a wall. The intended shape:
 
 ```
 Rails: budget_usd: float | None      # cumulative rig spend cap
@@ -213,34 +223,51 @@ Rails: budget_usd: float | None      # cumulative rig spend cap
        iter_cap:    int  | None       # loop iteration ceiling (per loop node)
 ```
 
-Enforcement is deterministic and lives in the core: a `loop` cannot exceed `iter_cap`;
-a node that would start after `deadline_s` is refused (the epoch closes with a
-`boundary(closed, reason=deadline)`); spend is accumulated from rig results and a node
-that would breach `budget_usd` is refused. Rails are recorded in the `boundary(opened)`
-event so replay reconstructs them without re-asking the planner. **(hand-1 call, review
-pending)** — the skeleton names budget/deadline/iteration caps; the precise refusal
-semantics (refuse-to-start vs interrupt-in-flight) are chosen as *refuse-to-start* for
-determinism; an in-flight kill on deadline is a step-4 (worktree hygiene) concern.
+**Rails are NOT admitted, recorded, or enforced yet.** Rails admission (a validated
+block riding the `boundary(opened)` event) and enforcement land **together at ladder
+step 4** (worktree hygiene), so the executor never records a rail it cannot enforce
+nor enforces one it never admitted. Until then, **the only live rail is the executable
+`loop`'s `cap`** — a `loop` cannot exceed `node.cap` (core-enforced; cap-exhaustion is
+an `ok=False` result, never a crash). Budget, deadline, and `iter_cap` refusal
+semantics do not exist in the current engine. When they land, the chosen semantics are
+*refuse-to-start* (a node that would breach a rail is refused and the epoch closes with
+`boundary(closed, reason=...)`); an in-flight deadline kill is a step-4 concern. **(SF4,
+hand-4: rails deferral confirmed on owner review — do not read §4 as currently enforced.)**
 
 ---
 
 ## 5. Resume semantics (SETTLED invariants 2 & D5)
 
 Resume = **replay the ndjson against the expression tree**. There is ONE re-entry path
-(grindstone's 76d01fe lesson): on start, load the journal, fold it into per-node state,
-and continue. Per-primitive replay rules:
+(grindstone's 76d01fe lesson): on start, `Engine` loads the journal (seq continues
+strictly-increasing across restarts, B1), folds it into per-`(epoch, node_id)` state,
+and `run_epoch` re-enters. A fully-closed epoch is a no-op; an opened-but-unclosed epoch
+resumes **without a second `boundary(opened)`**; a fresh epoch opens. Per-primitive
+replay rules:
 
-- **`do` / `combine` / `setup`:** a node with a durable `result` (and, for effectful
-  ones, an `integrated`) is **done** — its result is read from the journal/artifacts,
-  never re-run. A node `dispatched` without a `result` is **in-flight** → re-dispatch
-  (the prior worktree/process is dead; the reaper guarantees no orphan mutates git).
+- **`do` / `combine` / `setup`:** a node with a durable `result` is **done** — BUT a
+  node with **declared file effects** (a non-empty `result.files`) is durable only once
+  the core's `integrated` (the committed diff) is journalled; a result without its
+  `integrated` is **NOT durable** and re-runs (B5). An **effectless** node (no diff) is
+  durable on its result alone. A node `dispatched` without a `result` is **in-flight** →
+  re-dispatch (the prior worktree/process is dead; the reaper guarantees no orphan
+  mutates git). The rig's claim is never the durability record — the committed diff is.
 - **`inplace`:** `integrated` present → done (the commit is durable); `dispatched`
-  without `integrated` → re-apply the edits (whole-file writes are idempotent).
+  without `integrated` → re-apply the edits (whole-file writes are idempotent). An
+  empty/no-diff inplace is a durable no-op.
 - **`dispatch`:** fold each child independently; integrate ready children, re-dispatch
   in-flight ones.
 - **`loop` (D5):** live session state is gone. Find the **last integrated iteration**
-  from the journal; restart the body from the next iteration with the **journal tail as
-  briefing**. The `cap` counts integrated iterations, so a resume cannot exceed it.
+  from the journal (the count of `loop_iter` events); restart the body from the next
+  iteration with the **journal tail as briefing**. The `cap` counts integrated
+  iterations, so a resume cannot exceed it. **Partial-iteration fold rule (B4, hand-4):**
+  the resumed iteration is *partial* — some inner nodes ran before the process died.
+  Inner-node state journalled **at or before the last `loop_iter` event** belongs to a
+  COMPLETED iteration and does NOT satisfy resume for the partial one; only inner state
+  journalled **after** the last `loop_iter` is durable for the current iteration. The
+  engine implements this by passing the last `loop_iter` seq as a resume *floor* into the
+  partial iteration's body (state `seq <= floor` is stale); every subsequent fresh
+  iteration re-runs its whole body (floor = +∞).
 - **`ask`:** `asked` without `answered` → still parked; re-surface to the owner.
   `answered` present → the answer is durable, continue.
 - **`boundary(opened)` without `boundary(closed)`:** the epoch is incomplete; resume
@@ -261,6 +288,19 @@ discriminator; loading re-parses each line back into the typed union. The journa
 the *only* durable run state the dashboard and resume consume — everything else (git
 tip, worktree artifacts) hangs off node_ids recorded in it. The journal exposes:
 `append(event) -> seq`, `events() -> list[Event]`, and `load(run_dir) -> Journal`.
+
+**Torn-tail tolerance (B2, hand-4):** a kill/power-loss during the final `write()` can
+leave the last ndjson line unterminated or malformed. `load` drops exactly that one
+torn FINAL record (it never durably completed, so the next append reuses its seq) and
+still raises on any malformed COMPLETE or MIDDLE record. fsync-on-append bounds the
+damage to the last line; it does not eliminate a partially written last record.
+
+**Single-writer precondition (N2, hand-4):** the journal derives `seq` from its
+in-memory length and has **no lock or writer queue**. `Engine`-load-continues-seq (B1)
+covers **serial restarts only** — one append owner at a time. Parallel dispatch (ladder
+step 3) MUST introduce a single central append owner or an interprocess lock before any
+concurrent children/processes append; two live `Journal` instances over one run_dir
+would emit duplicate/reordered seqs. Not built this hand.
 
 ---
 
@@ -444,3 +484,33 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     channel) and `--purpose`, and renames `--worktree`→`--workdir`, `--log-dir`→derived.
     The executor/worker contract (senior) is the general seam; a planner rig is a
     later, distinct role with its own extra flags.
+
+### Hand-4 calls (from external review) pending review
+
+13. **`(epoch, node_id)` is the replay join key** (B3), not `node_id` alone: every
+    folded fact (result/integrated/dispatched/loop) is scoped by epoch, and epoch
+    open/closed folds to the LATEST boundary event for that epoch, so a reopened epoch
+    is never reported closed and one epoch's node never inherits another's result.
+14. **`do` is core-integrated like `inplace`** (B5): the deterministic durability record
+    is the committed diff the core makes (`git add -A -- .` + commit), never the rig's
+    claim. Fold rule: a result with declared file effects (`files` non-empty) is durable
+    only with its `integrated`; an effectless `do` stays durable on its result alone.
+15. **`inplace` commits ONLY its declared paths** (B6) via a `--`-scoped pathspec commit
+    (`git commit -- <paths>`), preserving any pre-existing staged index; edit paths are
+    literal (leading-dash rejected at admission), and `.git`/resolved-gitdir writes are
+    refused (N1). Git failures inside integration become a journalled
+    `result(ok=False, outcome="failed")` carrying git stderr — never an escaping
+    exception (SF1); an empty `inplace` is a no-op ok result with no git calls.
+16. **Loop partial-iteration resume floor** (B4): inner-node state at/below the last
+    `loop_iter` seq is stale for the partial resumed iteration; the engine threads that
+    seq as a resume *floor* (fresh iterations use +∞). See §5.
+17. **Loop result = last integrated body artifact; `loop_status` holds the disposition**
+    (SF6): the loop's final `result` carries the body's `text`/`files`; the
+    convergence/cap string lives in the separate `loop_status` field so a downstream
+    `combine` receives the artifact, not prose. See §3.
+18. **`ShellRig.timeout_s` is required** (SF3): no rig may be unbounded; a timed-out
+    command is reaped and returned as `outcome="failed"` with a `[timeout]` marker. The
+    engine additionally wraps every `rig.run` in try/except → a journalled failed result
+    (never an escape after `dispatched`). A `cmd` `Until` without a `cmd` is rejected at
+    admission (SF5). `RigRef.params` is admitted but NOT yet consumed (reserved for the
+    planner-config seam, §8) — narrowed rather than implemented this hand (SF2).
