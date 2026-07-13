@@ -1,13 +1,16 @@
-"""Item-2 equivalence proof: the new RunProjection folds the pre-refactor journals to
-identical decisions/state.
+"""Equivalence + compatibility proof: the current RunProjection folds the PRE-collapse
+journals (old `ok`/`outcome` + single-commit `integrated` + `loop_iter.body_*` shapes)
+into the current per-node state via the compatibility readers.
 
-`tests/fixtures/journals/*.ndjson` are journals captured from the PRE-refactor engine
-(seq of inplace+do+ctx, a converging loop, a capped loop, two epochs on one workdir, and
-a failed-then-effectless do); each `*.snapshot.json` is the fold the OLD `ReplayState`
-produced for it. This test re-folds the same ndjson with the new `RunProjection.apply`
-and asserts an identical snapshot — so the projection rewrite is a pure equivalence
-refactor, not a behavior change. The fixtures are FROZEN "before" truth captured once
-against the old engine; they are never regenerated.
+`tests/fixtures/journals/*.ndjson` are journals captured from an EARLIER engine (seq of
+inplace+do+ctx, a converging loop, a capped loop, two epochs on one workdir, and a
+failed-then-effectless do). Each `*.snapshot.json` is the fold the CURRENT projection
+produces for that old ndjson — so this doubles as the old-journal compatibility test:
+the ok→outcome reconciler (incl. the loop-cap `ok=False, outcome="ok"` drift line), the
+single-commit `integrated`→`commits` migration, and the body-outcome-by-reference loop
+fold all run over genuinely old lines. The snapshots were REGENERATED once (hand-7) when
+item-3 changed the event shapes, via `_snapshot` over the current fold; the ndjson stay
+frozen old-shape truth so the compatibility readers keep being exercised.
 """
 from __future__ import annotations
 
@@ -42,10 +45,10 @@ def _snapshot(state: RunProjection) -> dict[str, object]:
                     for key, n in sorted(nodes.items()) if n.result is not None},
         "result_seq": {k(key): n.result_seq
                        for key, n in sorted(nodes.items()) if n.result is not None},
-        "integrated": {k(key): n.integrated_paths
-                       for key, n in sorted(nodes.items()) if n.integrated_paths is not None},
+        "integrated": {k(key): n.receipt.paths
+                       for key, n in sorted(nodes.items()) if n.receipt is not None},
         "integrated_seq": {k(key): n.integrated_seq
-                           for key, n in sorted(nodes.items()) if n.integrated_paths is not None},
+                           for key, n in sorted(nodes.items()) if n.receipt is not None},
         "dispatched": sorted(k(key) for key, n in nodes.items() if n.dispatched),
         "loop_iterations": {k(key): n.loop_iterations
                             for key, n in sorted(nodes.items()) if n.loop_iterations},

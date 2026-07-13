@@ -9,7 +9,9 @@ from __future__ import annotations
 import time
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field, model_validator
+
+from wildflows.result import CommitReceipt, reconcile_outcome
 
 
 class _Header(BaseModel):
@@ -40,10 +42,14 @@ class Dispatched(_Header):
 
 
 class ResultEvent(_Header):
-    """A primitive produced output."""
+    """A primitive produced output.
+
+    `outcome` is the single terminal-status source; `ok` is a derived convenience
+    (`outcome == "ok"`). A legacy/caller `ok` is folded into `outcome` by the shared
+    reconciler (the ok/outcome collapse + old-journal compatibility reader, item 3).
+    """
 
     kind: Literal["result"] = "result"
-    ok: bool
     text: str = ""
     files: list[str] = Field(default_factory=list)
     exit_code: int | None = None
@@ -53,19 +59,57 @@ class ResultEvent(_Header):
     # status prose. None for every non-loop result. Journal-only (the dashboard
     # reads it); replay's Result reconstruction ignores it.
     loop_status: str | None = None
-    # Outcome discriminator mirroring Result.outcome. A `busy` result (rate/session
-    # wall) journals ok=False AND outcome="busy" so it is NOT confused with a task
-    # failure; real backoff/re-entry on it is a later ladder step. Defaults to "ok"
-    # so pre-existing journal lines (no field) parse unchanged.
     outcome: Literal["ok", "failed", "busy"] = "ok"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _collapse_ok(cls, data: Any) -> Any:
+        return reconcile_outcome(data)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        return self.outcome == "ok"
 
 
 class Integrated(_Header):
-    """The core applied+committed a result (mediation proof; core-only)."""
+    """The core applied+committed a result (mediation proof; core-only).
+
+    Carries EVERY commit the core attributes to this node attempt (a rig may legitimately
+    author several commits in `pre..post`), each with its own changed paths, so the full
+    range is verifiable (item 3/defect 4). `commit` (the final sha) and `paths` (the
+    order-preserving union) are derived. A legacy single-commit line (`commit`+`paths`,
+    no `commits`) is migrated by the before-validator — the old-journal compatibility
+    reader for this event.
+    """
 
     kind: Literal["integrated"] = "integrated"
-    commit: str
-    paths: list[str] = Field(default_factory=list)
+    commits: list[CommitReceipt] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_single_commit(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "commits" in data:
+            return data
+        if "commit" in data:
+            out = {k: v for k, v in data.items() if k not in ("commit", "paths")}
+            out["commits"] = [{"sha": data["commit"], "paths": data.get("paths", [])}]
+            return out
+        return data
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def commit(self) -> str:
+        return self.commits[-1].sha if self.commits else ""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def paths(self) -> list[str]:
+        seen: dict[str, None] = {}
+        for c in self.commits:
+            for p in c.paths:
+                seen.setdefault(p, None)
+        return list(seen)
 
 
 class Judged(_Header):
@@ -90,13 +134,11 @@ class LoopIter(_Header):
     iteration: int
     commit: str | None = None
     converged: bool = False
-    # The iteration's body artifact, folded so a crash BETWEEN the last loop_iter and
-    # the loop's final ResultEvent can reconstruct the loop result without re-running a
-    # converged/capped body. Additive: pre-existing loop_iter lines
-    # (no fields) default to an empty body, matching the old behavior.
-    body_text: str = ""
-    body_files: list[str] = Field(default_factory=list)
-    body_exit_code: int | None = None
+    # No body-artifact payload copy (item 3): the loop_iter REFERENCES the body outcome
+    # by journal position — the body leaf's ResultEvent is the last result folded before
+    # this loop_iter, so the projection recovers the iteration's body from its live
+    # last-result at fold time. A pre-collapse line's `body_*` fields are ignored (the
+    # preceding ResultEvent still reconstructs the body), so old journals fold unchanged.
 
 
 class Asked(_Header):

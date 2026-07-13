@@ -48,7 +48,7 @@ class EchoRig:
     """Deterministic rig: echoes the prompt back. The test substrate."""
 
     def run(self, prompt: str, workdir: Path) -> Result:
-        return Result(text=f"echo: {prompt}", ok=True, exit_code=0)
+        return Result(text=f"echo: {prompt}", exit_code=0)
 
 
 class ShellRig:
@@ -90,14 +90,12 @@ class ShellRig:
             stdout, stderr = proc.communicate()
             return Result(
                 text=f"[timeout] command exceeded {self.timeout_s}s\n{stderr}",
-                ok=False,
                 exit_code=None,
                 outcome="failed",
             )
         ok = proc.returncode == 0
         return Result(
             text=stdout if ok else stderr,
-            ok=ok,
             exit_code=proc.returncode,
             outcome="ok" if ok else "failed",
         )
@@ -188,7 +186,6 @@ class ScriptRig:
             (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
             return Result(
                 text=f"[timeout] script exceeded {self.timeout_s}s\n{stderr}",
-                ok=False,
                 exit_code=None,
                 outcome="failed",
             )
@@ -200,7 +197,6 @@ class ScriptRig:
         text = proc.stdout if proc.returncode == 0 else (proc.stderr or proc.stdout)
         return Result(
             text=text,
-            ok=proc.returncode == 0,
             exit_code=proc.returncode,
             outcome=outcome,
         )

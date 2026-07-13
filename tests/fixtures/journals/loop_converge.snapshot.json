@@ -15,8 +15,8 @@
       "marker.txt"
     ],
     "0::n0.0.1": [
-      "counter",
-      "tick.txt"
+      "tick.txt",
+      "counter"
     ]
   },
   "integrated_seq": {
