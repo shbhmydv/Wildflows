@@ -461,6 +461,27 @@ class WorkspaceEffects:
         )
         return diff_path
 
+    def quarantine_inactive_certificate(
+        self,
+        epoch: int,
+        node_id: str,
+        attempt: int,
+        pre_head: str | None,
+        post_head: str,
+        record: LeaseRecord | None,
+    ) -> Path | None:
+        """Preserve a certified attempt tip that is no longer active, then reset safely."""
+        rec = record or LeaseRecord(
+            epoch=epoch, node_id=node_id, attempt=attempt, pre_head=pre_head,
+            preexisting=self._untracked_ignored_paths(), preexisting_dirs=None, ts=0.0,
+        )
+        self._checked(
+            self.git("cat-file", "-e", f"{post_head}^{{commit}}"),
+            "inactive certificate object lookup",
+        )
+        self._preserve_tip(rec, post_head, None)
+        return self.quarantine_dead_attempt(rec)
+
     def quarantine_from_journal(
         self, epoch: int, node_id: str, attempt: int, pre_head: str | None
     ) -> Path | None:
@@ -556,6 +577,13 @@ class WorkspaceEffects:
         if rel in seen:
             return
         seen.add(rel)
+        root = self.workdir.resolve()
+        expected = root / rel
+        try:
+            if target.parent.resolve() != expected.parent:
+                raise WorkspaceFault(f"capture path changed topology: {rel}")
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot resolve capture parent for {rel}: {exc}") from exc
         try:
             info = target.lstat()
         except FileNotFoundError:
@@ -725,8 +753,16 @@ class WorkspaceEffects:
         if not rel or lexical.is_absolute() or ".." in lexical.parts:
             raise WorkspaceFault(f"invalid {what}: {rel!r}")
         target = root / lexical
-        if not target.is_relative_to(root):
-            raise WorkspaceFault(f"{what} escapes workdir: {rel!r}")
+        try:
+            resolved_parent = target.parent.resolve()
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot resolve parent for {what} {rel!r}: {exc}") from exc
+        if (
+            not target.is_relative_to(root)
+            or resolved_parent != target.parent
+            or not resolved_parent.is_relative_to(root)
+        ):
+            raise WorkspaceFault(f"{what} escapes workdir through path topology: {rel!r}")
         return target
 
     def _checked(
@@ -764,9 +800,9 @@ class WorkspaceEffects:
         untracked/ignored artifacts THIS attempt created) is captured to the run log dir;
         the workdir is then reset to the lease's PRE-run HEAD (undoing commits the failing
         rig made) and this lease's untracked/ignored leaks are removed. Cleanup is
-        LEASE-SCOPED (hand-8): only paths absent from `lease.preexisting` are touched, and
-        the run_dir subtree is hard-excluded — so pre-existing user files, the journal
-        under a run_dir-inside-workdir, and anything the lease did not create all survive.
+        LEASE-SCOPED: only attempt-created paths are swept, while pre-existing user bytes
+        and directories are restored from the lease baseline. The Engine requires run_dir
+        outside this unsandboxed shared workdir (hand-11 entry 56).
         Nested Git repositories the rig left are recursively byte-captured and removed
         (a plain `git clean -fd` would refuse them). Returns the evidence path
         or None if nothing changed. Per-node worktree isolation later replaces this with
@@ -812,7 +848,7 @@ class WorkspaceEffects:
             self._checked(self.git("reset"), "failure unborn reset", diff_path)
         # Recompute leaks AFTER the reset: a leak the failing rig (or a failed core commit)
         # had STAGED only surfaces as untracked once the index is reset. The sweep stays
-        # lease-scoped — preexisting user files and the run_dir subtree are never touched.
+        # lease-scoped — preexisting user paths are restored from the baseline.
         self._remove_leaks(
             self._attempt_leaks(list(lease.preexisting), list(lease.preexisting_dirs)),
             set(lease.preexisting_dirs),
@@ -841,7 +877,7 @@ class WorkspaceEffects:
                 rel = path.relative_to(self.workdir).as_posix()
                 if name == ".git" and root_path == self.workdir:
                     continue
-                if self._overlaps_run_dir(rel) or path.is_symlink():
+                if path.is_symlink():
                     continue
                 found.append(rel)
                 kept.append(name)
@@ -865,8 +901,8 @@ class WorkspaceEffects:
 
     def _untracked_ignored_paths(self) -> list[str]:
         """The untracked (`??`) and ignored (`!!`) paths git reports PER FILE
-        (`--untracked-files=all`), EXCLUDING the run_dir subtree, so an addition under a
-        pre-existing untracked directory is its own entry (hand-9, FAILURE-LEASE). A
+        (`--untracked-files=all`), so an addition under a pre-existing untracked directory
+        is its own entry (hand-9, FAILURE-LEASE). A
         nested Git repo still appears as ONE `dir/` entry — git never recurses into it —
         and is walked/removed as a directory by the evidence/sweep helpers."""
         status = self.git("status", "--ignored", "--porcelain", "-z", "--untracked-files=all")
@@ -879,9 +915,7 @@ class WorkspaceEffects:
         for entry in status.stdout.split("\0"):
             if not entry or entry[:2] not in ("??", "!!"):
                 continue
-            rel = entry[3:]
-            if not self._overlaps_run_dir(rel):
-                out.append(rel)
+            out.append(entry[3:])
         return out
 
     def _remove_leaks(
@@ -917,7 +951,7 @@ class WorkspaceEffects:
             parent = target.parent
             while parent != self.workdir:
                 rel_parent = parent.relative_to(self.workdir).as_posix()
-                if rel_parent in preexisting_dirs or self._overlaps_run_dir(rel_parent):
+                if rel_parent in preexisting_dirs:
                     break
                 try:
                     parent.rmdir()
@@ -943,18 +977,20 @@ class WorkspaceEffects:
                 self._fsync_dir(parent.parent)
                 parent = parent.parent
 
-    def _overlaps_run_dir(self, rel: str) -> bool:
-        """True if a workdir-relative path OVERLAPS the run_dir subtree — the run_dir
-        itself, anything inside it, OR an ANCESTOR of it. Git reports an untracked
-        directory as one top-level entry (e.g. `.wildflows/`), which is an ANCESTOR of a
-        `run_dir=<workdir>/.wildflows/run`; sweeping it would delete the live journal.
-        None of these may ever be captured or swept."""
-        # Deliberately lexical/no-follow: an untracked symlink that merely POINTS at the
-        # run directory is an attempt-created effect and is safe to capture+unlink. Using
-        # resolve() here would exclude that alias and let a failed epoch close over it.
-        target = Path(os.path.abspath(self.workdir / rel))
-        run = Path(os.path.abspath(self.run_dir))
-        return target == run or target.is_relative_to(run) or run.is_relative_to(target)
+    def certificate_is_active(self, post_head: str | None) -> bool:
+        if post_head is None:
+            return False
+        live = self._cleanup_head()
+        if live is None:
+            return False
+        ancestor = self.git("merge-base", "--is-ancestor", post_head, live)
+        if ancestor.returncode == 0:
+            return True
+        if ancestor.returncode == 1:
+            return False
+        raise WorkspaceFault(
+            f"certificate reachability check failed: {ancestor.stderr.strip()}"
+        )
 
     def reconstruct_receipt(
         self, pre_head: str | None, post_head: str | None
@@ -1172,16 +1208,7 @@ class WorkspaceEffects:
 
     def _commit_all(self, message: str) -> Integration:
         """Stage + commit ALL worktree changes (a `do`'s dirty remainder)."""
-        pathspecs = ["."]
-        work = Path(os.path.abspath(self.workdir))
-        run = Path(os.path.abspath(self.run_dir))
-        if run.is_relative_to(work):
-            rel = run.relative_to(work).as_posix()
-            unstage_run = self.git("reset", "-q", "--", rel)
-            if unstage_run.returncode != 0:
-                return Integration("failed", stderr=unstage_run.stderr)
-            pathspecs.extend([f":(exclude){rel}", f":(exclude){rel}/**"])
-        add = self.git("add", "-A", "--", *pathspecs)
+        add = self.git("add", "-A", "--", ".")
         if add.returncode != 0:
             return Integration("failed", stderr=add.stderr)
         if self.git("diff", "--cached", "--quiet").returncode == 0:

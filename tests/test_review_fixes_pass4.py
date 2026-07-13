@@ -128,31 +128,17 @@ def test_do_integration_failure_reverts_and_captures_dirty_state(tmp_path: Path)
     assert state.results[(0, "n0.1")].files == []
 
 
-def test_failure_cleanup_preserves_run_dir_and_preexisting_untracked_files(
-    tmp_path: Path,
-) -> None:
-    """Failure cleanup is LEASE-SCOPED: it removes only THIS attempt's leaks, never the
-    run_dir (even inside the workdir) nor pre-existing untracked user files."""
+def test_run_dir_inside_shared_workdir_is_rejected_before_journal(tmp_path: Path) -> None:
+    """An unsandboxed rig can directly mutate files under its workdir, so the serial
+    shared-workdir engine requires transaction records outside that authority boundary."""
     workdir = tmp_path / "work"
     workdir.mkdir()
     _git_init(workdir)
-    (workdir / "base.txt").write_text("base", encoding="utf-8")
-    subprocess.run(["git", "add", "base.txt"], cwd=workdir, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=workdir, check=True)
-    # A pre-existing untracked user file present BEFORE the attempt opens.
-    (workdir / "user_notes.txt").write_text("keep me", encoding="utf-8")
+    run_dir = workdir / ".wildflows" / "run"
 
-    run_dir = workdir / ".wildflows" / "run"  # the documented target-repo location: INSIDE
-    reg = _shell_reg("printf boom > leak.txt; exit 5")
-    Engine(run_dir=run_dir, workdir=workdir, registry=reg).run_epoch(
-        Do(task="leak", rig=RigRef(name="shell")), epoch=0
-    )
-
-    assert not (workdir / "leak.txt").exists()               # the leak was swept
-    assert (workdir / "user_notes.txt").read_text() == "keep me"  # user file preserved
-    assert (run_dir / "events.ndjson").exists()              # the journal survived cleanup
-    state = replay(run_dir)
-    assert state.results[(0, "n0")].ok is False
+    with pytest.raises(ValueError, match="run_dir must be outside workdir"):
+        Engine(run_dir=run_dir, workdir=workdir, registry=_shell_reg("exit 5"))
+    assert not run_dir.exists()
 
 
 def test_failed_do_cleanup_removes_and_captures_nested_git_repository(tmp_path: Path) -> None:

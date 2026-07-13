@@ -47,13 +47,19 @@ __all__ = ["Engine", "replay", "RunProjection"]
 class Engine:
     def __init__(self, run_dir: Path, workdir: Path, registry: RigRegistry) -> None:
         self.run_dir = Path(run_dir)
+        resolved_workdir = Path(workdir).resolve()
+        if self.run_dir.resolve().is_relative_to(resolved_workdir):
+            raise ValueError(
+                "run_dir must be outside workdir in the shared-workdir engine; "
+                "an unsandboxed rig could otherwise mutate the journal"
+            )
         self.registry = registry
         # Load-continues-seq: a restart reuses the durable journal; its live projection is
         # folded from disk on load and updated on every append. Serial restarts only —
         # parallel dispatch (step 3) needs the single append owner this journal is (§6).
         self.journal = Journal.load(self.run_dir)
         self.run_id = self.run_dir.name
-        self.ws = WorkspaceEffects(workdir, self.run_dir)
+        self.ws = WorkspaceEffects(resolved_workdir, self.run_dir)
         self.rec = CompletionRecorder(self.journal, self.run_id)
 
     @property
@@ -212,16 +218,42 @@ class Engine:
         recovery (its effect was reverted). The `wf:` commit marker survives as forensic
         metadata only.
         """
-        if floor != -1:
-            return False
         node = self._proj.node(key)
+        if floor is None or node.result_seq <= floor:
+            return False
         if node.result is None or not node.result.ok:
             return False  # dispatched-only or failed: no completion certificate to recover
+        if not self.ws.certificate_is_active(node.result_post_head):
+            self._recover_inactive_certificate(key, node.result_post_head)
+            return False
         receipt = self.ws.reconstruct_receipt(node.dispatched_pre_head, node.result_post_head)
         if not receipt.commits:
             return False  # effectless result — durable on its own; resume_action handles it
         self.rec.record_integrated(key, receipt)
         return True
+
+    def _recover_inactive_certificate(self, key: NodeKey, post_head: str | None) -> None:
+        if post_head is None:
+            raise WorkspaceFault("effectful result has no post_head certificate")
+        node = self._proj.node(key)
+        epoch, node_id = key
+        attempt = node.dispatch_count - 1
+        try:
+            record = self.ws.load_lease_record(epoch, node_id, attempt)
+            if record is not None and record.pre_head != node.dispatched_pre_head:
+                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
+            self.ws.quarantine_inactive_certificate(
+                epoch, node_id, attempt, node.dispatched_pre_head, post_head, record
+            )
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, "inactive result certificate recovery", fault, "retry")
+        self.rec.record_result(
+            key,
+            Result(text="inactive result certificate quarantined; retry required", outcome="failed"),
+            post_head=self.ws.head_commit(),
+            recovery_action="retry",
+        )
+        self.ws.settle_records(epoch, node_id, attempt)
 
     def _recover_unclean(self, key: NodeKey) -> bool:
         """Retry checked cleanup for a durably halted node before any new mutation.

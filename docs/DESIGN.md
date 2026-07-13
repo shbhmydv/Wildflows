@@ -784,10 +784,9 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     (revert + capture), never a bare `ok=False`. (b) The `Lease` snapshots the untracked +
     ignored file set at open; failure cleanup removes ONLY paths absent from that snapshot
     (recomputed AFTER the index reset, so a staged-then-unstaged leak is swept), so
-    pre-existing user files survive. The run_dir subtree is hard-excluded — and because git
-    reports an untracked directory as one ANCESTOR entry (`.wildflows/` for a
-    `run_dir=<workdir>/.wildflows/run`), the exclusion covers ancestors-of / equal-to / and
-    inside the run_dir, so a run_dir inside the workdir keeps its journal. (c) Nested Git
+    pre-existing user files survive. **SUPERSEDED by hand-11 entry 56:** a run_dir inside
+    this unsandboxed shared workdir cannot be made authoritative by path exclusion alone
+    and is now rejected before journal creation. (c) Nested Git
     repositories are captured (their file listing + contents, never a bare `<unreadable>`)
     and removed recursively (a plain `git clean -fd` refuses them).
 38. **Explicit loop body-outcome reference (LOOP-OUTCOME-REFERENCE).** `loop_iter` carries
@@ -1003,7 +1002,8 @@ than patching each row. Both are the transaction model of record — not a later
     publication is same-directory temp write → file fsync → `os.replace` → parent-directory
     fsync. Record unlink is followed by parent-directory fsync. Records carry a canonical
     SHA-256 integrity digest in addition to identity/provenance checks, so schema-valid
-    field corruption cannot reclassify user files or add rollback targets. A present
+    field corruption cannot accidentally reclassify user files or add rollback targets
+    (the digest is corruption detection, not hostile-writer authentication). A present
     unsigned, non-regular, unreadable, malformed, integrity-invalid, or schema-invalid
     record is a typed `WorkspaceFault`; it is never confused with an absent legacy record
     and recovery performs no mutation after such a load failure.
@@ -1014,5 +1014,20 @@ than patching each row. Both are the transaction model of record — not a later
     canonical symlink support was chosen over blanket rejection because the resolved path
     can be used consistently by every transaction operation in the serial-M1 model;
     hard-linked targets are rejected because pathname resolution cannot canonicalize an
-    inode alias. A run_dir inside the worktree is excluded and explicitly unstaged during
-    do integration, so journal/record files can never enter an effect commit.
+    inode alias. **Evidence-backed deviation:** the serial shared-workdir engine rejects a
+    `run_dir` inside `workdir` before creating the journal. An unsandboxed rig has the same
+    OS identity and can unlink/rewrite/commit any in-workdir exclusion, so hand-8 entry 37's
+    claimed hard exclusion was unsound; target-repo `.wildflows/` run state waits for the
+    per-node worktree authority boundary.
+
+57. **Active completion certificate (hand-11).** Torn result→integrated recovery requires
+    the certified `post_head` to be an ancestor of live `HEAD`, not merely an extant Git
+    object. If an operator reset/diverged after the result, both the certified attempt tip
+    and current operator tip are quarantined, the lease baseline is restored, a durable
+    retry transition is journalled, and the node reruns. A receipt is never reconstructed
+    for an effect absent from the active tree.
+
+58. **Recovery topology containment (hand-11).** Baseline capture/restore validates every
+    intermediate parent against its canonical workdir location before reading or deleting.
+    A post-crash parent-symlink substitution halts persistently without following it into
+    an external directory.
