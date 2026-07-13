@@ -318,6 +318,13 @@ replay rules:
   durable on its result alone. A node `dispatched` without a `result` is **in-flight** →
   re-dispatch (the prior worktree/process is dead; the reaper guarantees no orphan
   mutates git). The rig's claim is never the durability record — the committed diff is.
+  **Two-boundary provenance (hand-9, §Appendix 41):** the `result` event is a SECOND
+  durable boundary carrying `post_head`; a torn result-then-integrated window reconstructs
+  the receipt from EXACTLY `pre_head..post_head` (never `..HEAD`). A dispatched-only tail has
+  no `post_head` certificate — it is ALWAYS re-run after cleaning its leftover dirt, and a
+  dead attempt's mid-rig commits stay as reachable forensic residue, never reset away. The
+  re-run's lease REFUSES to open on a dirty tracked/index worktree (the honest serial-M1
+  rule), so a failed attempt's revert can only ever undo its own effects.
 - **`inplace`:** `integrated` present → done (the commit is durable); `dispatched`
   without `integrated` → re-apply the edits (whole-file writes are idempotent). An
   empty/no-diff inplace is a durable no-op.
@@ -795,3 +802,65 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     a ref into an elder `Seq` sibling is fine. An `inplace` edit path that escapes only via
     a symlink (uncatchable at admission) becomes a durable FAILED result at write time,
     never an exception escaping after `dispatched`.
+
+### Hand-9 calls (from the pass-5 exit review) pending review
+
+41. **Two-boundary provenance model — `pre_head..post_head` (PROVENANCE-RANGE).** The
+    completion certificate is a SECOND durable boundary: the `result` event gains
+    `post_head`, the workdir HEAD at the moment the rig returned and the result was recorded
+    (nullable only on a pre-v1 line or an unborn repo). Receipt reconstruction on resume uses
+    EXACTLY `pre_head..post_head` — never `..HEAD` — so an operator commit made after process
+    death sits above `post_head` and is out of range by construction, never misattributed.
+    The ONLY torn window recoverable as success is a durable OK `result` whose `integrated`
+    was lost (reconstruct the receipt from the two bounds). A **dispatched-only tail** (no
+    `result`) has NO completion proof — a mid-rig checkpoint commit is not a certificate — so
+    it is NEVER blessed as success: the resume path treats it as an incomplete attempt, runs
+    the standard failure cleanup for its leftover DIRT (`git reset --hard HEAD` + untracked
+    sweep, preserving committed history), and RE-RUNS the node. **Forensic-residue policy:**
+    mid-rig checkpoint commits from a dead attempt remain in history UNJOURNALLED — reachable,
+    harmless, and identifiable via `pre_head` lineage — and are NOT silently reset away (an
+    operator commit may sit above them). This SUPERSEDES hand-8's `pre_head..HEAD` recovery of
+    a dispatched-only tail (which could bless a mid-rig commit or grow after death).
+42. **Clean-worktree failure lease (FAILURE-LEASE).** (a) A lease REFUSES to open on a dirty
+    tracked/index worktree state — a durable failed result ("workdir has uncommitted tracked
+    changes"), never proceed. This removes the reset-`--hard` destruction class: pre-existing
+    tracked/staged user work can no longer exist at open, so failure revert (`reset --hard
+    pre_head`) only ever undoes THIS attempt's own effects. It is the honest serial-M1 rule;
+    M3 per-node worktree isolation makes the workdir engine-owned and retires the precondition.
+    (SUPERSEDES hand-4's "inplace preserves a pre-existing staged index" — a dirty index now
+    refuses the lease.) (b) The untracked snapshot uses per-file listing
+    (`--untracked-files=all`), so an addition UNDER a pre-existing untracked directory is a
+    distinct entry the lease-scoped sweep detects and removes while the pre-existing sibling
+    survives. (c) Failure capture tolerates BINARY content: a decode failure records a binary
+    artifact (size + sha256) instead of raising, so no exception escapes after `dispatched`.
+43. **Loop outcome totality + nested-loop resume floor (LOOP-OUTCOME-TOTALITY).** (a) Admission
+    rejects any composite whose LAST positional child chain does not terminate in a
+    result-producing leaf (do/inplace) or a `loop` — making `ExecutionOutcome.result_key()`
+    total by construction, so an uninterrupted fold and a resumed fold always agree. (b) The
+    nested-loop floor bug is fixed: a FRESH loop iteration runs its body with floor `None`
+    (not `-1`), and loop resume is FLOOR-SCOPED — only `loop_iter` events with seq > the
+    resume floor belong to the current invocation (`projection.loop_resume`), so a nested
+    inner loop is scoped to its CURRENT outer iteration and never reuses a prior outer
+    iteration's inner iterations/result. The loop's own final-result short-circuit is likewise
+    floor-scoped (`result_seq > floor`). (c) The `loop_iter.body_result_seq=None` live-path
+    fallback is killed: totality guarantees the body always has a journalled result, so the
+    live engine always emits the explicit reference; the `None` fallback in the projection is
+    legacy-journal-only.
+44. **Transactional inplace (INPLACE-TRANSACTIONAL).** `_exec_inplace` records every path it
+    writes and the content that pre-existed (None if created). On ANY failure after the first
+    write — a late symlink rejection OR a failed declared commit — it ROLLS BACK
+    (`workspace.rollback_inplace`): pre-existing files are restored, created files deleted,
+    the declared paths unstaged — BEFORE journaling the durable failed result. No partial
+    effect survives a failed inplace.
+45. **Strict seq contiguity + receipt SHA validation (SEQ+RECEIPT).** `Journal.load` requires
+    EXACT contiguity: each physical event's seq is previous+1, starting at 0; negatives are
+    rejected. Terra proved a torn TAIL cannot create a middle gap (append reuses `last_seq+1`
+    after dropping the final partial record), so the dropped gap allowance only hid missing
+    MIDDLE durability events — a middle gap now raises `JournalCompatibilityError`. A
+    `CommitReceipt` rejects an empty/blank `sha` (modern `commits=[{"sha":""}]` and migrated
+    legacy `commit:""` both), so an empty receipt can never mark an effect durable.
+46. **Result-producing ctx refs (ADMISSION-REF-RESULTFUL).** A `CtxRef(kind="node")` must
+    target a node that PRODUCES a result — an executable leaf (do/inplace) or a `loop`.
+    Admission rejects a ref to a structural `seq`/`dispatch` (which journals no node-level
+    result) and to an unfinished ANCESTOR composite (its result cannot exist before the
+    consumer inside it runs), instead of leaving it to fail as an unresolved ctx at run time.
