@@ -54,6 +54,10 @@ class Dispatched(_Header):
     cmd: str | None = None
     workdir: str | None = None
     pre_head: str | None = None
+    # New engines publish a durable lease before dispatch.  The explicit marker lets
+    # recovery distinguish a missing modern record (corruption: fail closed) from a
+    # pre-hand-12 journal that needs the conservative no-sweep compatibility path.
+    lease_required: bool = False
 
 
 class ResultEvent(_Header):

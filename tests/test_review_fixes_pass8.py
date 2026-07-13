@@ -185,7 +185,7 @@ def test_failed_rig_non_utf8_filename_is_captured_or_durably_halted(tmp_path: Pa
             if entry["kind"] == "file":
                 captured.append((manifest_path.parent / entry["blob"]).read_bytes())
     assert b"BYTE-NAME-EVIDENCE" in captured
-    assert any("bad-" in path for path in encoded_paths)
+    assert any(path.startswith("@wildflows-bytes:") for path in encoded_paths)
 
 
 def test_missing_required_modern_lease_cannot_take_legacy_fallback(tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import os
+import unicodedata
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -37,6 +38,8 @@ from wildflows.workspace import (
     InplaceIntent,
     IntentWrite,
     Lease,
+    RecoveryOutcome,
+    RecoveryRequest,
     WorkspaceEffects,
     WorkspaceFault,
 )
@@ -100,6 +103,8 @@ class Engine:
         """
         key = (epoch, node.node_id)
         if isinstance(node, (Do, Inplace)):
+            if self._publish_pending_recovery(key) == "fail":
+                return ExecutionOutcome(key=key)
             action = self._proj.resume_action(key, floor)
             if action == "done":
                 return ExecutionOutcome(key=key)
@@ -238,39 +243,71 @@ class Engine:
         self.rec.record_integrated(key, receipt)
         return True
 
+    def _recovery_request(
+        self, key: NodeKey, action: Literal["fail", "retry"], result: Result,
+        *, certified_post_head: str | None = None,
+    ) -> RecoveryRequest:
+        node = self._proj.node(key)
+        return RecoveryRequest(
+            node_key=key, attempt=node.dispatch_count - 1,
+            expected_pre_head=node.dispatched_pre_head,
+            lease_required=node.lease_required, action=action, result=result,
+            evidence_kind="failed-diffs" if action == "fail" else "quarantine",
+            certified_post_head=certified_post_head,
+        )
+
+    def _run_recovery(
+        self, key: NodeKey, request: RecoveryRequest, stage: str
+    ) -> RecoveryOutcome:
+        try:
+            return self.ws.recover_lease(request)
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, stage, fault, request.action)
+
+    def _publish_recovery(self, key: NodeKey, outcome: RecoveryOutcome) -> None:
+        self.rec.record_result(
+            key, outcome.result, post_head=self.ws.head_commit(),
+            recovery_action="retry" if outcome.action == "retry" else None,
+        )
+
+    def _publish_pending_recovery(
+        self, key: NodeKey
+    ) -> Literal["fail", "retry"] | None:
+        """Publish a recovery settled just before process death, before resume decisions."""
+        node = self._proj.node(key)
+        if node.dispatch_count == 0:
+            return None
+        if node.result_seq > node.last_dispatch_seq and not node.workspace_unclean:
+            return None
+        try:
+            outcome = self.ws.resume_recovery(
+                key, node.dispatch_count - 1, node.dispatched_pre_head
+            )
+        except WorkspaceFault as fault:
+            self._halt_unclean(
+                key, "settled recovery publication", fault, node.recovery_action or "retry"
+            )
+        if outcome is None:
+            return None
+        self._publish_recovery(key, outcome)
+        return outcome.action
+
     def _recover_inactive_certificate(self, key: NodeKey, post_head: str | None) -> None:
         if post_head is None:
             raise WorkspaceFault("effectful result has no post_head certificate")
-        node = self._proj.node(key)
-        epoch, node_id = key
-        attempt = node.dispatch_count - 1
-        try:
-            record = self.ws.load_lease_record(epoch, node_id, attempt)
-            if record is not None and record.pre_head != node.dispatched_pre_head:
-                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
-            self.ws.quarantine_inactive_certificate(
-                epoch, node_id, attempt, node.dispatched_pre_head, post_head, record
-            )
-        except WorkspaceFault as fault:
-            self._halt_unclean(key, "inactive result certificate recovery", fault, "retry")
-        self.rec.record_result(
+        outcome = self._run_recovery(
             key,
-            Result(text="inactive result certificate quarantined; retry required", outcome="failed"),
-            post_head=self.ws.head_commit(),
-            recovery_action="retry",
+            self._recovery_request(
+                key, "retry",
+                Result(text="inactive result certificate quarantined; retry required",
+                       outcome="failed"),
+                certified_post_head=post_head,
+            ),
+            "inactive result certificate recovery",
         )
-        self.ws.settle_records(epoch, node_id, attempt)
+        self._publish_recovery(key, outcome)
 
     def _recover_unclean(self, key: NodeKey) -> bool:
-        """Retry checked cleanup for a durably halted node before any new mutation.
-
-        Returns whether the interrupted attempt lacked a completion certificate and must
-        dispatch again. Both lease and intent records are loaded (and therefore validated)
-        before rollback/reset starts, so a corrupt present record never takes the legacy
-        fallback and never permits a partial cleanup. The explicit clean result is the
-        durable halt-clear transition; ``recovery_action='retry'`` keeps it non-terminal
-        across a crash before redispatch.
-        """
         node = self._proj.node(key)
         action = node.recovery_action
         if action is None:
@@ -278,52 +315,18 @@ class Engine:
                 "workspace is durably unclean but its legacy result has no recovery action; "
                 "manual repair is required"
             )
-        epoch, node_id = key
-        attempt = node.dispatch_count - 1
-        try:
-            lease_record = self.ws.load_lease_record(epoch, node_id, attempt)
-            intent = self.ws.load_intent(epoch, node_id, attempt)
-            if (
-                lease_record is not None
-                and lease_record.pre_head != node.dispatched_pre_head
-            ):
-                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
-            if intent is not None:
-                self.ws.rollback_inplace(
-                    intent,
-                    None if lease_record is None or lease_record.preexisting_dirs is None
-                    else set(lease_record.preexisting_dirs),
-                )
-            if lease_record is not None:
-                self.ws.quarantine_dead_attempt(lease_record)
-            else:
-                self.ws.quarantine_from_journal(
-                    epoch, node_id, attempt, node.dispatched_pre_head)
-        except WorkspaceFault as fault:
-            self._halt_unclean(key, "workspace recovery", fault, action)
-        self.rec.record_result(
+        outcome = self._run_recovery(
             key,
-            Result(text="workspace cleanup recovered", outcome="failed"),
-            post_head=self.ws.head_commit(),
-            recovery_action="retry" if action == "retry" else None,
+            self._recovery_request(
+                key, action, Result(text="workspace cleanup recovered", outcome="failed")
+            ),
+            "workspace recovery",
         )
-        self.ws.settle_records(epoch, node_id, attempt)
+        self._publish_recovery(key, outcome)
         return action == "retry"
-
-    def _settle_cleared_retry(self, key: NodeKey, floor: Floor) -> None:
-        """Finish old-record settlement after a crash following the durable halt clear."""
-        node = self._proj.node(key)
-        if (
-            node.recovery_action == "retry"
-            and not node.workspace_unclean
-            and not node.has_unfinished_dispatch(floor)
-            and node.dispatch_count > 0
-        ):
-            self.ws.settle_records(key[0], key[1], node.dispatch_count - 1)
 
     def _exec_do(self, node: Do, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
-        self._settle_cleared_retry(key, floor)
         if self._recover_committed_attempt(key, floor):
             self._settle(key)
             return ExecutionOutcome(key=key)
@@ -335,7 +338,7 @@ class Engine:
         self.journal.append(Dispatched(
             run_id=self.run_id, epoch=epoch, node_id=node.node_id,
             rig=node.rig.name, task=node.task, workdir=str(self.workdir),
-            pre_head=lease.pre_head,
+            pre_head=lease.pre_head, lease_required=True,
         ))
         if prompt is None:  # an unresolvable/escaping ctx ref is a failed RESULT
             self.rec.record_result(key, Result(
@@ -343,35 +346,29 @@ class Engine:
                 post_head=self.ws.head_commit())
             self._settle(key)
             return ExecutionOutcome(key=key)
-        diff_name = f"e{epoch}-{node.node_id}.diff"
         try:
             result = self.registry.resolve(node.rig.name).run(prompt, self.workdir)
         except Exception as exc:  # a rig exception never escapes after `dispatched`
-            diff_path = self._finalize_failure(lease, diff_name, key)
-            self.rec.record_result(key, Result(
-                text=self._fail_text(f"rig raised: {exc}", diff_path), outcome="failed"),
-                post_head=self.ws.head_commit())
-            self._settle(key)
+            self._finish_live_failure(
+                key, Result(text=f"rig raised: {exc}", outcome="failed")
+            )
             return ExecutionOutcome(key=key)
         if not result.ok:
-            # The failed rig's effects (incl its own commits) are reverted + captured.
-            diff_path = self._finalize_failure(lease, diff_name, key)
-            self.rec.record_result(key, Result(
-                text=self._fail_text(result.text, diff_path),
-                files=result.files, exit_code=result.exit_code, outcome=result.outcome),
-                post_head=self.ws.head_commit())
-            self._settle(key)
+            self._finish_live_failure(key, result)
             return ExecutionOutcome(key=key)
-        integ = self.ws.finalize_do_success(lease, self._commit_msg("do", node.node_id, epoch))
+        try:
+            integ = self.ws.finalize_do_success(
+                lease, self._commit_msg("do", node.node_id, epoch)
+            )
+        except WorkspaceFault as fault:
+            self._finish_live_failure(
+                key, Result(text=f"do integration failed:\n{fault}", outcome="failed")
+            )
+            return ExecutionOutcome(key=key)
         if not integ.ok:
-            # A git failure integrating a SUCCESSFUL rig's dirty state is a failed
-            # transaction, not a bare error: revert + capture the leak through the same
-            # failure path so no later node inherits it (hand-8, FAILURE-TRANSACTION).
-            diff_path = self._finalize_failure(lease, diff_name, key)
-            self.rec.record_result(key, Result(
-                text=self._fail_text(f"do integration failed:\n{integ.stderr}", diff_path),
-                outcome="failed"), post_head=self.ws.head_commit())
-            self._settle(key)
+            self._finish_live_failure(
+                key, Result(text=f"do integration failed:\n{integ.stderr}", outcome="failed")
+            )
             return ExecutionOutcome(key=key)
         # Result.files is the artifact list (== the effect paths in the shared-workdir
         # PoC); the receipt is the ownership record replay accumulates. `post_head` is the
@@ -390,7 +387,7 @@ class Engine:
         honest serial-M1 rule."""
         node = self._proj.node(key)
         if node.has_unfinished_dispatch(floor):
-            self._quarantine_dead_attempt(key, attempt)
+            self._recover_dead_attempt(key)
         lease = self.ws.open_lease(key, attempt)
         if lease is None:
             self.rec.record_result(key, Result(
@@ -398,38 +395,22 @@ class Engine:
                 outcome="failed"), post_head=self.ws.head_commit())
         return lease
 
-    def _quarantine_dead_attempt(self, key: NodeKey, attempt: int) -> None:
-        """Quarantine + reset a dead attempt from its DURABLE lease record (PRINCIPLE B),
-        or, for a pre-hand-10 dispatched line with no record, a conservative journal-based
-        fallback that never sweeps (treats all current untracked as preexisting) while
-        still quarantining committed work and resetting to the journalled `pre_head`. A
-        cleanup git-op failure HALTS the epoch (WorkspaceFault, PRINCIPLE A)."""
-        epoch, node_id = key
-        dead = attempt - 1
-        try:
-            rec = self.ws.load_lease_record(epoch, node_id, dead)
-            if (
-                rec is not None
-                and rec.pre_head != self._proj.node(key).dispatched_pre_head
-            ):
-                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
-            if rec is not None:
-                self.ws.quarantine_dead_attempt(rec)
-            else:
-                self.ws.quarantine_from_journal(
-                    epoch, node_id, dead, self._proj.node(key).dispatched_pre_head)
-        except WorkspaceFault as fault:
-            self._halt_unclean(key, "dead-attempt quarantine", fault, "retry")
-        self.ws.settle_records(epoch, node_id, dead)
+    def _recover_dead_attempt(self, key: NodeKey) -> None:
+        outcome = self._run_recovery(
+            key,
+            self._recovery_request(
+                key, "retry", Result(text="dead attempt quarantined; retry required",
+                                     outcome="failed")
+            ),
+            "dead-attempt recovery",
+        )
+        self._publish_recovery(key, outcome)
 
-    def _finalize_failure(self, lease: Lease, diff_name: str, key: NodeKey) -> Path | None:
-        """Run the checked failure revert; a cleanup git-op failure HALTS the epoch with a
-        `workspace_unclean` failed result rather than a durable "failed" that lies the live
-        effect was handled (hand-10, PRINCIPLE A)."""
-        try:
-            return self.ws.finalize_failure(lease, diff_name)
-        except WorkspaceFault as fault:
-            self._halt_unclean(key, "failure cleanup", fault, "fail")
+    def _finish_live_failure(self, key: NodeKey, result: Result) -> None:
+        outcome = self._run_recovery(
+            key, self._recovery_request(key, "fail", result), "failure cleanup"
+        )
+        self._publish_recovery(key, outcome)
 
     def _halt_unclean(
         self, key: NodeKey, stage: str, fault: WorkspaceFault,
@@ -452,24 +433,17 @@ class Engine:
 
     def _exec_inplace(self, node: Inplace, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
-        self._settle_cleared_retry(key, floor)
         if self._recover_committed_attempt(key, floor):
             self._settle(key)
             return ExecutionOutcome(key=key)
         attempt = self._proj.node(key).dispatch_count
-        pnode = self._proj.node(key)
-        if pnode.has_unfinished_dispatch(floor):
-            # Reverse a crashed inplace's DURABLE intent BEFORE anything else (PRINCIPLE B):
-            # a partial write to a pre-existing (possibly untracked) file is restored from
-            # the fsynced originals, which a `reset --hard` alone could not recover.
-            self._reverse_pending_intent(key, attempt - 1)
         lease = self._open_lease_or_fail(key, floor, attempt)
         if lease is None:
             return ExecutionOutcome(key=key)
         self.journal.append(Dispatched(
             run_id=self.run_id, epoch=epoch, node_id=node.node_id,
             task=f"inplace: {len(node.edits)} edit(s)", workdir=str(self.workdir),
-            pre_head=lease.pre_head,
+            pre_head=lease.pre_head, lease_required=True,
         ))
         if not node.edits:  # an empty inplace is a no-op ok result with NO git calls
             self.rec.record_result(key, Result(text="inplace: no edits", files=[]),
@@ -496,22 +470,24 @@ class Engine:
         paths = [w.path for w in writes]
         try:
             self._apply_inplace_writes(writes)
-        except Exception as exc:  # OSError/UnicodeError/... — a partial write is rolled back
-            self._rollback_inplace(intent, lease, key)
-            self.rec.record_result(key, Result(
-                text=f"inplace write failed: {exc}", outcome="failed"),
-                post_head=self.ws.head_commit())
-            self._settle(key)
+        except Exception as exc:  # OSError/UnicodeError/... — recover from durable intent
+            self._finish_live_failure(
+                key, Result(text=f"inplace write failed: {exc}", outcome="failed")
+            )
             return ExecutionOutcome(key=key)
-        integ = self.ws.integrate_declared(paths, self._commit_msg("inplace", node.node_id, epoch))
+        try:
+            integ = self.ws.integrate_declared(
+                paths, self._commit_msg("inplace", node.node_id, epoch)
+            )
+        except WorkspaceFault as fault:
+            self._finish_live_failure(
+                key, Result(text=f"inplace integration failed:\n{fault}", outcome="failed")
+            )
+            return ExecutionOutcome(key=key)
         if integ.status == "failed":
-            self._rollback_inplace(
-                intent, lease, key
-            )  # no partial write survives a failed commit
-            self.rec.record_result(key, Result(
-                text=f"inplace integration failed:\n{integ.stderr}", outcome="failed"),
-                post_head=self.ws.head_commit())
-            self._settle(key)
+            self._finish_live_failure(
+                key, Result(text=f"inplace integration failed:\n{integ.stderr}", outcome="failed")
+            )
             return ExecutionOutcome(key=key)
         if integ.status == "noop":
             # An already-identical edit produced no diff: a DURABLE no-op (files=[]), so
@@ -531,6 +507,8 @@ class Engine:
         """Plan one canonical resolved-target model for every transaction operation."""
         writes: list[IntentWrite] = []
         resolved_paths: set[str] = set()
+        identities: dict[tuple[int, int], str] = {}
+        case_keys: dict[str, str] = {}
         workdir = self.workdir.resolve()
         for edit in node.edits:
             resolved = self.ws.resolve_safe_path(edit.path)
@@ -538,6 +516,22 @@ class Engine:
             if canonical in resolved_paths:
                 raise ValueError(f"resolved target collision: {edit.path!r} -> {canonical!r}")
             resolved_paths.add(canonical)
+            case_key = unicodedata.normalize("NFC", canonical).casefold()
+            if case_key in case_keys:
+                raise ValueError(
+                    f"portable case-canonical target collision: {case_keys[case_key]!r} "
+                    f"and {edit.path!r}"
+                )
+            case_keys[case_key] = edit.path
+            if os.path.lexists(resolved):
+                info = resolved.stat()
+                identity = (info.st_dev, info.st_ino)
+                if identity in identities:
+                    raise ValueError(
+                        f"filesystem-identity target collision: {identities[identity]!r} "
+                        f"and {edit.path!r}"
+                    )
+                identities[identity] = edit.path
             if resolved.is_file():
                 if resolved.stat().st_nlink != 1:
                     raise ValueError(
@@ -577,34 +571,6 @@ class Engine:
             plain = self.workdir / write.path
             plain.parent.mkdir(parents=True, exist_ok=True)
             plain.write_text(write.content or "", encoding="utf-8")
-
-    def _reverse_pending_intent(self, key: NodeKey, attempt: int) -> None:
-        try:
-            # Validate both durable records before the first reversal write. A corrupt
-            # lease must halt without letting a valid intent partially mutate the tree.
-            lease_record = self.ws.load_lease_record(key[0], key[1], attempt)
-            if (
-                lease_record is not None
-                and lease_record.pre_head != self._proj.node(key).dispatched_pre_head
-            ):
-                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
-            intent = self.ws.load_intent(key[0], key[1], attempt)
-            if intent is not None:
-                self.ws.rollback_inplace(
-                    intent,
-                    None if lease_record is None or lease_record.preexisting_dirs is None
-                    else set(lease_record.preexisting_dirs),
-                )
-        except WorkspaceFault as fault:
-            self._halt_unclean(key, "pending inplace intent reversal", fault, "retry")
-
-    def _rollback_inplace(self, intent: InplaceIntent, lease: Lease, key: NodeKey) -> None:
-        """Roll back from the durable intent; an unstage git-op failure HALTS the epoch
-        (PRINCIPLE A) rather than record a durable failure that leaves a staged partial."""
-        try:
-            self.ws.rollback_inplace(intent, set(lease.preexisting_dirs))
-        except WorkspaceFault as fault:
-            self._halt_unclean(key, "inplace rollback", fault, "fail")
 
     def _materialize_ctx(self, node: Do, epoch: int) -> str | None:
         """Append declared `ctx` to the prompt; None if any ref is unresolvable.
