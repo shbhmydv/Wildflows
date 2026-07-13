@@ -94,6 +94,36 @@ def test_workspace_unclean_resume_remains_halted_until_cleanup_succeeds(
                and "cleanup recovered" in str(e["text"]) for e in _events(run_dir))
 
 
+def test_retry_marker_survives_crash_between_cleanup_and_redispatch(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Do(task="die", rig=RigRef(name="die"))
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": _DieAfterLeakRig("leak.txt")})
+    ).run_epoch(tree, 0)) == 0
+
+    (workdir / ".git" / "index.lock").touch()
+    with pytest.raises(WorkspaceFault):
+        Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("blocked")})).run_epoch(tree, 0)
+    (workdir / ".git" / "index.lock").unlink()
+
+    def die_before_redispatch() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("not-run")}))
+        setattr(engine.ws, "open_lease", _die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_before_redispatch) == 0
+    state = replay(run_dir).node((0, "n0"))
+    assert state.workspace_unclean is False and state.recovery_action == "retry"
+    assert not replay(run_dir).epoch_closed(0)
+
+    rig = _CountingRig("rerun")
+    Engine(run_dir, workdir, RigRegistry({"die": rig})).run_epoch(tree, 0)
+    assert rig.calls == 1
+    assert replay(run_dir).epoch_closed(0)
+
+
 def test_inplace_internal_symlink_alias_never_leaves_unreceipted_target_effect(
     tmp_path: Path,
 ) -> None:

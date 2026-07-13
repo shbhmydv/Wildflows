@@ -496,6 +496,9 @@ class Engine:
 
     def _reverse_pending_intent(self, key: NodeKey, attempt: int) -> None:
         try:
+            # Validate both durable records before the first reversal write. A corrupt
+            # lease must halt without letting a valid intent partially mutate the tree.
+            self.ws.load_lease_record(key[0], key[1], attempt)
             intent = self.ws.load_intent(key[0], key[1], attempt)
             if intent is not None:
                 self.ws.rollback_inplace(intent)

@@ -202,6 +202,9 @@ class WorkspaceEffects:
         """True if the worktree has any uncommitted TRACKED or staged change (untracked
         files excluded). The lease-open precondition."""
         proc = self.git("status", "--porcelain", "--untracked-files=no")
+        self._checked(proc, "inspect tracked workspace state")
+        if proc.stderr.strip():
+            raise WorkspaceFault(f"tracked workspace inspection was incomplete: {proc.stderr.strip()}")
         return bool(proc.stdout.strip())
 
     # -- durable transaction intents (PRINCIPLE B) ---------------------------
@@ -265,7 +268,11 @@ class WorkspaceEffects:
         if not os.path.lexists(path):
             return None
         try:
+            if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
+                raise WorkspaceFault(f"lease record is not a regular file: {path}")
             return LeaseRecord.model_validate_json(path.read_bytes())
+        except WorkspaceFault:
+            raise
         except (OSError, ValidationError) as exc:
             raise WorkspaceFault(f"lease record is unreadable or corrupt: {path}: {exc}") from exc
 
@@ -279,7 +286,11 @@ class WorkspaceEffects:
         if not os.path.lexists(path):
             return None
         try:
+            if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
+                raise WorkspaceFault(f"intent record is not a regular file: {path}")
             return InplaceIntent.model_validate_json(path.read_bytes())
+        except WorkspaceFault:
+            raise
         except (OSError, ValidationError) as exc:
             raise WorkspaceFault(f"intent record is unreadable or corrupt: {path}: {exc}") from exc
 
@@ -351,7 +362,7 @@ class WorkspaceEffects:
         `WorkspaceFault`. Idempotent given the record: quarantine update-ref, reset to
         pre_head, and capture-append all redo safely after a crash mid-cleanup."""
         pre = rec.pre_head
-        head = self.head_commit()
+        head = self._cleanup_head()
         diff_path = self._capture_dead_attempt(rec)
         if head is not None and head != pre:
             self._preserve_tip(rec, head, diff_path)
@@ -360,7 +371,10 @@ class WorkspaceEffects:
         else:
             # Unborn at lease open: drop the branch ref so the dead attempt's first commit
             # cannot survive as durable history (it lives on in the quarantine ref).
-            ref = self.git("symbolic-ref", "-q", "HEAD").stdout.strip()
+            symbolic = self.git("symbolic-ref", "-q", "HEAD")
+            if symbolic.returncode not in (0, 1):
+                self._checked(symbolic, "quarantine unborn symbolic-ref", diff_path)
+            ref = symbolic.stdout.strip()
             if head is not None and ref:
                 self._checked(self.git("update-ref", "-d", ref),
                               "quarantine unborn update-ref -d", diff_path)
@@ -386,7 +400,7 @@ class WorkspaceEffects:
 
     def _capture_dead_attempt(self, rec: LeaseRecord) -> Path | None:
         """Byte-exactly capture dirt before quarantine reset/sweep."""
-        head = self.head_commit()
+        head = self._cleanup_head()
         base = "HEAD" if head is not None else _EMPTY_TREE
         leaks = sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
         return self._capture_workspace(
@@ -605,8 +619,11 @@ class WorkspaceEffects:
         else:
             # Unborn at lease open: if the failing rig created the first commit, drop the
             # branch ref back to unborn so its effect cannot survive as durable history.
-            ref = self.git("symbolic-ref", "-q", "HEAD").stdout.strip()
-            if self.head_commit() is not None and ref:
+            symbolic = self.git("symbolic-ref", "-q", "HEAD")
+            if symbolic.returncode not in (0, 1):
+                self._checked(symbolic, "failure unborn symbolic-ref", diff_path)
+            ref = symbolic.stdout.strip()
+            if self._cleanup_head() is not None and ref:
                 self._checked(self.git("update-ref", "-d", ref),
                               "failure unborn update-ref -d", diff_path)
             self._checked(self.git("reset"), "failure unborn reset", diff_path)
@@ -776,6 +793,7 @@ class WorkspaceEffects:
         is an idempotent rollback case. Anything else is byte-captured first; only after
         that manifest is durable are canonical targets restored and unstaged.
         """
+        self._validate_intent_targets(intent)
         unexpected = [
             w.path for w in intent.writes
             if not self._matches_expected(w) and not self._matches_prestate(w)
@@ -784,7 +802,7 @@ class WorkspaceEffects:
             self._capture_workspace(
                 self.run_dir / "intent-reversal",
                 f"{intent.epoch}-{intent.node_id}-{intent.attempt}",
-                "HEAD" if self.head_commit() is not None else _EMPTY_TREE,
+                "HEAD" if self._cleanup_head() is not None else _EMPTY_TREE,
                 unexpected,
             )
         for write in intent.writes:
@@ -803,6 +821,21 @@ class WorkspaceEffects:
                 self.git("reset", "-q", "--", *[w.path for w in intent.writes]),
                 "inplace rollback unstage",
             )
+
+    def _validate_intent_targets(self, intent: InplaceIntent) -> None:
+        root = self.workdir.resolve()
+        for write in intent.writes:
+            expected = root / write.path
+            try:
+                actual = (self.workdir / write.path).resolve()
+            except OSError as exc:
+                raise WorkspaceFault(
+                    f"cannot resolve canonical inplace target {write.path}: {exc}"
+                ) from exc
+            if actual != expected or not actual.is_relative_to(root) or self._in_gitdir(actual):
+                raise WorkspaceFault(
+                    f"canonical inplace target changed after intent publication: {write.path}"
+                )
 
     def _original_bytes(self, write: IntentWrite) -> bytes:
         if write.original_b64 is not None:
@@ -865,6 +898,18 @@ class WorkspaceEffects:
     def head_commit(self) -> str | None:
         proc = self.git("rev-parse", "HEAD")
         return proc.stdout.strip() if proc.returncode == 0 else None
+
+    def _cleanup_head(self) -> str | None:
+        """Checked HEAD lookup: distinguish a valid unborn branch from a Git failure."""
+        proc = self.git("rev-parse", "--verify", "HEAD")
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+        symbolic = self.git("symbolic-ref", "-q", "HEAD")
+        if symbolic.returncode == 0 and symbolic.stdout.strip():
+            return None
+        raise WorkspaceFault(
+            f"cleanup HEAD lookup failed: {proc.stderr.strip() or symbolic.stderr.strip()}"
+        )
 
     def _commit_all(self, message: str) -> Integration:
         """Stage + commit ALL worktree changes (a `do`'s dirty remainder)."""
