@@ -987,8 +987,10 @@ than patching each row. Both are the transaction model of record — not a later
     the manifest, and the human-readable binary Git patch/index are fsynced. Lease open
     also captures exact baseline bytes for pre-existing untracked/ignored objects; cleanup
     captures their current value, then restores the baseline, so overwrite/deletion cannot
-    be absorbed by a retry. Retry suffixes make captures append-only. A hash summary is
-    evidence, never the only retained copy.
+    be absorbed by a retry. Success refuses a rig-authored commit that claims such a path,
+    fails if its baseline changed, and excludes an unchanged user path from core staging.
+    Retry suffixes make captures append-only. A hash summary is evidence, never the only
+    retained copy.
 
 54. **Divergent intent reversal (hand-11).** Rollback first compares each canonical live
     target with BOTH the expected attempt bytes and the recorded pre-state. A third state
@@ -1031,7 +1033,9 @@ than patching each row. Both are the transaction model of record — not a later
     is restored, a durable retry is journalled, and the node reruns. A receipt is never
     reconstructed for an effect absent from the active tree. Result events explicitly mark
     `receipt_required`, so even an active `--allow-empty` commit (zero changed paths) cannot
-    become durable in the result→integrated tear without its history receipt.
+    become durable in the result→integrated tear without its history receipt. An interrupted
+    pre-field result is refused as a legacy tail because absence cannot distinguish an
+    effectless result from that empty-commit crash window.
 
 58. **Recovery topology containment (hand-11).** Baseline capture/restore validates every
     intermediate parent against its canonical workdir location before reading or deleting.

@@ -45,6 +45,8 @@ def _is_legacy_shape(raw: dict[str, object]) -> bool:
     if kind == "result":
         if "outcome" not in raw:
             return True  # pre-collapse `ok`-only result
+        if "receipt_required" not in raw:
+            return True  # cannot distinguish a torn allow-empty commit from no effect
         # An EFFECTFUL leaf result (non-empty declared `files`) with no `post_head`
         # completion certificate is an interrupted pre-v1 tail, NOT a durable success
         # (hand-10, PRINCIPLE A). post_head is sampled on every modern effectful leaf result,

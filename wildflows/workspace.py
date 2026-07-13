@@ -822,7 +822,21 @@ class WorkspaceEffects:
         if topology_error is not None:
             return DoIntegration(ok=False, stderr=topology_error)
         commits = self._commit_receipts(lease.pre_head, post)
-        integ = self._commit_all(message)
+        if any(
+            self._is_preexisting_path(path, lease.preexisting)
+            for commit in commits for path in commit.paths
+        ):
+            return DoIntegration(
+                ok=False, stderr="rig commit claimed a preexisting untracked/ignored path"
+            )
+        try:
+            if not self._preexisting_baseline_unchanged(lease):
+                return DoIntegration(
+                    ok=False, stderr="rig modified a preexisting untracked/ignored path"
+                )
+        except WorkspaceFault as fault:
+            return DoIntegration(ok=False, stderr=str(fault))
+        integ = self._commit_all(message, lease)
         if integ.status == "failed":
             return DoIntegration(ok=False, stderr=integ.stderr)
         if integ.status == "committed" and integ.commit is not None:
@@ -1261,11 +1275,90 @@ class WorkspaceEffects:
             f"cleanup HEAD lookup failed: {proc.stderr.strip() or symbolic.stderr.strip()}"
         )
 
-    def _commit_all(self, message: str) -> Integration:
-        """Stage + commit ALL worktree changes (a `do`'s dirty remainder)."""
-        add = self.git("add", "-A", "--", ".")
+    @staticmethod
+    def _is_preexisting_path(path: str, preexisting: frozenset[str]) -> bool:
+        return any(
+            path == root.rstrip("/") or path.startswith(root.rstrip("/") + "/")
+            for root in preexisting
+        )
+
+    def _preexisting_baseline_unchanged(self, lease: Lease) -> bool:
+        if not lease.preexisting:
+            return True
+        loaded = self._load_lease_baseline(lease.baseline_manifest, lease.baseline_digest)
+        if loaded is None:
+            raise WorkspaceFault("preexisting paths have no lease baseline")
+        _capture_dir, manifest = loaded
+        expected = {entry.path: entry for entry in manifest.entries}
+        for root in lease.preexisting:
+            current = self._current_tree(root)
+            baseline_paths = {
+                path for path in expected
+                if path == root.rstrip("/") or path.startswith(root.rstrip("/") + "/")
+            }
+            if set(current) != baseline_paths:
+                return False
+            for path, kind in current.items():
+                entry = expected[path]
+                if kind != entry.kind:
+                    return False
+                if kind == "file":
+                    data = (self.workdir / path).read_bytes()
+                    if entry.sha256 is None or not hmac.compare_digest(
+                        hashlib.sha256(data).hexdigest(), entry.sha256
+                    ):
+                        return False
+                elif kind == "symlink" and os.readlink(self.workdir / path) != entry.link_target:
+                    return False
+        return True
+
+    def _current_tree(self, rel: str) -> dict[str, str]:
+        found: dict[str, str] = {}
+
+        def visit(path_rel: str) -> None:
+            target = self._contained_record_target(path_rel.rstrip("/"), "baseline comparison")
+            try:
+                info = target.lstat()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot inspect preexisting path {path_rel}: {exc}") from exc
+            if stat.S_ISLNK(info.st_mode):
+                found[path_rel] = "symlink"
+            elif stat.S_ISREG(info.st_mode):
+                found[path_rel] = "file"
+            elif stat.S_ISDIR(info.st_mode):
+                found[path_rel] = "directory"
+                try:
+                    children = sorted(os.scandir(target), key=lambda entry: entry.name)
+                except OSError as exc:
+                    raise WorkspaceFault(
+                        f"cannot enumerate preexisting path {path_rel}: {exc}"
+                    ) from exc
+                for child in children:
+                    visit(f"{path_rel}/{child.name}")
+            else:
+                found[path_rel] = "other"
+
+        visit(rel.rstrip("/"))
+        return found
+
+    def _commit_all(self, message: str, lease: Lease) -> Integration:
+        """Stage attempt effects, never unchanged preexisting untracked user paths."""
+        if lease.preexisting:
+            unstage = self.git("reset", "-q", "--", *sorted(lease.preexisting))
+            if unstage.returncode != 0:
+                return Integration("failed", stderr=unstage.stderr)
+        add = self.git("add", "-u", "--", ".")
         if add.returncode != 0:
             return Integration("failed", stderr=add.stderr)
+        new_paths = sorted(
+            set(self._untracked_ignored_paths()) - set(lease.preexisting)
+        )
+        if new_paths:
+            add_new = self.git("add", "-f", "-A", "--", *new_paths)
+            if add_new.returncode != 0:
+                return Integration("failed", stderr=add_new.stderr)
         if self.git("diff", "--cached", "--quiet").returncode == 0:
             return Integration("noop")
         commit = self.git("commit", "-q", "-m", message)

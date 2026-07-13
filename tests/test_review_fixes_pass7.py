@@ -276,6 +276,26 @@ def test_inplace_resolved_target_collision_is_rejected_before_write(tmp_path: Pa
     assert (workdir / "base.txt").read_text() == "base"
 
 
+def test_interrupted_legacy_result_without_receipt_requirement_is_refused(tmp_path: Path) -> None:
+    run_dir = tmp_path / "legacy"
+    run_dir.mkdir()
+    records = [
+        {"seq": 0, "run_id": "r", "epoch": 0, "node_id": "n0", "kind": "boundary",
+         "phase": "opened"},
+        {"seq": 1, "run_id": "r", "epoch": 0, "node_id": "n0", "kind": "dispatched",
+         "pre_head": "a" * 40},
+        {"seq": 2, "run_id": "r", "epoch": 0, "node_id": "n0", "kind": "result",
+         "outcome": "ok", "files": [], "post_head": "b" * 40},
+    ]
+    (run_dir / "events.ndjson").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    from wildflows.journal import JournalCompatibilityError
+
+    with pytest.raises(JournalCompatibilityError, match="legacy"):
+        Journal.load(run_dir)
+
+
 def test_allow_empty_commit_result_tear_still_requires_receipt(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)
@@ -569,6 +589,24 @@ def test_failed_and_dead_rig_empty_directories_are_captured_and_removed(tmp_path
             entry["path"] == "empty" and entry["kind"] == "directory"
             for manifest in manifests for entry in manifest["entries"]
         )
+
+
+def test_successful_noop_does_not_commit_preexisting_untracked_user_file(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    (workdir / "user.txt").write_text("USER", encoding="utf-8")
+    run_dir = tmp_path / "run"
+
+    Engine(run_dir, workdir, RigRegistry({"shell": ShellRig("true", 30)})).run_epoch(
+        Do(task="noop", rig=RigRef(name="shell")), 0
+    )
+
+    assert (workdir / "user.txt").read_text() == "USER"
+    assert subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "user.txt"], cwd=workdir,
+        capture_output=True,
+    ).returncode != 0
+    assert replay(run_dir).integrated.get((0, "n0"), []) == []
 
 
 def test_failed_rig_net_zero_commits_remain_reachable_after_reset(tmp_path: Path) -> None:
