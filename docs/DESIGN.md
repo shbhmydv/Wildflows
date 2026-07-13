@@ -940,3 +940,65 @@ than patching each row. Both are the transaction model of record — not a later
     result) over a separate run-level fault event, per the triage's "choose one": it keeps
     the honesty signal on the exact node whose effect survived, with zero new event kind.
     Net: the serial-M1 restart matrix has no remaining data-loss or false-durability row.
+
+### Hand-11 calls (from the pass-7 correctness review) — TRANSACTION HARDENING
+
+49. **Persistent unclean recovery (hand-11).** `workspace_unclean` and its explicit
+    `recovery_action` (`fail|retry`) are folded into `NodeProjection`; an in-scope marker
+    makes `resume_action` return `recover`, never `done`. Resume validates BOTH durable
+    lease and intent records before mutation, retries intent reversal plus the checked
+    quarantine/reset/sweep, and appends an explicit clean result only after every
+    postcondition succeeds. `fail` then closes the already-failed attempt; `retry` remains
+    a durable non-terminal rerun-pending state until a new dispatch produces its own
+    result, including across a crash between cleanup and redispatch. A legacy unclean
+    marker with no disposition fails closed for manual repair rather than guessing.
+
+50. **One canonical inplace target model (hand-11).** Every edit is fully resolved at
+    plan time and converted back to one workdir-relative canonical target. Intent capture,
+    write, rollback/unstage, staging, commit, result files, and receipt paths all use that
+    target. Two declarations resolving to the same target are rejected before the first
+    write. Internal symlinks therefore edit and receipt their resolved tracked target;
+    escapes/gitdir aliases remain rejected. Modern intents preserve original bytes as
+    base64 and the exact UTF-8 bytes the attempt expected to write.
+
+51. **Append-only quarantine histories (hand-11).** A quarantine ref is immutable per
+    observed tip: its name includes the full tip SHA and creation uses compare-and-create,
+    so a cleanup redo after an operator commit allocates a second ref and preserves both
+    histories. Run/node ref components use only `[A-Za-z0-9._-]`; lossy, empty, `.lock`,
+    dot-edge, and overlong forms receive a SHA-256 suffix. Thus arbitrary filesystem-valid
+    run-directory names cannot make Git recovery fail solely through ref syntax.
+
+52. **Checked filesystem cleanup (hand-11).** Cleanup has no `ignore_errors`: status/diff
+    enumeration, directory traversal, byte reads, capture publication, unlink/rmtree, and
+    Git reset/ref operations are checked. Every removal has an `lexists` absence
+    postcondition. The lease additionally snapshots pre-existing directories, allowing a
+    new empty parent to be pruned without deleting a user's pre-existing empty directory;
+    legacy records lacking that snapshot conservatively do not prune. Any incomplete Git
+    status warning or filesystem failure raises `WorkspaceFault` and enters decision 49's
+    persistent halt.
+
+53. **Byte-recoverable immutable capture (hand-11).** Before any destructive reset or
+    sweep, tracked current files, untracked/ignored files, symlinks, empty directories,
+    and recursively enumerated nested-repository contents are copied exactly into a unique
+    `.capture/` directory. `manifest.json` records path/kind/size/SHA-256/blob; raw blobs,
+    the manifest, and the human-readable binary Git patch/index are fsynced. Retry suffixes
+    make captures append-only. A hash summary is evidence, never the only retained copy.
+
+54. **Divergent intent reversal (hand-11).** Rollback first compares each canonical live
+    target with BOTH the expected attempt bytes and the recorded pre-state. A third state
+    (including binary post-crash operator bytes) is durably captured through decision 53
+    under `intent-reversal/` before restoration. A changed canonical path topology (for
+    example, an operator-installed parent symlink) halts without overwriting it.
+
+55. **Atomic durable-record lifecycle (hand-11).** Lease/intent and capture-manifest
+    publication is same-directory temp write → file fsync → `os.replace` → parent-directory
+    fsync. Record unlink is followed by parent-directory fsync. A present non-regular,
+    unreadable, malformed, or schema-invalid record is a typed `WorkspaceFault`; it is
+    never confused with an absent legacy record and recovery performs no mutation after
+    such a load failure.
+
+56. **Pass-7 crash proof (hand-11).** The transaction regressions use real `fork` plus
+    `os._exit` at the record-publication, inplace-write, rig-death, quarantine-reset, and
+    cleanup-before-redispatch windows. No deviation from the pass-7 intended directions:
+    canonical symlink support was chosen over blanket rejection because the resolved path
+    can be used consistently by every transaction operation in the serial-M1 model.

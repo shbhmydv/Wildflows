@@ -13,16 +13,15 @@ Two consolidation principles (hand-10) live here:
 - PRINCIPLE A — QUARANTINE, NEVER DESTROY. No cleanup path deletes content irrecoverably.
   A dead dispatched-only attempt's tip (dead-attempt AND post-crash operator commits) is
   moved to a quarantine ref before the branch is reset to the durable `pre_head`;
-  uncommitted dirt + non-preexisting untracked leaks are captured to the run_dir; the
-  lease's per-file preexisting snapshot is respected (preexisting files are left in place,
-  never swept). EVERY git op in any cleanup/rollback path is CHECKED — a failure raises a
-  typed `WorkspaceFault` (never a durable "failed" that lies the workspace was handled).
+  uncommitted dirt + non-preexisting leaks are byte-captured to immutable manifests; the
+  lease's preexisting file/directory snapshots are respected. EVERY Git/filesystem op in
+  cleanup is checked — a failure raises `WorkspaceFault` and the replayed persistent halt
+  retries cleanup rather than closing an unsafe epoch.
 
-- PRINCIPLE B — DURABLE TRANSACTION INTENTS. The lease record (pre_head + per-file
-  preexisting snapshot) is fsynced to `run_dir/leases/` at lease open, BEFORE the first
-  mutation, so restart cleanup is idempotent off disk, never process memory. `inplace` is
-  a durable intent transaction: the per-path original content is fsynced to
-  `run_dir/intents/` before the first write, so a crash mid-edit is reversed on restart.
+- PRINCIPLE B — DURABLE TRANSACTION INTENTS. Lease/intent records are atomically published
+  and directory-fsynced BEFORE the first mutation. Inplace records canonical targets,
+  exact original bytes, and expected written bytes; restart captures any divergent live
+  value before reversal. Corrupt present records fail closed and never trigger mutation.
 
 Per-node worktree leases are a later step; the shared-workdir policy (quarantine + reset
 on failure) lives here and is superseded by discard-the-worktree once worktrees land.
@@ -56,9 +55,9 @@ _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 class WorkspaceFault(Exception):
-    """A cleanup/rollback git op failed, so the workspace was NOT provably handled.
+    """A cleanup, rollback, capture, or durable-record op was not provably completed.
 
-    Raised from any CHECKED cleanup path (hand-10, PRINCIPLE A). The engine records the
+    Raised from any CHECKED transaction path (PRINCIPLE A). The engine records the
     failed result marked `workspace_unclean=True` and re-raises this to HALT the epoch — a
     durable "failed" that lies a live effect was reverted is worse than a crash. `diff_path`
     is the captured evidence, if any.
@@ -74,7 +73,7 @@ class LeaseRecord(BaseModel):
 
     Restart cleanup loads THIS (never process memory) to quarantine + reset a dead attempt
     idempotently: `pre_head` is the reset target and quarantine range anchor; `preexisting`
-    is the per-file untracked/ignored snapshot the sweep must leave in place.
+    and `preexisting_dirs` are the snapshots the sweep must leave in place.
     """
 
     epoch: int
@@ -136,9 +135,9 @@ class Lease:
     `pre_head` anchors rig-authored-commit discovery (`pre..post`), the reset target on
     resume/failure, and the receipt reconstruction range. `preexisting` is the set of
     untracked+ignored paths present at lease open — cleanup removes ONLY paths NOT in this
-    set, never destroying pre-existing user files, the run_dir, or anything the lease did
-    not create. `attempt` keys the durable lease/intent records and the quarantine ref so
-    repeated dead attempts never clobber one another's forensics.
+    set; `preexisting_dirs` likewise protects empty/user parent directories. `attempt`
+    keys durable records and capture groups; quarantine refs additionally include each
+    observed tip SHA so cleanup redos never clobber prior history.
     """
 
     node_key: NodeKey
@@ -595,8 +594,8 @@ class WorkspaceEffects:
         LEASE-SCOPED (hand-8): only paths absent from `lease.preexisting` are touched, and
         the run_dir subtree is hard-excluded — so pre-existing user files, the journal
         under a run_dir-inside-workdir, and anything the lease did not create all survive.
-        Nested Git repositories the rig left are captured (their file listing) and removed
-        recursively (a plain `git clean -fd` would refuse them). Returns the evidence path
+        Nested Git repositories the rig left are recursively byte-captured and removed
+        (a plain `git clean -fd` would refuse them). Returns the evidence path
         or None if nothing changed. Per-node worktree isolation later replaces this with
         discard-the-worktree.
         """

@@ -82,9 +82,9 @@ class ResultEvent(_Header):
     loop_status: str | None = None
     outcome: Literal["ok", "failed", "busy"] = "ok"
     # A durable failed result must never LIE that the workspace was cleanly handled. When a
-    # cleanup/rollback git op fails (hand-10, PRINCIPLE A), the engine marks the failed
-    # result `workspace_unclean=True` and HALTS the epoch (a WorkspaceFault propagates), so
-    # a surviving live effect is recorded honestly rather than papered over as handled.
+    # cleanup/rollback/capture operation fails (PRINCIPLE A), the engine marks the failed
+    # result `workspace_unclean=True` and HALTS. Replay retains this marker and retries the
+    # durable recovery action; a surviving live effect is never papered over as handled.
     workspace_unclean: bool = False
     # How resume proceeds AFTER checked cleanup clears an unclean halt. `fail` means the
     # attempt had already failed and may close once cleanup succeeds; `retry` means it died
