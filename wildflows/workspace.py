@@ -29,6 +29,8 @@ on failure) lives here and is superseded by discard-the-worktree once worktrees 
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import re
@@ -87,11 +89,16 @@ class LeaseRecord(BaseModel):
 
 
 class IntentWrite(BaseModel):
-    """One inplace target's pre-state, enough to reverse the write on restart/failure."""
+    """One canonical inplace target's exact pre-state and expected written state."""
 
     path: str
     pre_kind: Literal["file", "dir", "absent", "other"]
-    original: str | None = None  # the file's content when pre_kind == "file"
+    # `original` reads hand-10 text intents; modern intents use base64 for exact binary
+    # reversal. `content` is what this attempt intended to write, allowing restart to
+    # distinguish the engine's bytes from a post-crash operator edit.
+    original: str | None = None
+    original_b64: str | None = None
+    content: str | None = None
 
 
 class InplaceIntent(BaseModel):
@@ -762,29 +769,93 @@ class WorkspaceEffects:
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         return Integration("committed", commit=sha, paths=list(declared))
 
-    def rollback_inplace(self, writes: list[IntentWrite]) -> None:
-        """Reverse an inplace from its DURABLE intent — on a failure after the first write
-        (OSError/symlink/commit failure) OR on restart of a crashed inplace (hand-10,
-        PRINCIPLE B). Idempotent given the intent record.
+    def rollback_inplace(self, intent: InplaceIntent) -> None:
+        """Reverse a durable intent without destroying post-crash operator bytes.
 
-        Each target is restored to its recorded pre-state: a pre-existing FILE is rewritten
-        with its original content; a path this inplace CREATED (pre_kind `absent`) is
-        unlinked; a pre-existing DIRECTORY/other is left untouched (a whole-file write could
-        not have mutated it — the write failed). The declared paths are then unstaged with a
-        CHECKED reset so a durable failed result leaves NO partial effect for a later node to
-        claim (an unstage failure raises WorkspaceFault, never a lying durable failure)."""
-        for w in writes:
-            target = self.workdir / w.path
-            if w.pre_kind == "file":
-                target.write_text(w.original or "", encoding="utf-8")
-            elif w.pre_kind == "absent":
-                if target.is_file() or target.is_symlink():
-                    target.unlink(missing_ok=True)
-            # pre_kind dir/other: the write never mutated it; leave it in place.
-        if writes:
-            self._checked(
-                self.git("reset", "-q", "--", *[w.path for w in writes]), "inplace rollback unstage"
+        Current state matching either the expected engine write or the recorded pre-state
+        is an idempotent rollback case. Anything else is byte-captured first; only after
+        that manifest is durable are canonical targets restored and unstaged.
+        """
+        unexpected = [
+            w.path for w in intent.writes
+            if not self._matches_expected(w) and not self._matches_prestate(w)
+        ]
+        if unexpected:
+            self._capture_workspace(
+                self.run_dir / "intent-reversal",
+                f"{intent.epoch}-{intent.node_id}-{intent.attempt}",
+                "HEAD" if self.head_commit() is not None else _EMPTY_TREE,
+                unexpected,
             )
+        for write in intent.writes:
+            target = self.workdir / write.path
+            if write.pre_kind == "file":
+                self._atomic_write(target, self._original_bytes(write), "inplace rollback")
+            elif write.pre_kind == "absent":
+                self._remove_rollback_target(target, write.path)
+            elif write.pre_kind in ("dir", "other"):
+                if not self._matches_prestate(write):
+                    raise WorkspaceFault(
+                        f"legacy inplace intent cannot restore pre-state for {write.path}"
+                    )
+        if intent.writes:
+            self._checked(
+                self.git("reset", "-q", "--", *[w.path for w in intent.writes]),
+                "inplace rollback unstage",
+            )
+
+    def _original_bytes(self, write: IntentWrite) -> bytes:
+        if write.original_b64 is not None:
+            try:
+                return base64.b64decode(write.original_b64, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise WorkspaceFault(
+                    f"inplace intent has invalid original bytes for {write.path}: {exc}"
+                ) from exc
+        return (write.original or "").encode("utf-8")
+
+    def _matches_expected(self, write: IntentWrite) -> bool:
+        if write.content is None:  # legacy intent did not record what the attempt wrote
+            return False
+        target = self.workdir / write.path
+        try:
+            return target.is_file() and not target.is_symlink() and (
+                target.read_bytes() == write.content.encode("utf-8")
+            )
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot compare inplace target {write.path}: {exc}") from exc
+
+    def _matches_prestate(self, write: IntentWrite) -> bool:
+        target = self.workdir / write.path
+        try:
+            if write.pre_kind == "absent":
+                return not os.path.lexists(target)
+            if write.pre_kind == "file":
+                return target.is_file() and not target.is_symlink() and (
+                    target.read_bytes() == self._original_bytes(write)
+                )
+            if write.pre_kind == "dir":
+                return target.is_dir() and not target.is_symlink()
+            return False
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot compare inplace pre-state {write.path}: {exc}") from exc
+
+    def _remove_rollback_target(self, target: Path, rel: str) -> None:
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot stat inplace rollback target {rel}: {exc}") from exc
+        try:
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot remove inplace rollback target {rel}: {exc}") from exc
+        if os.path.lexists(target):
+            raise WorkspaceFault(f"inplace rollback target remained after removal: {rel}")
 
     # -- git plumbing --------------------------------------------------------
 

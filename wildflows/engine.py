@@ -20,6 +20,8 @@ ndjson alone. Executable: do, inplace, seq, dispatch (serial in the PoC), and lo
 """
 from __future__ import annotations
 
+import base64
+import os
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -244,7 +246,7 @@ class Engine:
             lease_record = self.ws.load_lease_record(epoch, node_id, attempt)
             intent = self.ws.load_intent(epoch, node_id, attempt)
             if intent is not None:
-                self.ws.rollback_inplace(intent.writes)
+                self.ws.rollback_inplace(intent)
             if lease_record is not None:
                 self.ws.quarantine_dead_attempt(lease_record)
             else:
@@ -416,19 +418,20 @@ class Engine:
         # mutation, so no rollback is needed.
         try:
             writes = self._plan_inplace_writes(node)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             self.rec.record_result(key, Result(
                 text=f"inplace path rejected: {exc}", outcome="failed"),
                 post_head=self.ws.head_commit())
             self._settle(key)
             return ExecutionOutcome(key=key)
-        self.ws.write_intent(InplaceIntent(
-            epoch=epoch, node_id=node.node_id, attempt=attempt, writes=writes, ts=0.0))
+        intent = InplaceIntent(
+            epoch=epoch, node_id=node.node_id, attempt=attempt, writes=writes, ts=0.0)
+        self.ws.write_intent(intent)
         paths = [w.path for w in writes]
         try:
-            self._apply_inplace_writes(node)
+            self._apply_inplace_writes(writes)
         except Exception as exc:  # OSError/UnicodeError/... — a partial write is rolled back
-            self._rollback_inplace(writes, key)
+            self._rollback_inplace(intent, key)
             self.rec.record_result(key, Result(
                 text=f"inplace write failed: {exc}", outcome="failed"),
                 post_head=self.ws.head_commit())
@@ -436,7 +439,7 @@ class Engine:
             return ExecutionOutcome(key=key)
         integ = self.ws.integrate_declared(paths, self._commit_msg("inplace", node.node_id, epoch))
         if integ.status == "failed":
-            self._rollback_inplace(writes, key)  # no partial write survives a failed commit
+            self._rollback_inplace(intent, key)  # no partial write survives a failed commit
             self.rec.record_result(key, Result(
                 text=f"inplace integration failed:\n{integ.stderr}", outcome="failed"),
                 post_head=self.ws.head_commit())
@@ -457,48 +460,53 @@ class Engine:
         return ExecutionOutcome(key=key)
 
     def _plan_inplace_writes(self, node: Inplace) -> list[IntentWrite]:
-        """Resolve every edit path (raising on a symlink escape) and capture its pre-state
-        for the durable intent — BEFORE any write. A pre-existing regular file's content is
-        recorded so a failed/crashed write is reversed; a directory/absent target records
-        its kind so rollback never deletes a pre-existing directory."""
+        """Plan one canonical resolved-target model for every transaction operation."""
         writes: list[IntentWrite] = []
+        resolved_paths: set[str] = set()
+        workdir = self.workdir.resolve()
         for edit in node.edits:
-            self.ws.resolve_safe_path(edit.path)  # ValueError on a symlink escape / gitdir
-            plain = self.workdir / edit.path
-            pre_kind: Literal["file", "dir", "absent", "other"]
-            original: str | None
-            if plain.is_symlink():
-                pre_kind, original = "other", None
-            elif plain.is_file():
-                pre_kind, original = "file", plain.read_text(encoding="utf-8")
-            elif plain.is_dir():
-                pre_kind, original = "dir", None
+            resolved = self.ws.resolve_safe_path(edit.path)
+            canonical = resolved.relative_to(workdir).as_posix()
+            if canonical in resolved_paths:
+                raise ValueError(f"resolved target collision: {edit.path!r} -> {canonical!r}")
+            resolved_paths.add(canonical)
+            if resolved.is_file():
+                original_b64 = base64.b64encode(resolved.read_bytes()).decode("ascii")
+                pre_kind: Literal["file", "dir", "absent"] = "file"
+            elif resolved.is_dir():
+                original_b64 = None
+                pre_kind = "dir"  # write raises; rollback leaves the preexisting dir intact
+            elif os.path.lexists(resolved):
+                raise ValueError(f"inplace target is not a regular file: {edit.path}")
             else:
-                pre_kind, original = "absent", None
-            writes.append(IntentWrite(path=edit.path, pre_kind=pre_kind, original=original))
+                original_b64 = None
+                pre_kind = "absent"
+            writes.append(IntentWrite(
+                path=canonical, pre_kind=pre_kind, original_b64=original_b64,
+                content=edit.content,
+            ))
         return writes
 
-    def _apply_inplace_writes(self, node: Inplace) -> None:
-        """Apply the whole-file writes; any OSError (e.g. a target directory) propagates to
-        the caller's rollback. Plain (unresolved) paths keep write and rollback symmetric."""
-        for edit in node.edits:
-            plain = self.workdir / edit.path
+    def _apply_inplace_writes(self, writes: list[IntentWrite]) -> None:
+        """Write only canonical targets recorded in the durable intent."""
+        for write in writes:
+            plain = self.workdir / write.path
             plain.parent.mkdir(parents=True, exist_ok=True)
-            plain.write_text(edit.content, encoding="utf-8")
+            plain.write_text(write.content or "", encoding="utf-8")
 
     def _reverse_pending_intent(self, key: NodeKey, attempt: int) -> None:
         try:
             intent = self.ws.load_intent(key[0], key[1], attempt)
             if intent is not None:
-                self.ws.rollback_inplace(intent.writes)
+                self.ws.rollback_inplace(intent)
         except WorkspaceFault as fault:
             self._halt_unclean(key, "pending inplace intent reversal", fault, "retry")
 
-    def _rollback_inplace(self, writes: list[IntentWrite], key: NodeKey) -> None:
+    def _rollback_inplace(self, intent: InplaceIntent, key: NodeKey) -> None:
         """Roll back from the durable intent; an unstage git-op failure HALTS the epoch
         (PRINCIPLE A) rather than record a durable failure that leaves a staged partial."""
         try:
-            self.ws.rollback_inplace(writes)
+            self.ws.rollback_inplace(intent)
         except WorkspaceFault as fault:
             self._halt_unclean(key, "inplace rollback", fault, "fail")
 
