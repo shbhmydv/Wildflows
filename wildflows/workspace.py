@@ -127,6 +127,9 @@ class IntentWrite(BaseModel):
     original: str | None = None
     original_b64: str | None = None
     content: str | None = None
+    # Fsynced before this path's first write.  A started target that later disappears is
+    # ambiguous (an external hard-link alias may retain attempt bytes) and fails closed.
+    started: bool = False
 
 
 class InplaceIntent(BaseModel):
@@ -139,6 +142,9 @@ class InplaceIntent(BaseModel):
     writes: list[IntentWrite]
     created_dirs: list[str] = Field(default_factory=list)
     ts: float
+    # Published after complete reversal so a recovery crash after an engine unlink can
+    # redo without misclassifying the now-absent target as a hidden external alias.
+    reversed: bool = False
     integrity: str | None = None
 
 
@@ -533,7 +539,7 @@ class WorkspaceEffects:
         if lease.baseline_manifest is not None:
             self._load_lease_baseline(lease.baseline_manifest, lease.baseline_digest)
         unexpected: list[str] = []
-        if intent is not None:
+        if intent is not None and not intent.reversed:
             self._validate_intent_targets(
                 intent, None if lease.preexisting_dirs is None else set(lease.preexisting_dirs)
             )
@@ -576,12 +582,14 @@ class WorkspaceEffects:
                 self._preserve_tip(lease, head, diff_path)
 
             # Phase 4: reverse intent, restore exact committed/unborn baseline, sweep leaks.
-            if intent is not None:
+            if intent is not None and not intent.reversed:
                 self.rollback_inplace(
                     intent,
                     None if lease.preexisting_dirs is None else set(lease.preexisting_dirs),
                     prevalidated=True,
                 )
+                intent.reversed = True
+                self.write_intent(intent)
             self._reset_to_pre_head(lease, diff_path)
             self._remove_leaks(
                 self._attempt_leaks(lease.preexisting, lease.preexisting_dirs),
@@ -1390,6 +1398,7 @@ class WorkspaceEffects:
             if actual_dir != expected_dir or not actual_dir.is_relative_to(root):
                 raise WorkspaceFault(f"created inplace directory changed topology: {rel}")
         linked: list[str] = []
+        disappeared: list[str] = []
         for write in intent.writes:
             expected = root / _fs_path(write.path)
             try:
@@ -1405,11 +1414,24 @@ class WorkspaceEffects:
             try:
                 info = actual.lstat()
             except FileNotFoundError:
+                if write.started:
+                    disappeared.append(write.path)
                 continue
             except OSError as exc:
                 raise WorkspaceFault(f"cannot stat inplace target {write.path}: {exc}") from exc
             if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                 linked.append(write.path)
+        if disappeared:
+            evidence = self._capture_workspace(
+                self.run_dir / "intent-reversal",
+                f"{intent.epoch}-{intent.node_id}-{intent.attempt}-disappeared",
+                "HEAD" if self._cleanup_head() is not None else self._empty_tree(),
+                disappeared,
+            )
+            raise WorkspaceFault(
+                "started inplace target disappeared; hidden hard-link alias is ambiguous",
+                evidence,
+            )
         if linked:
             evidence = self._capture_workspace(
                 self.run_dir / "intent-reversal",

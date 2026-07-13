@@ -469,7 +469,7 @@ class Engine:
         self.ws.write_intent(intent)
         paths = [w.path for w in writes]
         try:
-            self._apply_inplace_writes(writes)
+            self._apply_inplace_writes(intent)
         except Exception as exc:  # OSError/UnicodeError/... — recover from durable intent
             self._finish_live_failure(
                 key, Result(text=f"inplace write failed: {exc}", outcome="failed")
@@ -568,9 +568,11 @@ class Engine:
                 parent = parent.parent
         return sorted(created, key=lambda p: (len(Path(self.ws.decode_path(p)).parts), p))
 
-    def _apply_inplace_writes(self, writes: list[IntentWrite]) -> None:
-        """Write only canonical targets recorded in the durable intent."""
-        for write in writes:
+    def _apply_inplace_writes(self, intent: InplaceIntent) -> None:
+        """Fsync per-path write-start, then write only canonical intent targets."""
+        for write in intent.writes:
+            write.started = True
+            self.ws.write_intent(intent)
             plain = self.workdir / self.ws.decode_path(write.path)
             plain.parent.mkdir(parents=True, exist_ok=True)
             plain.write_text(write.content or "", encoding="utf-8")

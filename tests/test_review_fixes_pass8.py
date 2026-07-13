@@ -110,6 +110,30 @@ def test_post_intent_hardlink_alias_halts_without_leaking_attempt_bytes(tmp_path
     assert not state.epoch_closed(0)
 
 
+def test_post_intent_hidden_hardlink_alias_fails_closed(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="new.txt", content="ENGINE")])
+
+    def die_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _exit_now)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_write) == 0
+    alias = tmp_path / "hidden-alias"
+    os.link(workdir / "new.txt", alias)
+    (workdir / "new.txt").unlink()
+
+    with pytest.raises(WorkspaceFault, match="disappeared|ambiguous"):
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert alias.read_bytes() == b"ENGINE"
+    state = replay(run_dir)
+    assert state.node((0, "n0")).workspace_unclean is True
+    assert not state.epoch_closed(0)
+
+
 class _CommitThenSucceed:
     def run(self, prompt: str, workdir: Path) -> Result:
         (workdir / "owned").write_text("effect", encoding="utf-8")

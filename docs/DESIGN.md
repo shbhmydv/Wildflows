@@ -370,8 +370,11 @@ The journal is the run's spine. In the PoC it is both an **in-memory append-only
 and an **ndjson file** at `<run_dir>/events.ndjson`, written line-per-event with an
 fsync-on-append discipline. Each event is a Pydantic model serialized with its `kind`
 discriminator; loading re-parses each line back into the typed union. The journal is
-the *only* durable run state the dashboard and resume consume — everything else (git
-tip, worktree artifacts) hangs off node_ids recorded in it. The journal exposes:
+the durable state the projection/dashboard consume. Effect recovery additionally
+consumes integrity-bound lease, intent, recovery, and settled-lease records under
+`run_dir`; those records are transaction inputs/certificates, while lifecycle decisions
+still fold from the journal. Git tips and artifacts hang off node_ids recorded there.
+The journal exposes:
 `append(event) -> seq`, `events() -> list[Event]`, and `load(run_dir) -> Journal`.
 
 **Event shape versioning + compatibility (hand-7).** Item 3 changed three event shapes
@@ -399,18 +402,18 @@ would emit duplicate/reordered seqs. Not built this hand.
 
 ---
 
-## 7. Worktree mediation & the disjoint-ownership merge (invariant 1)
+## 7. Worktree mediation & the disjoint-ownership merge (target invariant 1)
 
-Every `do`/`dispatch` child runs in its **own git worktree** off the run's base commit.
-The core — never the model — integrates results by applying each child's diff and
-committing, enforcing **disjoint ownership**: two integrated siblings may not both
-modify the same path (a collision fails the integration and surfaces to the planner,
-who re-shapes). `inplace` and `setup` are the exceptions: `inplace` commits directly in
-the workdir (it is the planner's hands, serialized), `setup` mutates host state by
-design. Worktree lifecycle hardening (creation, disjoint merge, reap-on-kill, cleanup)
-is ladder step 4; the PoC (step 1) runs `do`/`inplace` in a single workdir to prove the
-mind-steers loop end-to-end, and records the seam (`Rig.run(prompt, workdir)`) that the
-worktree layer slots behind.
+**Target after worktree isolation lands:** every `do`/`dispatch` child runs in its own
+Git worktree off the run's base commit. The core integrates each child and enforces
+**disjoint ownership**: two integrated siblings may not both modify the same path.
+`inplace` and `setup` remain the exceptions.
+
+**Current serial PoC:** `do` and `inplace` share the integration workdir; a rig may author
+commits there, and the core validates, attributes, receipts, or quarantines them. Worktree
+creation, disjoint merge, reaping, and discard replace this shared-workdir recovery policy
+at the later hygiene step. `Rig.run(prompt, workdir)` is the seam that isolation slots
+behind; this section's first paragraph is not a claim that isolation is implemented now.
 
 ---
 
@@ -1069,8 +1072,11 @@ than patching each row. Both are the transaction model of record — not a later
 61. **Reversal alias and portable case policy (B2/H5).** Intent validation re-stats every
     existing canonical target immediately before expected/pre-state classification. A
     regular file with `st_nlink != 1` is byte-captured and raises `WorkspaceFault` before
-    any overwrite or unlink, so a post-intent alias can never retain unrecorded engine
-    bytes. Initial planning uses `(st_dev, st_ino)` identity for existing targets and an
+    any overwrite or unlink. Each path also fsyncs `started=True` before its first write
+    and the intent publishes `reversed=True` after complete reversal; a started canonical
+    target that disappears before that marker fails closed because a hidden external alias
+    may retain attempt bytes. Initial planning uses `(st_dev, st_ino)` identity for
+    existing targets and an
     NFC+casefold canonical key for all declarations. **Documented conservative deviation:**
     case-canonical declaration collisions are rejected on every filesystem, not only after
     proving the workdir case-insensitive. A reliable absent-name case-sensitivity probe

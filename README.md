@@ -1,7 +1,7 @@
 # wildflows
 
-**Better dynamic workflows.** Multi-harness, multi-model, long-running,
-worktree-isolated, fully journalled — open source.
+**Better dynamic workflows.** Multi-harness, multi-model-ready, long-running,
+crash-recoverable, fully journalled — open source.
 
 > The state machine is the hands, the model is the mind.
 
@@ -11,7 +11,7 @@ owns *effects* (git, disk, journal, budgets/rails). Workflows are not a registry
 of files — they are **expressions** over seven primitives:
 
 ```
-do(task, rig, ctx)     one agent, one task, in a worktree -> a result
+do(task, rig, ctx)     one agent, one task -> a result
 dispatch(tasks)        parallel do()s
 combine(results, task) a do() whose input is other results
 loop(expr, until, cap) repeat a sub-expression until a condition or cap
@@ -27,16 +27,19 @@ expressions that act as nudges to the planner.
 
 Multi-CLI orchestrators exist. wildflows is built for **survivability**:
 
-- **Worktree-mediated effects** — agents never touch integration git; the core
-  applies and commits. Crashes/OOMs/SIGTERMs lose zero accepted work.
+- **Core-accounted effects** — the serial PoC verifies and receipts commits in a
+  shared workdir; per-node worktree mediation is the next isolation boundary.
+  Crashes/OOMs/SIGTERMs retain accepted work or quarantine incomplete work.
 - **One journal, one event vocabulary** — resume = replay the event log against
   the expression tree. No per-shape resume code.
-- **Planner-declared, core-enforced rails** — budget / deadline / iteration caps.
+- **Core-enforced rails direction** — loop caps are live now; budget and deadline
+  rails land with the later composition/worktree steps.
 - **Multi-harness rigs** — `claude -p`, `pi`, local Qwen, `codex` all plug in
   behind one prompt-in / files-out seam.
 
-Runs default to a **BUILD** run followed by a spec-unbound **AUDIT** run (an
-expert panel judges the artifact, not the tasks).
+The design's eventual default macro is a **BUILD** run followed by a spec-unbound
+**AUDIT** run (an expert panel judges the artifact, not the tasks); that planner
+macro is not part of the serial PoC yet.
 
 ## Status
 
