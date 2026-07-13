@@ -35,11 +35,17 @@ class Dispatched(_Header):
     """A do/combine/inplace/setup started.
 
     `pre_head` is the workdir HEAD at the moment the attempt opened (None for an unborn
-    repo). It is the DURABLE ATTEMPT PROVENANCE (hand-8): on resume, the commits in
-    `pre_head..HEAD` are exactly this attempt's, so a crash anywhere in the completion
-    gap is reconstructed from that range instead of re-run. A legacy dispatched line
-    lacks this key entirely — the field's absence marks a pre-v1 journal that cannot be
-    provenance-resumed (see `journal.JournalCompatibilityError`).
+    repo). It is the DURABLE ATTEMPT PROVENANCE and the reset target on recovery. Two
+    disjoint recovery boundaries key off it (hand-9/hand-10):
+    - a torn OK `result` (post_head stamped) whose `integrated` was lost reconstructs the
+      receipt from EXACTLY `pre_head..post_head` — never `..HEAD`, so a post-crash operator
+      commit is out of range by construction;
+    - a DISPATCHED-ONLY tail (no result, no completion certificate) is NOT reconstructed:
+      its tip is QUARANTINED to a ref and the branch reset to `pre_head`, then the node
+      re-runs (PRINCIPLE A — no committed work is destroyed, no unreceipted commit is
+      blessed as success).
+    A legacy dispatched line lacks this key entirely — the field's absence marks a pre-v1
+    journal that cannot be provenance-resumed (see `journal.JournalCompatibilityError`).
     """
 
     kind: Literal["dispatched"] = "dispatched"
@@ -75,6 +81,11 @@ class ResultEvent(_Header):
     # reads it); replay's Result reconstruction ignores it.
     loop_status: str | None = None
     outcome: Literal["ok", "failed", "busy"] = "ok"
+    # A durable failed result must never LIE that the workspace was cleanly handled. When a
+    # cleanup/rollback git op fails (hand-10, PRINCIPLE A), the engine marks the failed
+    # result `workspace_unclean=True` and HALTS the epoch (a WorkspaceFault propagates), so
+    # a surviving live effect is recorded honestly rather than papered over as handled.
+    workspace_unclean: bool = False
 
     @model_validator(mode="before")
     @classmethod

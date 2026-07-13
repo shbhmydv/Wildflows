@@ -3,23 +3,43 @@
 The engine says "run this node in this lease, then finalize success/failure"; it issues
 ZERO git commands. `WorkspaceEffects` owns a per-node-attempt lease (pre/post HEAD
 capture over the shared workdir — the seam, not yet a worktree), rig-authored commit
-discovery, staging/commit, failure evidence capture + revert, marker reconciliation
-(reachable-from-HEAD only), and path containment. It hands back one accumulated
-`IntegrationReceipt` (every attributed commit, per-commit paths). `CompletionRecorder`
-owns the ONE event ordering — result THEN integrated — for every completion path
-(do / inplace / reconciliation), replacing three inconsistent orderings.
+discovery, staging/commit, failure evidence capture + revert, and path containment. It
+hands back one accumulated `IntegrationReceipt` (every attributed commit, per-commit
+paths). `CompletionRecorder` owns the ONE event ordering — result THEN integrated — for
+every completion path (do / inplace / recovery), replacing three inconsistent orderings.
 
-Per-node worktree leases are a later step; the shared-workdir policy (revert + clean on
-failure) lives here and is superseded by discard-the-worktree once worktrees land.
+Two consolidation principles (hand-10) live here:
+
+- PRINCIPLE A — QUARANTINE, NEVER DESTROY. No cleanup path deletes content irrecoverably.
+  A dead dispatched-only attempt's tip (dead-attempt AND post-crash operator commits) is
+  moved to a quarantine ref before the branch is reset to the durable `pre_head`;
+  uncommitted dirt + non-preexisting untracked leaks are captured to the run_dir; the
+  lease's per-file preexisting snapshot is respected (preexisting files are left in place,
+  never swept). EVERY git op in any cleanup/rollback path is CHECKED — a failure raises a
+  typed `WorkspaceFault` (never a durable "failed" that lies the workspace was handled).
+
+- PRINCIPLE B — DURABLE TRANSACTION INTENTS. The lease record (pre_head + per-file
+  preexisting snapshot) is fsynced to `run_dir/leases/` at lease open, BEFORE the first
+  mutation, so restart cleanup is idempotent off disk, never process memory. `inplace` is
+  a durable intent transaction: the per-path original content is fsynced to
+  `run_dir/intents/` before the first write, so a crash mid-edit is reversed on restart.
+
+Per-node worktree leases are a later step; the shared-workdir policy (quarantine + reset
+on failure) lives here and is superseded by discard-the-worktree once worktrees land.
 """
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+from pydantic import BaseModel, Field
 
 from wildflows.events import Integrated, ResultEvent
 from wildflows.journal import Journal
@@ -31,20 +51,70 @@ from wildflows.result import CommitReceipt, IntegrationReceipt, Result
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
+class WorkspaceFault(Exception):
+    """A cleanup/rollback git op failed, so the workspace was NOT provably handled.
+
+    Raised from any CHECKED cleanup path (hand-10, PRINCIPLE A). The engine records the
+    failed result marked `workspace_unclean=True` and re-raises this to HALT the epoch — a
+    durable "failed" that lies a live effect was reverted is worse than a crash. `diff_path`
+    is the captured evidence, if any.
+    """
+
+    def __init__(self, message: str, diff_path: "Path | None" = None) -> None:
+        super().__init__(message)
+        self.diff_path = diff_path
+
+
+class LeaseRecord(BaseModel):
+    """The durable lease intent (PRINCIPLE B), fsynced to run_dir BEFORE the first mutation.
+
+    Restart cleanup loads THIS (never process memory) to quarantine + reset a dead attempt
+    idempotently: `pre_head` is the reset target and quarantine range anchor; `preexisting`
+    is the per-file untracked/ignored snapshot the sweep must leave in place.
+    """
+
+    epoch: int
+    node_id: str
+    attempt: int
+    pre_head: str | None
+    preexisting: list[str] = Field(default_factory=list)
+    ts: float
+
+
+class IntentWrite(BaseModel):
+    """One inplace target's pre-state, enough to reverse the write on restart/failure."""
+
+    path: str
+    pre_kind: Literal["file", "dir", "absent", "other"]
+    original: str | None = None  # the file's content when pre_kind == "file"
+
+
+class InplaceIntent(BaseModel):
+    """The durable inplace transaction intent (PRINCIPLE B): every target's original state,
+    fsynced BEFORE the first write so a crash mid-edit is reversed idempotently on restart."""
+
+    epoch: int
+    node_id: str
+    attempt: int
+    writes: list[IntentWrite]
+    ts: float
+
+
 @dataclass
 class Lease:
     """A node attempt's workspace lease: the shared workdir + its pre-run HEAD.
 
-    `pre_head` anchors rig-authored-commit discovery (`pre..post`), the provenance
-    range `pre_head..HEAD` used on resume, and the failure revert. `preexisting` is the
-    set of untracked+ignored paths present at lease open — failure cleanup removes ONLY
-    paths NOT in this set, so it never destroys pre-existing user files, the run_dir, or
-    anything the lease did not create (hand-8 lease-scoping). A per-node worktree is the
-    later backend behind this same seam.
+    `pre_head` anchors rig-authored-commit discovery (`pre..post`), the reset target on
+    resume/failure, and the receipt reconstruction range. `preexisting` is the set of
+    untracked+ignored paths present at lease open — cleanup removes ONLY paths NOT in this
+    set, never destroying pre-existing user files, the run_dir, or anything the lease did
+    not create. `attempt` keys the durable lease/intent records and the quarantine ref so
+    repeated dead attempts never clobber one another's forensics.
     """
 
     node_key: NodeKey
     pre_head: str | None
+    attempt: int = 0
     preexisting: frozenset[str] = frozenset()
 
 
@@ -76,25 +146,26 @@ class WorkspaceEffects:
 
     # -- lease ---------------------------------------------------------------
 
-    def open_lease(self, node_key: NodeKey) -> Lease | None:
+    def open_lease(self, node_key: NodeKey, attempt: int) -> Lease | None:
         """Begin a node attempt, or REFUSE (None) on a dirty tracked/index worktree.
 
         The clean-worktree precondition (hand-9, FAILURE-LEASE): a lease opens only when
         the tracked + index state is clean (untracked files are allowed and snapshotted
-        per-file). This is the honest serial-M1 rule — it removes the reset-`--hard`
-        destruction class, because pre-existing tracked/staged user work can no longer
-        exist at open, so failure revert only ever undoes THIS attempt's own effects.
-        (M3 per-node worktree isolation makes the workdir engine-owned and retires this
-        precondition.) `preexisting` snapshots untracked+ignored PER FILE so an addition
-        under a pre-existing untracked directory is a distinct entry the sweep can detect.
+        per-file). This is the honest serial-M1 rule. The durable lease record is fsynced
+        to run_dir BEFORE any mutation (hand-10, PRINCIPLE B) so restart cleanup loads
+        `pre_head` + the per-file `preexisting` snapshot off disk, never process memory.
+        (M3 per-node worktree isolation makes the workdir engine-owned and retires this.)
         """
         if self.tracked_dirty():
             return None
-        return Lease(
+        lease = Lease(
             node_key=node_key,
             pre_head=self.head_commit(),
+            attempt=attempt,
             preexisting=frozenset(self._untracked_ignored_paths()),
         )
+        self._write_lease_record(lease)
+        return lease
 
     def tracked_dirty(self) -> bool:
         """True if the worktree has any uncommitted TRACKED or staged change (untracked
@@ -102,16 +173,129 @@ class WorkspaceEffects:
         proc = self.git("status", "--porcelain", "--untracked-files=no")
         return bool(proc.stdout.strip())
 
-    def clean_dispatched_residue(self) -> None:
-        """Clean a dead dispatched-only attempt's leftover DIRT before re-running (hand-9,
-        PROVENANCE-RANGE). Reverts uncommitted tracked changes to the CURRENT HEAD and
-        sweeps untracked/ignored leaks — but KEEPS committed history (`reset --hard HEAD`,
-        not `pre_head`): mid-rig checkpoint commits are accepted forensic residue (reachable
-        and identifiable via `pre_head` lineage), never reset away, since an operator commit
-        may sit above them. In the serial PoC the engine owns the workdir mid-run, so the
-        untracked leftovers ARE the dead attempt's; per-node worktrees (M3) retire this."""
-        self.git("reset", "--hard", "HEAD")
-        self._remove_leaks(self._untracked_ignored_paths())
+    # -- durable transaction intents (PRINCIPLE B) ---------------------------
+
+    def _record_path(self, kind: str, epoch: int, node_id: str, attempt: int) -> Path:
+        return self.run_dir / kind / f"{epoch}-{node_id}-{attempt}.json"
+
+    def _fsync_json(self, path: Path, model: BaseModel) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(model.model_dump_json())
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _write_lease_record(self, lease: Lease) -> None:
+        epoch, node_id = lease.node_key
+        self._fsync_json(
+            self._record_path("leases", epoch, node_id, lease.attempt),
+            LeaseRecord(
+                epoch=epoch, node_id=node_id, attempt=lease.attempt,
+                pre_head=lease.pre_head, preexisting=sorted(lease.preexisting),
+                ts=time.time(),
+            ),
+        )
+
+    def load_lease_record(self, epoch: int, node_id: str, attempt: int) -> LeaseRecord | None:
+        path = self._record_path("leases", epoch, node_id, attempt)
+        if not path.exists():
+            return None
+        return LeaseRecord.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def write_intent(self, intent: InplaceIntent) -> None:
+        self._fsync_json(
+            self._record_path("intents", intent.epoch, intent.node_id, intent.attempt), intent
+        )
+
+    def load_intent(self, epoch: int, node_id: str, attempt: int) -> InplaceIntent | None:
+        path = self._record_path("intents", epoch, node_id, attempt)
+        if not path.exists():
+            return None
+        return InplaceIntent.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def settle_records(self, epoch: int, node_id: str, attempt: int) -> None:
+        """Remove a settled attempt's durable lease + intent records — only AFTER its
+        terminal result (and integrated) are journalled, so a crash before settlement
+        redoes an idempotent cleanup rather than losing recovery state."""
+        self._record_path("leases", epoch, node_id, attempt).unlink(missing_ok=True)
+        self._record_path("intents", epoch, node_id, attempt).unlink(missing_ok=True)
+
+    # -- dead-attempt recovery: QUARANTINE, NEVER DESTROY (PRINCIPLE A) -------
+
+    def _quarantine_ref(self, rec: LeaseRecord) -> str:
+        slug = f"{self.run_dir.name}-{rec.epoch}-{rec.node_id}-{rec.attempt}".replace("/", "-")
+        return f"refs/wildflows/quarantine/{slug}"
+
+    def quarantine_dead_attempt(self, rec: LeaseRecord) -> Path | None:
+        """Recover a dead dispatched-only attempt without destroying anything (PRINCIPLE A).
+
+        The current tip (dead-attempt commits AND any post-crash operator commit) is moved
+        to a quarantine ref so it stays reachable; uncommitted dirt + non-preexisting
+        untracked leaks are captured to run_dir; the branch is reset to the durable
+        `pre_head`; then only NON-preexisting untracked leaks are swept (the lease's
+        preexisting snapshot is left in place). EVERY git op is CHECKED — a failure raises
+        `WorkspaceFault`. Idempotent given the record: quarantine update-ref, reset to
+        pre_head, and capture-append all redo safely after a crash mid-cleanup."""
+        pre = rec.pre_head
+        head = self.head_commit()
+        diff_path = self._capture_dead_attempt(rec)
+        if head is not None and head != pre:
+            self._checked(self.git("update-ref", self._quarantine_ref(rec), head),
+                          "quarantine update-ref", diff_path)
+        if pre is not None:
+            self._checked(self.git("reset", "--hard", pre), "quarantine reset --hard", diff_path)
+        else:
+            # Unborn at lease open: drop the branch ref so the dead attempt's first commit
+            # cannot survive as durable history (it lives on in the quarantine ref).
+            ref = self.git("symbolic-ref", "-q", "HEAD").stdout.strip()
+            if head is not None and ref:
+                self._checked(self.git("update-ref", "-d", ref),
+                              "quarantine unborn update-ref -d", diff_path)
+            self._checked(self.git("reset"), "quarantine unborn reset", diff_path)
+        self._remove_leaks(
+            sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
+        )
+        return diff_path
+
+    def quarantine_from_journal(
+        self, epoch: int, node_id: str, attempt: int, pre_head: str | None
+    ) -> Path | None:
+        """Quarantine a pre-hand-10 dead attempt that has no durable lease record: build a
+        conservative record from the journalled `pre_head` and treat ALL current untracked
+        as preexisting, so committed work is quarantined + reset to pre_head but NOTHING is
+        swept (never-destroy in the absence of a snapshot)."""
+        rec = LeaseRecord(
+            epoch=epoch, node_id=node_id, attempt=attempt, pre_head=pre_head,
+            preexisting=self._untracked_ignored_paths(), ts=0.0,
+        )
+        return self.quarantine_dead_attempt(rec)
+
+    def _capture_dead_attempt(self, rec: LeaseRecord) -> Path | None:
+        """Capture a dead attempt's uncommitted dirt + non-preexisting untracked leaks to
+        run_dir/quarantine/ (committed work is already reachable via the quarantine ref)."""
+        parts: list[str] = []
+        diff = self.git("diff", "HEAD")
+        if diff.returncode == 0 and diff.stdout.strip():
+            parts.append(diff.stdout)
+        parts.extend(self._leak_evidence(
+            sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
+        ))
+        if not parts:
+            return None
+        cap_dir = self.run_dir / "quarantine"
+        cap_dir.mkdir(parents=True, exist_ok=True)
+        path = cap_dir / f"{rec.epoch}-{rec.node_id}-{rec.attempt}.diff"
+        path.write_text("\n".join(parts), encoding="utf-8")
+        return path
+
+    def _checked(
+        self, proc: subprocess.CompletedProcess[str], what: str, diff_path: Path | None = None
+    ) -> None:
+        """Every cleanup/rollback git op is checked (PRINCIPLE A): a non-zero exit raises
+        `WorkspaceFault` so the engine never journals a durable "failed" claiming a live
+        effect was reverted when the revert itself failed."""
+        if proc.returncode != 0:
+            raise WorkspaceFault(f"{what} failed: {proc.stderr.strip()}", diff_path)
 
     # -- do finalization -----------------------------------------------------
 
@@ -165,15 +349,20 @@ class WorkspaceEffects:
             diff_path = leak_dir / diff_name
             diff_path.write_text("\n".join(parts), encoding="utf-8")
 
+        # EVERY revert git op is CHECKED (hand-10, PRINCIPLE A): if reset/update-ref fails,
+        # the failing rig's live effect is NOT provably reverted, so raise WorkspaceFault
+        # (carrying the captured evidence) rather than let the engine journal a durable
+        # "failed" that lies the workspace was handled.
         if pre is not None:
-            self.git("reset", "--hard", pre)  # undo the failing rig's own commits
+            self._checked(self.git("reset", "--hard", pre), "failure reset --hard", diff_path)
         else:
             # Unborn at lease open: if the failing rig created the first commit, drop the
             # branch ref back to unborn so its effect cannot survive as durable history.
             ref = self.git("symbolic-ref", "-q", "HEAD").stdout.strip()
             if self.head_commit() is not None and ref:
-                self.git("update-ref", "-d", ref)
-            self.git("reset")  # unstage so staged leaks become untracked for the sweep
+                self._checked(self.git("update-ref", "-d", ref),
+                              "failure unborn update-ref -d", diff_path)
+            self._checked(self.git("reset"), "failure unborn reset", diff_path)
         # Recompute leaks AFTER the reset: a leak the failing rig (or a failed core commit)
         # had STAGED only surfaces as untracked once the index is reset. The sweep stays
         # lease-scoped — preexisting user files and the run_dir subtree are never touched.
@@ -283,22 +472,29 @@ class WorkspaceEffects:
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         return Integration("committed", commit=sha, paths=list(declared))
 
-    def rollback_inplace(self, writes: list[tuple[str, str | None]]) -> None:
-        """Undo an inplace's partial writes on a failure AFTER the first write (a late
-        symlink rejection or a failed declared commit) — hand-9, INPLACE-TRANSACTIONAL.
+    def rollback_inplace(self, writes: list[IntentWrite]) -> None:
+        """Reverse an inplace from its DURABLE intent — on a failure after the first write
+        (OSError/symlink/commit failure) OR on restart of a crashed inplace (hand-10,
+        PRINCIPLE B). Idempotent given the intent record.
 
-        `writes` is every path this inplace already wrote, in order, each with the content
-        that PRE-EXISTED (None if the file was created). Pre-existing files are restored to
-        that content; created files are deleted; then the declared paths are unstaged, so a
-        durable failed result leaves NO partial effect for a later node to claim."""
-        for rel, original in writes:
-            target = self.workdir / rel
-            if original is None:
-                target.unlink(missing_ok=True)
-            else:
-                target.write_text(original, encoding="utf-8")
+        Each target is restored to its recorded pre-state: a pre-existing FILE is rewritten
+        with its original content; a path this inplace CREATED (pre_kind `absent`) is
+        unlinked; a pre-existing DIRECTORY/other is left untouched (a whole-file write could
+        not have mutated it — the write failed). The declared paths are then unstaged with a
+        CHECKED reset so a durable failed result leaves NO partial effect for a later node to
+        claim (an unstage failure raises WorkspaceFault, never a lying durable failure)."""
+        for w in writes:
+            target = self.workdir / w.path
+            if w.pre_kind == "file":
+                target.write_text(w.original or "", encoding="utf-8")
+            elif w.pre_kind == "absent":
+                if target.is_file() or target.is_symlink():
+                    target.unlink(missing_ok=True)
+            # pre_kind dir/other: the write never mutated it; leave it in place.
         if writes:
-            self.git("reset", "-q", "--", *[rel for rel, _ in writes])
+            self._checked(
+                self.git("reset", "-q", "--", *[w.path for w in writes]), "inplace rollback unstage"
+            )
 
     # -- git plumbing --------------------------------------------------------
 
@@ -399,10 +595,15 @@ class CompletionRecorder:
         self.run_id = run_id
 
     def record_result(
-        self, key: NodeKey, result: Result, post_head: str | None = None
+        self, key: NodeKey, result: Result, post_head: str | None = None,
+        workspace_unclean: bool = False,
     ) -> None:
-        """A terminal result with no integration (failure, effectless, or no-op)."""
-        self.journal.append(self._result_event(key, result, post_head=post_head))
+        """A terminal result with no integration (failure, effectless, or no-op).
+
+        `workspace_unclean` marks a failed result whose cleanup git op failed (PRINCIPLE A):
+        it is journalled honestly and the engine then HALTS the epoch (WorkspaceFault)."""
+        self.journal.append(self._result_event(
+            key, result, post_head=post_head, workspace_unclean=workspace_unclean))
 
     def record_success(
         self, key: NodeKey, result: Result, receipt: IntegrationReceipt,
@@ -437,11 +638,12 @@ class CompletionRecorder:
 
     def _result_event(
         self, key: NodeKey, result: Result, loop_status: str | None = None,
-        post_head: str | None = None,
+        post_head: str | None = None, workspace_unclean: bool = False,
     ) -> ResultEvent:
         epoch, node_id = key
         return ResultEvent(
             run_id=self.run_id, epoch=epoch, node_id=node_id,
             text=result.text, files=result.files, exit_code=result.exit_code,
             outcome=result.outcome, loop_status=loop_status, post_head=post_head,
+            workspace_unclean=workspace_unclean,
         )

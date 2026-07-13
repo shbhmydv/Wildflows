@@ -43,7 +43,18 @@ def _is_legacy_shape(raw: dict[str, object]) -> bool:
     if kind == "loop_iter":
         return any(f in raw for f in ("body_text", "body_files", "body_exit_code"))
     if kind == "result":
-        return "outcome" not in raw   # pre-collapse `ok`-only result
+        if "outcome" not in raw:
+            return True  # pre-collapse `ok`-only result
+        # An EFFECTFUL leaf result (non-empty declared `files`) with no `post_head`
+        # completion certificate is an interrupted pre-v1 tail, NOT a durable success
+        # (hand-10, PRINCIPLE A). post_head is sampled on every modern effectful leaf result,
+        # so its absence/None over a non-empty `files` cannot be reconstructed (no range end)
+        # and must never be accepted as a durable receipt-less effect certificate. A LOOP's
+        # final result (identified by a non-None `loop_status`) legitimately carries the body
+        # artifact `files` with no post_head — its durability rides on the body iterations'
+        # own integrated events, so it is exempt.
+        if raw.get("files") and raw.get("post_head") is None and raw.get("loop_status") is None:
+            return True
     return False
 
 

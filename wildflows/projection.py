@@ -74,6 +74,7 @@ class NodeProjection:
     """Everything the fold knows about one `(epoch, node_id)`."""
 
     dispatched: bool = False
+    dispatch_count: int = 0  # number of Dispatched events = the next attempt's index
     dispatched_pre_head: str | None = None  # provenance anchor (range START)
     result: Result | None = None
     result_seq: int = -1
@@ -125,6 +126,7 @@ class RunProjection:
         node = self.nodes.setdefault(key, NodeProjection())
         if isinstance(ev, Dispatched):
             node.dispatched = True
+            node.dispatch_count += 1
             node.dispatched_pre_head = ev.pre_head
         elif isinstance(ev, ResultEvent):
             node.result = Result(

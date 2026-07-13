@@ -21,15 +21,23 @@ ndjson alone. Executable: do, inplace, seq, dispatch (serial in the PoC), and lo
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal, NoReturn
 
 from wildflows.admission import admit_epoch
 from wildflows.events import Boundary, Dispatched, LoopIter
 from wildflows.expr import CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Until
 from wildflows.journal import Journal
-from wildflows.projection import ExecutionOutcome, Floor, RunProjection, replay
+from wildflows.projection import ExecutionOutcome, Floor, NodeKey, RunProjection, replay
 from wildflows.result import CommitReceipt, IntegrationReceipt, Result
 from wildflows.rig import RigRegistry
-from wildflows.workspace import CompletionRecorder, Lease, WorkspaceEffects
+from wildflows.workspace import (
+    CompletionRecorder,
+    InplaceIntent,
+    IntentWrite,
+    Lease,
+    WorkspaceEffects,
+    WorkspaceFault,
+)
 
 __all__ = ["Engine", "replay", "RunProjection"]
 
@@ -212,8 +220,10 @@ class Engine:
     def _exec_do(self, node: Do, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if self._recover_committed_attempt(key, floor):
+            self._settle(key)
             return ExecutionOutcome(key=key)
-        lease = self._open_lease_or_fail(key, floor)
+        attempt = self._proj.node(key).dispatch_count
+        lease = self._open_lease_or_fail(key, floor, attempt)
         if lease is None:
             return ExecutionOutcome(key=key)
         prompt = self._materialize_ctx(node, epoch)
@@ -226,33 +236,37 @@ class Engine:
             self.rec.record_result(key, Result(
                 text=f"unresolved ctx for {node.node_id}", outcome="failed"),
                 post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         diff_name = f"e{epoch}-{node.node_id}.diff"
         try:
             result = self.registry.resolve(node.rig.name).run(prompt, self.workdir)
         except Exception as exc:  # a rig exception never escapes after `dispatched`
-            diff_path = self.ws.finalize_failure(lease, diff_name)
+            diff_path = self._finalize_failure(lease, diff_name, key)
             self.rec.record_result(key, Result(
                 text=self._fail_text(f"rig raised: {exc}", diff_path), outcome="failed"),
                 post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         if not result.ok:
             # The failed rig's effects (incl its own commits) are reverted + captured.
-            diff_path = self.ws.finalize_failure(lease, diff_name)
+            diff_path = self._finalize_failure(lease, diff_name, key)
             self.rec.record_result(key, Result(
                 text=self._fail_text(result.text, diff_path),
                 files=result.files, exit_code=result.exit_code, outcome=result.outcome),
                 post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         integ = self.ws.finalize_do_success(lease, self._commit_msg("do", node.node_id, epoch))
         if not integ.ok:
             # A git failure integrating a SUCCESSFUL rig's dirty state is a failed
             # transaction, not a bare error: revert + capture the leak through the same
             # failure path so no later node inherits it (hand-8, FAILURE-TRANSACTION).
-            diff_path = self.ws.finalize_failure(lease, diff_name)
+            diff_path = self._finalize_failure(lease, diff_name, key)
             self.rec.record_result(key, Result(
                 text=self._fail_text(f"do integration failed:\n{integ.stderr}", diff_path),
                 outcome="failed"), post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         # Result.files is the artifact list (== the effect paths in the shared-workdir
         # PoC); the receipt is the ownership record replay accumulates. `post_head` is the
@@ -261,26 +275,80 @@ class Engine:
             text=result.text, files=integ.receipt.paths,
             exit_code=result.exit_code, outcome=result.outcome), integ.receipt,
             post_head=self.ws.head_commit())
+        self._settle(key)
         return ExecutionOutcome(key=key)
 
-    def _open_lease_or_fail(self, key: tuple[int, str], floor: Floor) -> Lease | None:
-        """Open a lease, first cleaning a dead dispatched-only attempt's leftover dirt on a
-        top-level resume (hand-9). A refused lease (dirty tracked/index worktree) records a
-        durable failed result and returns None — the honest serial-M1 rule."""
-        if floor == -1 and self._proj.node(key).dispatched:
-            self.ws.clean_dispatched_residue()
-        lease = self.ws.open_lease(key)
+    def _open_lease_or_fail(self, key: NodeKey, floor: Floor, attempt: int) -> Lease | None:
+        """Open a lease, first QUARANTINING (never destroying) a dead dispatched-only
+        attempt on a top-level resume (hand-10, PRINCIPLE A). A refused lease (dirty
+        tracked/index worktree) records a durable failed result and returns None — the
+        honest serial-M1 rule."""
+        node = self._proj.node(key)
+        if floor == -1 and node.dispatched and node.result is None:
+            self._quarantine_dead_attempt(key, attempt)
+        lease = self.ws.open_lease(key, attempt)
         if lease is None:
             self.rec.record_result(key, Result(
                 text="workdir has uncommitted tracked changes; lease refused",
                 outcome="failed"), post_head=self.ws.head_commit())
         return lease
 
+    def _quarantine_dead_attempt(self, key: NodeKey, attempt: int) -> None:
+        """Quarantine + reset a dead attempt from its DURABLE lease record (PRINCIPLE B),
+        or, for a pre-hand-10 dispatched line with no record, a conservative journal-based
+        fallback that never sweeps (treats all current untracked as preexisting) while
+        still quarantining committed work and resetting to the journalled `pre_head`. A
+        cleanup git-op failure HALTS the epoch (WorkspaceFault, PRINCIPLE A)."""
+        epoch, node_id = key
+        dead = attempt - 1
+        try:
+            rec = self.ws.load_lease_record(epoch, node_id, dead)
+            if rec is not None:
+                self.ws.quarantine_dead_attempt(rec)
+            else:
+                self.ws.quarantine_from_journal(
+                    epoch, node_id, dead, self._proj.node(key).dispatched_pre_head)
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, "dead-attempt quarantine", fault)
+        self.ws.settle_records(epoch, node_id, dead)
+
+    def _finalize_failure(self, lease: Lease, diff_name: str, key: NodeKey) -> Path | None:
+        """Run the checked failure revert; a cleanup git-op failure HALTS the epoch with a
+        `workspace_unclean` failed result rather than a durable "failed" that lies the live
+        effect was handled (hand-10, PRINCIPLE A)."""
+        try:
+            return self.ws.finalize_failure(lease, diff_name)
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, "failure cleanup", fault)
+
+    def _halt_unclean(self, key: NodeKey, stage: str, fault: WorkspaceFault) -> NoReturn:
+        """Record the failed result marked `workspace_unclean` (honest: a live effect may
+        survive), then re-raise to HALT the epoch — the fault is durable in the journal and
+        no `boundary(closed)` is written for a workspace we could not clean."""
+        self.rec.record_result(key, Result(
+            text=self._fail_text(f"{stage} failed, workspace UNCLEAN: {fault}", fault.diff_path),
+            outcome="failed"), post_head=self.ws.head_commit(), workspace_unclean=True)
+        raise fault
+
+    def _settle(self, key: NodeKey) -> None:
+        """Remove the attempt's durable lease/intent records once its terminal result is
+        journalled (PRINCIPLE B: settle only after the transaction is durable)."""
+        epoch, node_id = key
+        self.ws.settle_records(epoch, node_id, self._proj.node(key).dispatch_count - 1)
+
     def _exec_inplace(self, node: Inplace, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if self._recover_committed_attempt(key, floor):
+            self._settle(key)
             return ExecutionOutcome(key=key)
-        lease = self._open_lease_or_fail(key, floor)
+        attempt = self._proj.node(key).dispatch_count
+        pnode = self._proj.node(key)
+        if floor == -1 and pnode.dispatched and pnode.result is None:
+            # Reverse a crashed inplace's DURABLE intent BEFORE anything else (PRINCIPLE B):
+            # a partial write to a pre-existing (possibly untracked) file is restored from
+            # the fsynced originals, which a `reset --hard` alone could not recover.
+            self._reverse_pending_intent(key, attempt - 1)
+        lease = self._open_lease_or_fail(key, floor, attempt)
         if lease is None:
             return ExecutionOutcome(key=key)
         self.journal.append(Dispatched(
@@ -291,35 +359,40 @@ class Engine:
         if not node.edits:  # an empty inplace is a no-op ok result with NO git calls
             self.rec.record_result(key, Result(text="inplace: no edits", files=[]),
                                    post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
-        # Track every write (path + the content it pre-existed with, None if created) so a
-        # failure AFTER the first write rolls back to leave NO partial effect (hand-9,
-        # INPLACE-TRANSACTIONAL).
-        paths: list[str] = []
-        writes: list[tuple[str, str | None]] = []
+        # A durable intent (every target's pre-state) is fsynced BEFORE the first write, so
+        # ANY exception after the first write — OR a crash — is reversed from the record,
+        # leaving NO partial effect (hand-10, PRINCIPLE B / INPLACE-TRANSACTIONAL). A path
+        # rejection at PLAN time (a symlink escape resolve_safe_path catches) is before any
+        # mutation, so no rollback is needed.
         try:
-            for edit in node.edits:
-                target = self.ws.resolve_safe_path(edit.path)
-                original = target.read_text(encoding="utf-8") if target.is_file() else None
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(edit.content, encoding="utf-8")
-                writes.append((edit.path, original))
-                paths.append(edit.path)
+            writes = self._plan_inplace_writes(node)
         except ValueError as exc:
-            # A symlink resolving outside the workdir can only be caught at write time
-            # (admission cannot resolve symlinks); roll back earlier edits, then a durable
-            # FAILED result — never an exception escaping after `dispatched`.
-            self.ws.rollback_inplace(writes)
             self.rec.record_result(key, Result(
                 text=f"inplace path rejected: {exc}", outcome="failed"),
                 post_head=self.ws.head_commit())
+            self._settle(key)
+            return ExecutionOutcome(key=key)
+        self.ws.write_intent(InplaceIntent(
+            epoch=epoch, node_id=node.node_id, attempt=attempt, writes=writes, ts=0.0))
+        paths = [w.path for w in writes]
+        try:
+            self._apply_inplace_writes(node)
+        except Exception as exc:  # OSError/UnicodeError/... — a partial write is rolled back
+            self._rollback_inplace(writes, key)
+            self.rec.record_result(key, Result(
+                text=f"inplace write failed: {exc}", outcome="failed"),
+                post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         integ = self.ws.integrate_declared(paths, self._commit_msg("inplace", node.node_id, epoch))
         if integ.status == "failed":
-            self.ws.rollback_inplace(writes)  # no partial write survives a failed commit
+            self._rollback_inplace(writes, key)  # no partial write survives a failed commit
             self.rec.record_result(key, Result(
                 text=f"inplace integration failed:\n{integ.stderr}", outcome="failed"),
                 post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         if integ.status == "noop":
             # An already-identical edit produced no diff: a DURABLE no-op (files=[]), so
@@ -327,11 +400,56 @@ class Engine:
             self.rec.record_result(key, Result(
                 text=f"inplace: no diff (already applied) for {', '.join(paths)}", files=[]),
                 post_head=self.ws.head_commit())
+            self._settle(key)
             return ExecutionOutcome(key=key)
         receipt = IntegrationReceipt(commits=[CommitReceipt(sha=integ.commit or "", paths=paths)])
         self.rec.record_success(key, Result(text=f"wrote {', '.join(paths)}", files=paths),
                                 receipt, post_head=self.ws.head_commit())
+        self._settle(key)
         return ExecutionOutcome(key=key)
+
+    def _plan_inplace_writes(self, node: Inplace) -> list[IntentWrite]:
+        """Resolve every edit path (raising on a symlink escape) and capture its pre-state
+        for the durable intent — BEFORE any write. A pre-existing regular file's content is
+        recorded so a failed/crashed write is reversed; a directory/absent target records
+        its kind so rollback never deletes a pre-existing directory."""
+        writes: list[IntentWrite] = []
+        for edit in node.edits:
+            self.ws.resolve_safe_path(edit.path)  # ValueError on a symlink escape / gitdir
+            plain = self.workdir / edit.path
+            pre_kind: Literal["file", "dir", "absent", "other"]
+            original: str | None
+            if plain.is_symlink():
+                pre_kind, original = "other", None
+            elif plain.is_file():
+                pre_kind, original = "file", plain.read_text(encoding="utf-8")
+            elif plain.is_dir():
+                pre_kind, original = "dir", None
+            else:
+                pre_kind, original = "absent", None
+            writes.append(IntentWrite(path=edit.path, pre_kind=pre_kind, original=original))
+        return writes
+
+    def _apply_inplace_writes(self, node: Inplace) -> None:
+        """Apply the whole-file writes; any OSError (e.g. a target directory) propagates to
+        the caller's rollback. Plain (unresolved) paths keep write and rollback symmetric."""
+        for edit in node.edits:
+            plain = self.workdir / edit.path
+            plain.parent.mkdir(parents=True, exist_ok=True)
+            plain.write_text(edit.content, encoding="utf-8")
+
+    def _reverse_pending_intent(self, key: NodeKey, attempt: int) -> None:
+        intent = self.ws.load_intent(key[0], key[1], attempt)
+        if intent is not None:
+            self._rollback_inplace(intent.writes, key)
+
+    def _rollback_inplace(self, writes: list[IntentWrite], key: NodeKey) -> None:
+        """Roll back from the durable intent; an unstage git-op failure HALTS the epoch
+        (PRINCIPLE A) rather than record a durable failure that leaves a staged partial."""
+        try:
+            self.ws.rollback_inplace(writes)
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, "inplace rollback", fault)
 
     def _materialize_ctx(self, node: Do, epoch: int) -> str | None:
         """Append declared `ctx` to the prompt; None if any ref is unresolvable.
