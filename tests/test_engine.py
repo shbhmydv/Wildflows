@@ -68,10 +68,10 @@ def test_replay_reconstructs_state_from_ndjson_alone(tmp_path: Path) -> None:
     # inplace node integrated; do node has a result
     inplace_id = "n0.0"
     do_id = "n0.1"
-    assert inplace_id in state.integrated
-    assert do_id in state.results
-    assert state.results[do_id].ok is True
-    assert "t" in state.results[do_id].text
+    assert (0, inplace_id) in state.integrated
+    assert (0, do_id) in state.results
+    assert state.results[(0, do_id)].ok is True
+    assert "t" in state.results[(0, do_id)].text
 
 
 def test_unexecutable_primitive_raises_in_poc(tmp_path: Path) -> None:
@@ -114,12 +114,14 @@ def test_loop_converges_and_journals_iterations(tmp_path: Path) -> None:
     assert iters[-1].converged is True
     result = [e for e in eng.journal.events() if e.kind == "result" and e.node_id == "n0"]
     assert result[-1].ok is True
-    assert "converged after 3" in result[-1].text
+    # SF6: convergence/cap status is in loop_status; text/files carry the body artifact.
+    assert "converged after 3" in (result[-1].loop_status or "")
+    assert "converged" not in result[-1].text  # the artifact, not the prose
     # body effect landed + was committed each iteration
     assert (eng.workdir / "marker.txt").read_text() == "body ran"
     state = replay(eng.run_dir)
-    assert state.loop_iterations["n0"] == 3
-    assert state.loop_last_commit["n0"] is not None
+    assert state.loop_iterations[(0, "n0")] == 3
+    assert state.loop_last_commit[(0, "n0")] is not None
 
 
 def test_loop_cap_exhaustion_is_result_not_crash(tmp_path: Path) -> None:
@@ -133,7 +135,7 @@ def test_loop_cap_exhaustion_is_result_not_crash(tmp_path: Path) -> None:
     assert all(e.converged is False for e in iters)
     result = [e for e in eng.journal.events() if e.kind == "result" and e.node_id == "n0"]
     assert result[-1].ok is False
-    assert "hit cap 3" in result[-1].text
+    assert "hit cap 3" in (result[-1].loop_status or "")
     kinds = [e.kind for e in eng.journal.events()]
     assert kinds[-1] == "boundary"  # epoch still closes cleanly
 
@@ -164,6 +166,6 @@ def test_replay_folds_mid_loop_journal(tmp_path: Path) -> None:
     path.write_text("\n".join(lines[:cut]) + "\n")
 
     state = replay(eng.run_dir)
-    assert state.loop_iterations["n0"] == 2  # iterations-completed == k
-    assert state.loop_last_commit["n0"] is not None
+    assert state.loop_iterations[(0, "n0")] == 2  # iterations-completed == k
+    assert state.loop_last_commit[(0, "n0")] is not None
     assert not state.epoch_closed(0)  # kill happened before the boundary closed
