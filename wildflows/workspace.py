@@ -34,12 +34,13 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from wildflows.events import Integrated, ResultEvent
 from wildflows.journal import Journal
@@ -178,12 +179,42 @@ class WorkspaceEffects:
     def _record_path(self, kind: str, epoch: int, node_id: str, attempt: int) -> Path:
         return self.run_dir / kind / f"{epoch}-{node_id}-{attempt}.json"
 
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        """Durably publish a directory-entry change (rename/unlink/mkdir)."""
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise WorkspaceFault(f"directory fsync failed for {path}: {exc}") from exc
+
     def _fsync_json(self, path: Path, model: BaseModel) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(model.model_dump_json())
-            fh.flush()
-            os.fsync(fh.fileno())
+        """Crash-atomically publish a record: temp + file fsync + replace + dir fsync."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._fsync_dir(path.parent.parent)
+            fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+            tmp = Path(raw_tmp)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(model.model_dump_json())
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+                self._fsync_dir(path.parent)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        except WorkspaceFault:
+            raise
+        except OSError as exc:
+            raise WorkspaceFault(f"atomic record publication failed for {path}: {exc}") from exc
 
     def _write_lease_record(self, lease: Lease) -> None:
         epoch, node_id = lease.node_key
@@ -198,9 +229,12 @@ class WorkspaceEffects:
 
     def load_lease_record(self, epoch: int, node_id: str, attempt: int) -> LeaseRecord | None:
         path = self._record_path("leases", epoch, node_id, attempt)
-        if not path.exists():
+        if not os.path.lexists(path):
             return None
-        return LeaseRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return LeaseRecord.model_validate_json(path.read_bytes())
+        except (OSError, ValidationError) as exc:
+            raise WorkspaceFault(f"lease record is unreadable or corrupt: {path}: {exc}") from exc
 
     def write_intent(self, intent: InplaceIntent) -> None:
         self._fsync_json(
@@ -209,16 +243,25 @@ class WorkspaceEffects:
 
     def load_intent(self, epoch: int, node_id: str, attempt: int) -> InplaceIntent | None:
         path = self._record_path("intents", epoch, node_id, attempt)
-        if not path.exists():
+        if not os.path.lexists(path):
             return None
-        return InplaceIntent.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return InplaceIntent.model_validate_json(path.read_bytes())
+        except (OSError, ValidationError) as exc:
+            raise WorkspaceFault(f"intent record is unreadable or corrupt: {path}: {exc}") from exc
 
     def settle_records(self, epoch: int, node_id: str, attempt: int) -> None:
         """Remove a settled attempt's durable lease + intent records — only AFTER its
         terminal result (and integrated) are journalled, so a crash before settlement
         redoes an idempotent cleanup rather than losing recovery state."""
-        self._record_path("leases", epoch, node_id, attempt).unlink(missing_ok=True)
-        self._record_path("intents", epoch, node_id, attempt).unlink(missing_ok=True)
+        for kind in ("leases", "intents"):
+            path = self._record_path(kind, epoch, node_id, attempt)
+            try:
+                if os.path.lexists(path):
+                    path.unlink()
+                    self._fsync_dir(path.parent)
+            except OSError as exc:
+                raise WorkspaceFault(f"record settlement failed for {path}: {exc}") from exc
 
     # -- dead-attempt recovery: QUARANTINE, NEVER DESTROY (PRINCIPLE A) -------
 
@@ -597,13 +640,15 @@ class CompletionRecorder:
     def record_result(
         self, key: NodeKey, result: Result, post_head: str | None = None,
         workspace_unclean: bool = False,
+        recovery_action: Literal["fail", "retry"] | None = None,
     ) -> None:
         """A terminal result with no integration (failure, effectless, or no-op).
 
         `workspace_unclean` marks a failed result whose cleanup git op failed (PRINCIPLE A):
         it is journalled honestly and the engine then HALTS the epoch (WorkspaceFault)."""
         self.journal.append(self._result_event(
-            key, result, post_head=post_head, workspace_unclean=workspace_unclean))
+            key, result, post_head=post_head, workspace_unclean=workspace_unclean,
+            recovery_action=recovery_action))
 
     def record_success(
         self, key: NodeKey, result: Result, receipt: IntegrationReceipt,
@@ -639,11 +684,12 @@ class CompletionRecorder:
     def _result_event(
         self, key: NodeKey, result: Result, loop_status: str | None = None,
         post_head: str | None = None, workspace_unclean: bool = False,
+        recovery_action: Literal["fail", "retry"] | None = None,
     ) -> ResultEvent:
         epoch, node_id = key
         return ResultEvent(
             run_id=self.run_id, epoch=epoch, node_id=node_id,
             text=result.text, files=result.files, exit_code=result.exit_code,
             outcome=result.outcome, loop_status=loop_status, post_head=post_head,
-            workspace_unclean=workspace_unclean,
+            workspace_unclean=workspace_unclean, recovery_action=recovery_action,
         )

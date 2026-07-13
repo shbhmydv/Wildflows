@@ -86,6 +86,11 @@ class ResultEvent(_Header):
     # result `workspace_unclean=True` and HALTS the epoch (a WorkspaceFault propagates), so
     # a surviving live effect is recorded honestly rather than papered over as handled.
     workspace_unclean: bool = False
+    # How resume proceeds AFTER checked cleanup clears an unclean halt. `fail` means the
+    # attempt had already failed and may close once cleanup succeeds; `retry` means it died
+    # without a completion certificate and must dispatch again. None on ordinary results
+    # and legacy unclean markers (which fail closed because their disposition is unknown).
+    recovery_action: Literal["fail", "retry"] | None = None
 
     @model_validator(mode="before")
     @classmethod

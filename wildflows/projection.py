@@ -79,6 +79,8 @@ class NodeProjection:
     result: Result | None = None
     result_seq: int = -1
     result_post_head: str | None = None  # HEAD when the result was recorded (range END)
+    workspace_unclean: bool = False
+    recovery_action: Literal["fail", "retry"] | None = None
     receipt: IntegrationReceipt | None = None  # accumulated effect record
     integrated_seq: int = -1  # seq of the LAST integrated event (the resume frontier)
     # Loop-only: completed-iteration count, last integrated commit, the seq of the last
@@ -134,6 +136,8 @@ class RunProjection:
             )
             node.result_seq = ev.seq
             node.result_post_head = ev.post_head
+            node.workspace_unclean = ev.workspace_unclean
+            node.recovery_action = ev.recovery_action
             self._results_by_seq[ev.seq] = node.result
             self._last_result_seq = ev.seq
         elif isinstance(ev, Integrated):
@@ -157,20 +161,26 @@ class RunProjection:
 
     # -- resume / durability decision ---------------------------------------
 
-    def resume_action(self, key: NodeKey, floor: Floor) -> Literal["run", "done"]:
-        """The single leaf durability decision.
+    def resume_action(self, key: NodeKey, floor: Floor) -> Literal["run", "done", "recover"]:
+        """The single leaf durability decision, including persistent workspace halts.
 
-        A `do`/`inplace` with DECLARED FILE EFFECTS is durable only once its core
-        `integrated` receipt is journalled; an effectless node is durable on its result
-        alone. `floor` scopes the decision: durable state at/below it is stale; `None`
-        (a fresh loop iteration) is never durable.
+        An in-scope ``workspace_unclean`` result is never terminal: resume must first run
+        checked recovery from the durable record. A cleared ``retry`` marker also remains
+        non-terminal until a new dispatch produces its own result, which closes the crash
+        window between recovery and redispatch. Successful declared file effects require
+        an integration receipt; failed results are terminal once their cleanup is verified,
+        regardless of any artifact names the failed rig reported.
         """
         node = self.nodes.get(key)
         if node is None or node.result is None:
             return "run"
         if floor is None or node.result_seq <= floor:
             return "run"
-        if node.result.files:
+        if node.workspace_unclean:
+            return "recover"
+        if node.recovery_action == "retry":
+            return "run"
+        if node.result.ok and node.result.files:
             if node.receipt is None or node.integrated_seq <= floor:
                 return "run"
         return "done"
