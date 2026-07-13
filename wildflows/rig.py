@@ -12,16 +12,16 @@ import shlex
 import signal
 import subprocess
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from wildflows.result import Outcome, Result
 
-# Outcome discriminator (extends the plain ok/not-ok Result):
-#   ok     — the rig produced output and exited 0.
-#   failed — a real task/transport failure (non-zero exit, or a timeout kill).
-#   busy   — a rate/session/quota wall: NOT a task failure. The caller should back
-#            off and re-enter (real backoff policy is a later ladder step, not here).
-Outcome = Literal["ok", "failed", "busy"]
+# `Result`/`Outcome` are core domain values (in `result.py`); re-exported here so
+# `from wildflows.rig import Result` keeps working for rig implementations.
+__all__ = [
+    "Outcome", "Result", "DEFAULT_BUSY_PATTERNS", "Rig", "EchoRig", "ShellRig",
+    "ScriptRig", "RigRegistry",
+]
 
 # The rate/session-limit signatures the grindstone rigs surface on stderr (kept in
 # sync with models/picodex/{senior,planner}_request.sh + grindstone/ratelimit.py).
@@ -35,16 +35,6 @@ DEFAULT_BUSY_PATTERNS = [
     r"plan limit",
     r"too many requests",
 ]
-
-
-class Result(BaseModel):
-    """A primitive's output: a diff, artifact, free text, or a judgment — all one shape."""
-
-    text: str = ""
-    files: list[str] = Field(default_factory=list)
-    ok: bool = True
-    exit_code: int | None = None
-    outcome: Outcome = "ok"
 
 
 @runtime_checkable
@@ -67,12 +57,12 @@ class ShellRig:
     This is the real plug-in path (e.g. template='claude -p {prompt}'); the command
     runs with cwd=workdir so a real rig writes its files inside the worktree.
 
-    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever (SF3). The
+    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever. The
     command runs in its OWN process group (`start_new_session=True`); on timeout the
     core signals the whole GROUP (`killpg`), so background children the shell spawned
-    (`cmd & ...`) are reaped too, not orphaned (pass-2 SHOULD-FIX 3). A timeout is
+    (`cmd & ...`) are reaped too, not orphaned. A timeout is
     returned as `outcome="failed"` with a `[timeout]` marker; any non-zero exit is
-    likewise `outcome="failed"` (pass-2 SHOULD-FIX 7).
+    likewise `outcome="failed"`.
     """
 
     def __init__(self, template: str, timeout_s: float) -> None:
@@ -221,6 +211,9 @@ class RigRegistry:
 
     def __init__(self, rigs: dict[str, Rig]) -> None:
         self._rigs = dict(rigs)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._rigs
 
     def resolve(self, name: str) -> Rig:
         if name not in self._rigs:

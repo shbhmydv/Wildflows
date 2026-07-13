@@ -313,17 +313,13 @@ def test_file_ctx_rejects_absolute_parent_and_symlink_escapes(tmp_path: Path) ->
     secret.write_text("HOST-SECRET", encoding="utf-8")
     reg = RigRegistry({"echo": EchoRig()})
 
-    # (a) absolute path escape -> failed result, secret NOT materialized.
-    eng = Engine(run_dir=tmp_path / "run", workdir=workdir, registry=reg)
-    eng.run_epoch(
-        Do(task="x", rig=RigRef(name="echo"), ctx=[CtxRef(kind="file", ref=str(secret))]),
-        epoch=0,
-    )
-    res = replay(tmp_path / "run").results[(0, "n0")]
-    assert res.ok is False
-    assert "HOST-SECRET" not in res.text
+    # (a) An absolute/`..` path escape is a LEXICAL error rejected at admission — now a
+    # CtxRef construction-time validation error (item 5), before any epoch opens.
+    with pytest.raises(ValidationError):
+        CtxRef(kind="file", ref=str(secret))
 
-    # (b) in-worktree symlink pointing outside the workdir -> escape, failed result.
+    # (b) An in-worktree symlink pointing outside the workdir can only be judged at use
+    # time (admission cannot resolve symlinks) -> a failed result, no exfiltration.
     os.symlink(secret, workdir / "link.txt")
     eng2 = Engine(run_dir=tmp_path / "run2", workdir=workdir, registry=reg)
     eng2.run_epoch(
@@ -337,16 +333,18 @@ def test_file_ctx_rejects_absolute_parent_and_symlink_escapes(tmp_path: Path) ->
 
 # --------------------------------------------------------------------------- SF2
 
-def test_unknown_rig_becomes_failed_result_after_dispatched(tmp_path: Path) -> None:
+def test_unknown_rig_rejected_at_admission(tmp_path: Path) -> None:
+    # An unknown rig name is a deterministic registry error the core rejects over the
+    # whole tree BEFORE opening the epoch (item 5), not a runtime failed result.
+    from wildflows.admission import AdmissionError
+
     workdir = tmp_path / "work"
     workdir.mkdir()
     _git_init(workdir)
     eng = Engine(run_dir=tmp_path / "run", workdir=workdir, registry=RigRegistry({}))
-    eng.run_epoch(Do(task="x", rig=RigRef(name="typo")), epoch=0)  # must NOT raise
-    state = replay(tmp_path / "run")
-    assert state.results[(0, "n0")].ok is False
-    assert state.results[(0, "n0")].outcome == "failed"
-    assert state.epoch_closed(0)
+    with pytest.raises(AdmissionError):
+        eng.run_epoch(Do(task="x", rig=RigRef(name="typo")), epoch=0)
+    assert not (tmp_path / "run" / "events.ndjson").exists()
 
 
 # --------------------------------------------------------------------------- SF3

@@ -61,6 +61,17 @@ def test_load_rigs_rejects_missing_script_field(tmp_path: Path) -> None:
         load_rigs(cfg)
 
 
+def test_load_rigs_rejects_nonpositive_timeout(tmp_path: Path) -> None:
+    # A non-positive rig timeout is rejected at config load (item 5, Field(gt=0)).
+    cfg = tmp_path / "rigs.yaml"
+    cfg.write_text(
+        "rigs:\n  s:\n    kind: shell\n    template: 'echo {prompt}'\n    timeout_s: 0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError):
+        load_rigs(cfg)
+
+
 def test_example_rigs_yaml_loads() -> None:
     example = Path(__file__).resolve().parents[1] / "examples" / "rigs.yaml"
     registry = load_rigs(example)

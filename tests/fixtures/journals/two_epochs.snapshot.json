@@ -1,0 +1,74 @@
+{
+  "dispatched": [
+    "0::n0.0",
+    "0::n0.1",
+    "1::n0"
+  ],
+  "epoch_state": {
+    "0": {
+      "closed": true,
+      "has_expr": true,
+      "opened": true
+    },
+    "1": {
+      "closed": true,
+      "has_expr": true,
+      "opened": true
+    }
+  },
+  "integrated": {
+    "0::n0.0": [
+      "planner.txt"
+    ],
+    "0::n0.1": [
+      "do.txt"
+    ],
+    "1::n0": [
+      "do.txt"
+    ]
+  },
+  "integrated_seq": {
+    "0::n0.0": 2,
+    "0::n0.1": 6,
+    "1::n0": 11
+  },
+  "loop_converged": {},
+  "loop_iterations": {},
+  "loop_last_body": {},
+  "loop_last_commit": {},
+  "loop_last_iter_seq": {},
+  "result_seq": {
+    "0::n0.0": 3,
+    "0::n0.1": 5,
+    "1::n0": 10
+  },
+  "results": {
+    "0::n0.0": {
+      "exit_code": null,
+      "files": [
+        "planner.txt"
+      ],
+      "ok": true,
+      "outcome": "ok",
+      "text": "wrote planner.txt"
+    },
+    "0::n0.1": {
+      "exit_code": 0,
+      "files": [
+        "do.txt"
+      ],
+      "ok": true,
+      "outcome": "ok",
+      "text": "do run 1"
+    },
+    "1::n0": {
+      "exit_code": 0,
+      "files": [
+        "do.txt"
+      ],
+      "ok": true,
+      "outcome": "ok",
+      "text": "do run 2"
+    }
+  }
+}

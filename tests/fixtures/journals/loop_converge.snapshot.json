@@ -1,0 +1,84 @@
+{
+  "dispatched": [
+    "0::n0.0.0",
+    "0::n0.0.1"
+  ],
+  "epoch_state": {
+    "0": {
+      "closed": true,
+      "has_expr": true,
+      "opened": true
+    }
+  },
+  "integrated": {
+    "0::n0.0.0": [
+      "marker.txt"
+    ],
+    "0::n0.0.1": [
+      "counter",
+      "tick.txt"
+    ]
+  },
+  "integrated_seq": {
+    "0::n0.0.0": 2,
+    "0::n0.0.1": 18
+  },
+  "loop_converged": {
+    "0::n0": true
+  },
+  "loop_iterations": {
+    "0::n0": 3
+  },
+  "loop_last_body": {
+    "0::n0": {
+      "exit_code": 0,
+      "files": [
+        "counter",
+        "tick.txt"
+      ],
+      "ok": true,
+      "outcome": "ok",
+      "text": "tick run 3"
+    }
+  },
+  "loop_last_commit": {
+    "0::n0": "df95060545ed578f58c8602ea52e192ec93b4cea"
+  },
+  "loop_last_iter_seq": {
+    "0::n0": 19
+  },
+  "result_seq": {
+    "0::n0": 20,
+    "0::n0.0.0": 15,
+    "0::n0.0.1": 17
+  },
+  "results": {
+    "0::n0": {
+      "exit_code": 0,
+      "files": [
+        "counter",
+        "tick.txt"
+      ],
+      "ok": true,
+      "outcome": "ok",
+      "text": "tick run 3"
+    },
+    "0::n0.0.0": {
+      "exit_code": null,
+      "files": [],
+      "ok": true,
+      "outcome": "ok",
+      "text": "inplace: no diff (already applied) for marker.txt"
+    },
+    "0::n0.0.1": {
+      "exit_code": 0,
+      "files": [
+        "counter",
+        "tick.txt"
+      ],
+      "ok": true,
+      "outcome": "ok",
+      "text": "tick run 3"
+    }
+  }
+}

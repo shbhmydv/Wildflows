@@ -148,6 +148,50 @@ point (§3). The tree is validated by Pydantic on admission; `do`, `inplace`, `s
 `loop` (with a `cmd` predicate) are *executable* in the PoC, but all eight kinds are
 *representable* so the journal vocabulary and the model are proven complete from day one.
 
+### Code homes (hand-6 authority split, from the bloat audit)
+
+The engine was split by **authority**, each home owning one thing so the planned
+scheduler / worktree / planner / dashboard steps each depend on one narrow seam:
+
+| Home | Sole authority |
+|---|---|
+| `engine.py` | epoch lifecycle, expression traversal, primitive orchestration |
+| `admission.py` | dealias + deterministic ids + whole-tree validation (`admit_epoch`) |
+| `projection.py` | the one live journal fold (`RunProjection.apply`), resume decisions, `replay` |
+| `workspace.py` | containment, git mediation, reconciliation (`Workspace`) |
+| `result.py` | the `Result` / `Outcome` value types |
+| `journal.py` | the single append owner: seq-assign + fsync + `projection.apply` |
+
+There is exactly ONE state system: the journal's live `RunProjection`, folded by one
+`apply(event)`. Load replays the ndjson through the same `apply`, so a running
+projection and a reloaded one are bit-identical (proven by the frozen journal fixtures
+in `tests/fixtures/journals/`). Resume/durability is one decision — `resume_action` — over
+an explicit attempt/iteration `floor` (`-1` top-level, an int for a resumed-partial loop
+iteration, `None` for a fresh one) that replaces the old `_NO_RESUME` sentinel.
+
+### Admission (hand-6) — one pass before `boundary(opened)`
+
+`admission.admit_epoch(tree, epoch, projection, registry)` runs BEFORE any execution
+event: it dealiases (wire round-trip), assigns deterministic node ids, then makes ONE
+whole-tree traversal to reject a plan the core can refuse **without effects**. On
+rejection it raises **`AdmissionError`** (a `ValueError` subclass) and NO journal event
+is written — a representable-but-unrunnable shape never opens an incomplete epoch, so
+`NotImplementedError` after a durable boundary is gone. Admission rejects:
+
+- **executor capability** — `combine` / `ask` / `setup`, and `loop` with a `flag`
+  predicate (representable, not yet executable);
+- **unknown rig names** — every rig-bearing node's `rig.name` must resolve in the registry;
+- **ctx node refs** — a `CtxRef(kind="node")` must name a node in the epoch tree;
+- **resume identity** — on an already-open epoch, the supplied tree must equal the
+  journalled `boundary(opened).expr` (a divergent resumed tree is a caller error).
+
+**Local Pydantic invariants** (single-model, checked at construction) carry the rest:
+lexical path guards on `Edit.path` and file `CtxRef.ref` (leading dash, absolute, `..`,
+literal `.git`), duplicate paths within one `Inplace`, positive `loop.cap`, and positive
+rig `timeout_s`. **Environment-dependent** checks stay at use time in `Workspace` (symlink
+escapes, the resolved linked-worktree gitdir, a not-yet-created ctx file, git/process
+failures, the actual `until` result) — a validator cannot resolve a symlink.
+
 ---
 
 ## 3. Runs, epochs, and the event vocabulary
@@ -166,7 +210,7 @@ types (in `wildflows/events.py`), each a Pydantic model sharing a header
 
 | event        | emitted when                              | key fields |
 |--------------|-------------------------------------------|------------|
-| `boundary`   | an epoch opens / closes                   | `phase: opened\|closed`, `expr` (opened: the admitted tree), `rails` |
+| `boundary`   | an epoch opens / closes                   | `phase: opened\|closed`, `expr` (opened: the admitted tree) |
 | `dispatched` | a `do`/`combine`/`inplace`/`setup` starts | `rig`, `task`/`cmd`, `workdir` |
 | `result`     | an agent/primitive produced output        | `ok`, `text` tail, `files`, `exit_code?`, `loop_status?` |
 | `integrated` | the core applied+committed a result       | `commit`, `paths` (disjoint-ownership set) |
@@ -226,8 +270,10 @@ Rails: budget_usd: float | None      # cumulative rig spend cap
 **Rails are NOT admitted, recorded, or enforced yet.** Rails admission (a validated
 block riding the `boundary(opened)` event) and enforcement land **together at ladder
 step 4** (worktree hygiene), so the executor never records a rail it cannot enforce
-nor enforces one it never admitted. Until then, **the only live rail is the executable
-`loop`'s `cap`** — a `loop` cannot exceed `node.cap` (core-enforced; cap-exhaustion is
+nor enforces one it never admitted. The speculative `Boundary.rails: dict|None`
+placeholder field was DELETED in hand-6 (an un-admitted, un-enforced raw dict is the
+opposite of §4's rule); the typed rails block is added when admission + enforcement land
+together. Until then, **the only live rail is the executable `loop`'s `cap`** — a `loop` cannot exceed `node.cap` (core-enforced; cap-exhaustion is
 an `ok=False` result, never a crash). Budget, deadline, and `iter_cap` refusal
 semantics do not exist in the current engine. When they land, the chosen semantics are
 *refuse-to-start* (a node that would breach a rail is refused and the epoch closes with
@@ -584,3 +630,40 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
 27. **N2 (single-writer journal) remains DEFERRED to ladder step 3** (§6) — documented,
     not implemented this hand: the current fixes harden the SERIAL restart/effect
     invariants that step 3's parallel dispatch would otherwise build on unsoundly.
+
+### Hand-6 calls (from the bloat audit) — an equivalence refactor
+
+28. **Authority split (hand-6, from bloat audit).** The 700-line `Engine` was split into
+    five homes — `engine.py` (orchestration), `admission.py`, `projection.py`,
+    `workspace.py`, `result.py` — plus the journal as the single append owner (see §2
+    "Code homes"). Behavior is bit-for-bit identical; tests changed only for imports and
+    the sanctioned admission-rejection API (below). No executor-per-primitive files, no
+    visitor classes, no plugin framework.
+
+29. **One live `RunProjection` (hand-6).** The frozen `_state` snapshot + raw-journal
+    scans (`_is_durable`, `_last_result_since`, `_journalled_result_text`, per-entry
+    refolds) are replaced by ONE `dict[NodeKey, NodeProjection]` folded by a single
+    `apply(event)`, owned by the journal and updated on every append; load replays
+    through the same `apply`. `resume_action(key, floor)` is the single durability
+    decision and the `_NO_RESUME = sys.maxsize` sentinel becomes an explicit `floor=None`
+    scope. Proven equivalent by re-folding pre-refactor journal fixtures
+    (`tests/fixtures/journals/`) to identical snapshots. Event shapes are UNCHANGED
+    (`LoopIter.body_*` stay for a later hand). The loop still consumes its body's "last
+    result" (now via the projection, not a journal slice); the full outcome-reference
+    model is a later raze.
+
+30. **Admission pass (hand-6, sanctioned behavior change).** `admit_epoch` runs before
+    `boundary(opened)` and rejects capability / unknown-rig / bad-ctx-node-ref / resume-
+    identity errors with `AdmissionError` (see §2 "Admission"). This SUPERSEDES the
+    runtime treatment of these inputs: entry 26's "unknown rig name is a journalled failed
+    result" and the old runtime `NotImplementedError`/failed-result for unexecutable kinds,
+    missing ctx node refs, and absolute/`..` ctx-file paths are now admission rejections
+    BEFORE any event. Lexical path guards moved to `Edit`/`CtxRef` validators; duplicate
+    inplace paths and positive rig `timeout_s` are new local invariants.
+
+31. **Speculative-field/residue deletions (hand-6, low-risk rows only).** `Boundary.rails`
+    (un-admitted raw dict, §4) deleted; the review-ticket comment labels
+    (`B*`/`NB*`/`SF*`/`SHOULD-FIX`) stripped from source (history lives here); the stale
+    `expr.py` docstring corrected. `RigRef.params`, the second `Judged` event,
+    `LoopIter.body_*`, the `ok`/`outcome` duplication, and `_capture_and_reset_dirty` are
+    intentionally LEFT for a later hand (they carry behavior/wire risk or await worktrees).

@@ -26,7 +26,6 @@ class Boundary(_Header):
     kind: Literal["boundary"] = "boundary"
     phase: Literal["opened", "closed"]
     expr: dict[str, Any] | None = None  # the admitted tree (on opened)
-    rails: dict[str, Any] | None = None
     reason: str | None = None  # e.g. deadline / budget / done (on closed)
 
 
@@ -51,7 +50,7 @@ class ResultEvent(_Header):
     # A loop's final result reuses this event but carries the last integrated
     # iteration's body artifact in text/files; the convergence/cap disposition rides
     # in this SEPARATE field so a downstream `combine` consumes the artifact, never the
-    # status prose (SF6). None for every non-loop result. Journal-only (the dashboard
+    # status prose. None for every non-loop result. Journal-only (the dashboard
     # reads it); replay's Result reconstruction ignores it.
     loop_status: str | None = None
     # Outcome discriminator mirroring Result.outcome. A `busy` result (rate/session
@@ -93,7 +92,7 @@ class LoopIter(_Header):
     converged: bool = False
     # The iteration's body artifact, folded so a crash BETWEEN the last loop_iter and
     # the loop's final ResultEvent can reconstruct the loop result without re-running a
-    # converged/capped body (pass-2 NB3 / SF6). Additive: pre-existing loop_iter lines
+    # converged/capped body. Additive: pre-existing loop_iter lines
     # (no fields) default to an empty body, matching the old behavior.
     body_text: str = ""
     body_files: list[str] = Field(default_factory=list)

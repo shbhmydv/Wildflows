@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from wildflows.admission import AdmissionError
 from wildflows.engine import Engine, replay
 from wildflows.expr import Ask, Do, Edit, Inplace, Loop, RigRef, Seq, Until
 from wildflows.rig import EchoRig, RigRegistry
@@ -74,10 +75,13 @@ def test_replay_reconstructs_state_from_ndjson_alone(tmp_path: Path) -> None:
     assert "t" in state.results[(0, do_id)].text
 
 
-def test_unexecutable_primitive_raises_in_poc(tmp_path: Path) -> None:
+def test_unexecutable_primitive_rejected_at_admission(tmp_path: Path) -> None:
+    # A representable-but-not-executable kind is rejected BEFORE any epoch opens (item 5),
+    # not with a NotImplementedError after a durable boundary.
     eng = _engine(tmp_path)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(AdmissionError):
         eng.run_epoch(Ask(question="which?"), epoch=0)
+    assert not (eng.run_dir / "events.ndjson").exists()  # no incomplete epoch was opened
 
 
 def test_inplace_rejects_sibling_prefix_escape(tmp_path: Path) -> None:
@@ -140,10 +144,10 @@ def test_loop_cap_exhaustion_is_result_not_crash(tmp_path: Path) -> None:
     assert kinds[-1] == "boundary"  # epoch still closes cleanly
 
 
-def test_loop_flag_predicate_not_yet_implemented(tmp_path: Path) -> None:
+def test_loop_flag_predicate_rejected_at_admission(tmp_path: Path) -> None:
     eng = _engine(tmp_path)
     loop = Loop(body=_counter_loop_body(), until=Until(kind="flag"), cap=3)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(AdmissionError):  # flag predicate not executable yet (item 5)
         eng.run_epoch(loop, epoch=0)
 
 

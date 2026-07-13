@@ -26,7 +26,7 @@ class EchoRigConfig(BaseModel):
 class ShellRigConfig(BaseModel):
     kind: Literal["shell"] = "shell"
     template: str
-    timeout_s: float  # required — an unbounded rig can hang an epoch forever (SF3)
+    timeout_s: float = Field(gt=0)  # required + positive — no unbounded/degenerate rig
 
     def build(self) -> Rig:
         return ShellRig(template=self.template, timeout_s=self.timeout_s)
@@ -36,7 +36,7 @@ class ScriptRigConfig(BaseModel):
     kind: Literal["script"] = "script"
     script: Path
     log_dir: Path
-    timeout_s: float = 900.0
+    timeout_s: float = Field(default=900.0, gt=0)
     env: dict[str, str] = Field(default_factory=dict)
     busy_patterns: list[str] | None = None
 

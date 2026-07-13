@@ -334,18 +334,21 @@ def test_do_materializes_node_and_file_context(tmp_path: Path) -> None:
     assert "FROM-FILE-CTX" in consumed  # file content was materialized
 
 
-def test_do_with_missing_ctx_ref_is_a_failed_result_not_a_crash(tmp_path: Path) -> None:
+def test_do_with_missing_ctx_node_ref_rejected_at_admission(tmp_path: Path) -> None:
+    # A ctx node ref naming no node in the tree is a deterministic error the core can
+    # reject over the whole tree BEFORE opening the epoch (item 5), not a runtime result.
+    from wildflows.admission import AdmissionError
+
     workdir = tmp_path / "work"
     workdir.mkdir()
     _git_init(workdir)
     reg = RigRegistry({"echo": EchoRig()})
     eng = Engine(run_dir=tmp_path / "run", workdir=workdir, registry=reg)
-    eng.run_epoch(
-        Do(task="x", rig=RigRef(name="echo"), ctx=[CtxRef(kind="node", ref="n404")]), epoch=0
-    )
-    state = replay(tmp_path / "run")
-    assert state.results[(0, "n0")].ok is False
-    assert state.epoch_closed(0)
+    with pytest.raises(AdmissionError):
+        eng.run_epoch(
+            Do(task="x", rig=RigRef(name="echo"), ctx=[CtxRef(kind="node", ref="n404")]), epoch=0
+        )
+    assert not (tmp_path / "run" / "events.ndjson").exists()
 
 
 # --------------------------------------------------------------------------- SF3

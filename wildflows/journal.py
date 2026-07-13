@@ -1,7 +1,11 @@
-"""The journal: the run's durable spine.
+"""The journal: the run's durable spine AND the single append owner.
 
 An append-only in-memory list mirrored to <run_dir>/events.ndjson (one event per line,
 fsynced on append). It is the ONLY durable run state resume and the dashboard consume.
+`append` is the one place that assigns a seq, fsyncs, and updates the live
+`RunProjection`; `load` replays the ndjson through the same `projection.apply`, so a
+running projection and a reloaded one are bit-identical. Parallel dispatch (step 3)
+serializes through this owner (DESIGN §6).
 """
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from wildflows.events import Event, parse_event
+from wildflows.projection import RunProjection
 
 
 class Journal:
@@ -20,9 +25,10 @@ class Journal:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.run_dir / "events.ndjson"
         self._events: list[Event] = []
+        self.projection = RunProjection()
 
     def append(self, event: Event) -> int:
-        """Append an event, assigning it the next seq; returns the seq."""
+        """Append an event: assign the next seq, fsync, fold into the projection."""
         seq = len(self._events)
         event.seq = seq
         self._events.append(event)
@@ -31,10 +37,15 @@ class Journal:
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
+        self.projection.apply(event)
         return seq
 
     def events(self) -> list[Event]:
         return list(self._events)
+
+    @property
+    def n_events(self) -> int:
+        return len(self._events)
 
     @classmethod
     def load(cls, run_dir: Path) -> "Journal":
@@ -45,7 +56,7 @@ class Journal:
         UTF-8 sequence. Only a record that lacks its terminating newline may be dropped,
         and only if it fails to parse. A newline-TERMINATED record durably completed its
         write, so if it is malformed the journal still raises — a complete invalid line
-        is corruption, not a torn tail (pass-2 B2 / SHOULD-FIX 1). The file is read as
+        is corruption, not a torn tail. The file is read as
         RAW BYTES so a mid-UTF-8 unterminated tail is recoverable rather than a decode
         crash outside the handler.
         """
@@ -62,9 +73,11 @@ class Journal:
         last = len(records) - 1
         for i, rec in enumerate(records):
             try:
-                j._events.append(parse_event(json.loads(rec.decode("utf-8"))))
+                event = parse_event(json.loads(rec.decode("utf-8")))
             except (json.JSONDecodeError, ValidationError, UnicodeDecodeError):
                 if i == last and not final_terminated:
                     break  # unterminated torn final record — drop it, no durable log
                 raise
+            j._events.append(event)
+            j.projection.apply(event)
         return j
