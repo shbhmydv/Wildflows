@@ -108,6 +108,7 @@ class InplaceIntent(BaseModel):
     node_id: str
     attempt: int
     writes: list[IntentWrite]
+    created_dirs: list[str] = Field(default_factory=list)
     ts: float
 
 
@@ -721,6 +722,7 @@ class WorkspaceEffects:
                     shutil.rmtree(target)
                 else:
                     target.unlink()
+                self._fsync_dir(target.parent)
             except OSError as exc:
                 raise WorkspaceFault(f"cannot remove workspace leak {rel}: {exc}") from exc
             if os.path.lexists(target):
@@ -758,6 +760,7 @@ class WorkspaceEffects:
                     raise WorkspaceFault(
                         f"workspace leak directory remained after removal: {rel_parent}"
                     )
+                self._fsync_dir(parent.parent)
                 parent = parent.parent
 
     def _overlaps_run_dir(self, rel: str) -> bool:
@@ -835,6 +838,7 @@ class WorkspaceEffects:
                     raise WorkspaceFault(
                         f"legacy inplace intent cannot restore pre-state for {write.path}"
                     )
+        self._remove_created_inplace_dirs(intent)
         if intent.writes:
             self._checked(
                 self.git("reset", "-q", "--", *[w.path for w in intent.writes]),
@@ -855,6 +859,29 @@ class WorkspaceEffects:
                 raise WorkspaceFault(
                     f"canonical inplace target changed after intent publication: {write.path}"
                 )
+
+    def _remove_created_inplace_dirs(self, intent: InplaceIntent) -> None:
+        for rel in sorted(intent.created_dirs, key=lambda p: len(Path(p).parts), reverse=True):
+            target = self.workdir / rel
+            try:
+                target.rmdir()
+                self._fsync_dir(target.parent)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # A created parent that is still nonempty contains an unexpected attempt
+                # or operator artifact. Capture the whole subtree before removing it.
+                if not target.is_dir() or target.is_symlink():
+                    raise WorkspaceFault(f"created inplace directory changed kind: {rel}")
+                self._capture_workspace(
+                    self.run_dir / "intent-reversal",
+                    f"{intent.epoch}-{intent.node_id}-{intent.attempt}-dir",
+                    "HEAD" if self._cleanup_head() is not None else _EMPTY_TREE,
+                    [rel],
+                )
+                self._remove_rollback_target(target, rel)
+            if os.path.lexists(target):
+                raise WorkspaceFault(f"created inplace directory remained after rollback: {rel}")
 
     def _original_bytes(self, write: IntentWrite) -> bytes:
         if write.original_b64 is not None:
@@ -904,6 +931,7 @@ class WorkspaceEffects:
                 shutil.rmtree(target)
             else:
                 target.unlink()
+            self._fsync_dir(target.parent)
         except OSError as exc:
             raise WorkspaceFault(f"cannot remove inplace rollback target {rel}: {exc}") from exc
         if os.path.lexists(target):

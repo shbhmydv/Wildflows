@@ -216,6 +216,22 @@ def test_inplace_internal_symlink_alias_never_leaves_unreceipted_target_effect(
     ).stdout == "MUTATED"
 
 
+def test_failed_inplace_removes_parent_directories_created_by_its_writes(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    (workdir / "dest").mkdir()
+    run_dir = tmp_path / "run"
+
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(Inplace(edits=[
+        Edit(path="new/deep/file", content="partial"),
+        Edit(path="dest", content="fails because dest is a directory"),
+    ]), 0)
+
+    assert not (workdir / "new").exists()
+    assert (workdir / "dest").is_dir()
+    assert not replay(run_dir).results[(0, "n0")].ok
+
+
 def test_inplace_resolved_target_collision_is_rejected_before_write(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)

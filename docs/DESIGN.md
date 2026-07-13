@@ -989,8 +989,10 @@ than patching each row. Both are the transaction model of record — not a later
 54. **Divergent intent reversal (hand-11).** Rollback first compares each canonical live
     target with BOTH the expected attempt bytes and the recorded pre-state. A third state
     (including binary post-crash operator bytes) is durably captured through decision 53
-    under `intent-reversal/` before restoration. A changed canonical path topology (for
-    example, an operator-installed parent symlink) halts without overwriting it.
+    under `intent-reversal/` before restoration. Parent directories absent at intent time
+    are also recorded and removed on rollback; unexpected contents are captured first. A
+    changed canonical path topology (for example, an operator-installed parent symlink)
+    halts without overwriting it.
 
 55. **Atomic durable-record lifecycle (hand-11).** Lease/intent and capture-manifest
     publication is same-directory temp write → file fsync → `os.replace` → parent-directory

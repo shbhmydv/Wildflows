@@ -435,7 +435,8 @@ class Engine:
             self._settle(key)
             return ExecutionOutcome(key=key)
         intent = InplaceIntent(
-            epoch=epoch, node_id=node.node_id, attempt=attempt, writes=writes, ts=0.0)
+            epoch=epoch, node_id=node.node_id, attempt=attempt, writes=writes,
+            created_dirs=self._created_inplace_dirs(writes), ts=0.0)
         self.ws.write_intent(intent)
         paths = [w.path for w in writes]
         try:
@@ -496,6 +497,17 @@ class Engine:
                 content=edit.content,
             ))
         return writes
+
+    def _created_inplace_dirs(self, writes: list[IntentWrite]) -> list[str]:
+        """Canonical parent directories that the write phase may create."""
+        root = self.workdir.resolve()
+        created: set[str] = set()
+        for write in writes:
+            parent = (root / write.path).parent
+            while parent != root and not os.path.lexists(parent):
+                created.add(parent.relative_to(root).as_posix())
+                parent = parent.parent
+        return sorted(created, key=lambda p: (len(Path(p).parts), p))
 
     def _apply_inplace_writes(self, writes: list[IntentWrite]) -> None:
         """Write only canonical targets recorded in the durable intent."""
