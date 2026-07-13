@@ -32,13 +32,22 @@ class Boundary(_Header):
 
 
 class Dispatched(_Header):
-    """A do/combine/inplace/setup started."""
+    """A do/combine/inplace/setup started.
+
+    `pre_head` is the workdir HEAD at the moment the attempt opened (None for an unborn
+    repo). It is the DURABLE ATTEMPT PROVENANCE (hand-8): on resume, the commits in
+    `pre_head..HEAD` are exactly this attempt's, so a crash anywhere in the completion
+    gap is reconstructed from that range instead of re-run. A legacy dispatched line
+    lacks this key entirely — the field's absence marks a pre-v1 journal that cannot be
+    provenance-resumed (see `journal.JournalCompatibilityError`).
+    """
 
     kind: Literal["dispatched"] = "dispatched"
     rig: str | None = None
     task: str | None = None
     cmd: str | None = None
     workdir: str | None = None
+    pre_head: str | None = None
 
 
 class ResultEvent(_Header):
@@ -89,13 +98,34 @@ class Integrated(_Header):
     @model_validator(mode="before")
     @classmethod
     def _migrate_single_commit(cls, data: Any) -> Any:
-        if not isinstance(data, dict) or "commits" in data:
+        if not isinstance(data, dict):
+            return data
+        if "commits" in data and data["commits"]:
+            # New shape (a dump also carries derived `commit`/`paths`); reject a
+            # CONTRADICTORY hand-authored/corrupt line where `commit` disagrees with the
+            # last of `commits` (malformed-receipt hardening, hand-8).
+            legacy_commit = data.get("commit")
+            if legacy_commit:
+                last = data["commits"][-1]
+                last_sha = last["sha"] if isinstance(last, dict) else getattr(last, "sha", None)
+                if last_sha is not None and legacy_commit != last_sha:
+                    raise ValueError("integrated: `commit` contradicts `commits`")
             return data
         if "commit" in data:
             out = {k: v for k, v in data.items() if k not in ("commit", "paths")}
             out["commits"] = [{"sha": data["commit"], "paths": data.get("paths", [])}]
             return out
         return data
+
+    @model_validator(mode="after")
+    def _require_nonempty_commits(self) -> "Integrated":
+        # An `integrated` is the mediation PROOF; an empty receipt proves nothing and
+        # would falsely mark an effect durable (malformed-receipt hardening, hand-8). The
+        # core only ever emits `integrated` for a non-empty receipt, so this rejects only
+        # corrupt/legacy-empty lines.
+        if not self.commits:
+            raise ValueError("integrated must carry at least one commit")
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -134,11 +164,14 @@ class LoopIter(_Header):
     iteration: int
     commit: str | None = None
     converged: bool = False
-    # No body-artifact payload copy (item 3): the loop_iter REFERENCES the body outcome
-    # by journal position — the body leaf's ResultEvent is the last result folded before
-    # this loop_iter, so the projection recovers the iteration's body from its live
-    # last-result at fold time. A pre-collapse line's `body_*` fields are ignored (the
-    # preceding ResultEvent still reconstructs the body), so old journals fold unchanged.
+    # An EXPLICIT reference to this iteration's body outcome: the `seq` of the body
+    # leaf's ResultEvent (hand-8, LOOP-OUTCOME-REFERENCE). The fold resolves the body
+    # artifact through THIS seq, never the process-global last-folded result — which was
+    # only coincidentally correct under serial in-order dispatch and wrong the moment a
+    # positional Dispatch completes out of order. `None` on a legacy line (no such field);
+    # the projection then falls back to the last ResultEvent before the loop_iter, which
+    # is the documented old-journal semantics (its `body_*` payload is ignored either way).
+    body_result_seq: int | None = None
 
 
 class Asked(_Header):

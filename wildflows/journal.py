@@ -19,6 +19,52 @@ from wildflows.events import Event, parse_event
 from wildflows.projection import RunProjection
 
 
+class JournalCompatibilityError(ValueError):
+    """A journal the current engine refuses to resume/replay.
+
+    Journals are PRE-V1 and unstable (DESIGN §6). A COMPLETE legacy history still folds
+    via the compatibility readers, but an INTERRUPTED legacy tail (pre-provenance shapes
+    after the last boundary with no terminal result) cannot be provenance-recovered — the
+    operator must complete or archive the run with the engine version that wrote it.
+    Non-contiguous / physically-misordered sequence streams are refused for the same
+    reason: the projection floors trust `seq`.
+    """
+
+
+# Raw-line markers of a PRE-V1 (legacy) event shape — each is a field the current engine
+# would emit differently. Their presence in an INTERRUPTED tail means the run cannot be
+# resumed by this engine (no durable attempt provenance to key recovery off).
+def _is_legacy_shape(raw: dict[str, object]) -> bool:
+    kind = raw.get("kind")
+    if kind == "dispatched":
+        return "pre_head" not in raw  # provenance anchor added in v1 (hand-8)
+    if kind == "integrated":
+        return "commits" not in raw   # single-commit `commit`/`paths` shape
+    if kind == "loop_iter":
+        return any(f in raw for f in ("body_text", "body_files", "body_exit_code"))
+    if kind == "result":
+        return "outcome" not in raw   # pre-collapse `ok`-only result
+    return False
+
+
+def _refuse_legacy_interrupted_tail(raws: list[dict[str, object]]) -> None:
+    """Refuse to resume a legacy INTERRUPTED tail. A complete history ends at its closing
+    boundary (empty tail); any records AFTER the last boundary are an in-flight tail. If
+    that tail carries a pre-v1 shape it cannot be provenance-recovered — raise so the
+    operator finishes/archives the run with the old engine (hand-8, LEGACY-COMPLETION-TAIL).
+    """
+    last_boundary = max(
+        (i for i, r in enumerate(raws) if r.get("kind") == "boundary"), default=-1
+    )
+    for raw in raws[last_boundary + 1:]:
+        if _is_legacy_shape(raw):
+            raise JournalCompatibilityError(
+                "interrupted legacy journal tail (pre-v1 event shape after the last "
+                "boundary): complete or archive this run with the engine version that "
+                "wrote it before resuming"
+            )
+
+
 class Journal:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = Path(run_dir)
@@ -28,8 +74,14 @@ class Journal:
         self.projection = RunProjection()
 
     def append(self, event: Event) -> int:
-        """Append an event: assign the next seq, fsync, fold into the projection."""
-        seq = len(self._events)
+        """Append an event: assign the next seq, fsync, fold into the projection.
+
+        The next seq is one past the last event's (load enforces strictly-increasing
+        seqs, so the tail holds the max). Deriving from the max — not the list length —
+        keeps seqs collision-free even after a gap-truncated resume, so the strict
+        ordering `load` checks always holds.
+        """
+        seq = self._events[-1].seq + 1 if self._events else 0
         event.seq = seq
         self._events.append(event)
         line = event.model_dump_json() + "\n"
@@ -71,13 +123,31 @@ class Journal:
         final_terminated = raw.endswith(b"\n")
         records = [r for r in raw.split(b"\n") if r.strip()]
         last = len(records) - 1
+        raws: list[dict[str, object]] = []
+        prev_seq = -1
         for i, rec in enumerate(records):
             try:
-                event = parse_event(json.loads(rec.decode("utf-8")))
+                data = json.loads(rec.decode("utf-8"))
+                event = parse_event(data)
             except (json.JSONDecodeError, ValidationError, UnicodeDecodeError):
                 if i == last and not final_terminated:
                     break  # unterminated torn final record — drop it, no durable log
                 raise
+            # Recorded seq order must match physical record order — strictly increasing,
+            # no duplicates or reordering. The projection floors trust `seq`, so a
+            # reordered/duplicated stream (the parallel-writer corruption N2 warns of) is
+            # refused, not silently folded (hand-8). Gaps from a legitimately truncated
+            # tail are fine; an unassigned seq (< 0, only in hand-crafted pre-append
+            # lines) is exempt from the ordering check.
+            if event.seq >= 0:
+                if event.seq <= prev_seq:
+                    raise JournalCompatibilityError(
+                        f"journal seq {event.seq} at physical position {i} is not strictly "
+                        f"after {prev_seq}: reordered or duplicated stream"
+                    )
+                prev_seq = event.seq
             j._events.append(event)
+            raws.append(data)
             j.projection.apply(event)
+        _refuse_legacy_interrupted_tail(raws)
         return j

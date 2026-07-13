@@ -64,6 +64,7 @@ class NodeProjection:
     """Everything the fold knows about one `(epoch, node_id)`."""
 
     dispatched: bool = False
+    dispatched_pre_head: str | None = None  # provenance anchor for pre_head..HEAD recovery
     result: Result | None = None
     result_seq: int = -1
     receipt: IntegrationReceipt | None = None  # accumulated effect record
@@ -90,10 +91,12 @@ class RunProjection:
     def __init__(self) -> None:
         self.nodes: dict[NodeKey, NodeProjection] = {}
         self.epochs: dict[int, EpochProjection] = {}
-        # The most recently journalled result. A loop_iter references its body's outcome
-        # through this (the body leaf's result is the last one folded before the
-        # loop_iter), so no body payload is copied into the loop_iter event (item 3).
-        self._last_result: Result | None = None
+        # Every result by its journal seq, so a loop_iter resolves its body artifact
+        # through its EXPLICIT `body_result_seq` reference (hand-8). `_last_result_seq`
+        # is the last ResultEvent's seq — used ONLY to fold a legacy loop_iter that
+        # predates the explicit reference (old-journal compatibility, not a live path).
+        self._results_by_seq: dict[int, Result] = {}
+        self._last_result_seq: int = -1
 
     # -- the one fold --------------------------------------------------------
 
@@ -108,12 +111,14 @@ class RunProjection:
         node = self.nodes.setdefault(key, NodeProjection())
         if isinstance(ev, Dispatched):
             node.dispatched = True
+            node.dispatched_pre_head = ev.pre_head
         elif isinstance(ev, ResultEvent):
             node.result = Result(
                 text=ev.text, files=ev.files, exit_code=ev.exit_code, outcome=ev.outcome,
             )
             node.result_seq = ev.seq
-            self._last_result = node.result
+            self._results_by_seq[ev.seq] = node.result
+            self._last_result_seq = ev.seq
         elif isinstance(ev, Integrated):
             if node.receipt is None:
                 node.receipt = IntegrationReceipt()
@@ -124,9 +129,11 @@ class RunProjection:
             node.loop_last_commit = ev.commit
             node.loop_last_iter_seq = ev.seq
             node.loop_converged = ev.converged
-            # Reference (not copy): the body's outcome is the last result folded before
-            # this loop_iter — for old journals too (the body ResultEvent precedes it).
-            node.loop_last_body = self._last_result
+            # Resolve the body artifact through the loop_iter's EXPLICIT reference; a
+            # legacy line (no reference) falls back to the last result before it — the
+            # documented old-journal semantics, never the live fold path.
+            ref_seq = ev.body_result_seq if ev.body_result_seq is not None else self._last_result_seq
+            node.loop_last_body = self._results_by_seq.get(ref_seq)
 
     # -- resume / durability decision ---------------------------------------
 

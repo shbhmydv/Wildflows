@@ -17,8 +17,10 @@ from collections.abc import Iterator
 
 from wildflows.expr import (
     Combine,
+    Dispatch,
     Do,
     Expr,
+    Inplace,
     Loop,
     assign_node_ids,
     children_of,
@@ -47,10 +49,36 @@ def _check_capability(node: Expr) -> None:
     # executable only with a `cmd` predicate (a `flag` predicate needs the planner).
     if isinstance(node, Combine) or node.kind in ("ask", "setup"):
         raise AdmissionError(f"{node.kind} is not executable in the PoC")
-    if isinstance(node, Loop) and node.until.kind != "cmd":
-        raise AdmissionError(
-            "loop `until=flag` is planner-judged; lands with real planner integration"
-        )
+    if isinstance(node, Loop):
+        if node.until.kind != "cmd":
+            raise AdmissionError(
+                "loop `until=flag` is planner-judged; lands with real planner integration"
+            )
+        # An empty composite loop body (a Seq/Dispatch with no executable leaf) would
+        # iterate forever producing nothing and leave `loop_iter` with no body outcome to
+        # reference (hand-8, LOOP-OUTCOME-REFERENCE). A body must contain a runnable leaf.
+        if not _has_executable_leaf(node.body):
+            raise AdmissionError("loop body has no executable leaf (do/inplace)")
+
+
+def _has_executable_leaf(node: Expr) -> bool:
+    if isinstance(node, (Do, Inplace)):
+        return True
+    return any(_has_executable_leaf(c) for c in children_of(node))
+
+
+def _ancestor_paths(tree: Expr) -> dict[str, list[Expr]]:
+    """Each node_id -> the list of expressions from root down to (and including) it."""
+    paths: dict[str, list[Expr]] = {}
+
+    def rec(node: Expr, acc: list[Expr]) -> None:
+        acc2 = [*acc, node]
+        paths[node.node_id] = acc2
+        for child in children_of(node):
+            rec(child, acc2)
+
+    rec(tree, [])
+    return paths
 
 
 def admit_epoch(
@@ -67,18 +95,51 @@ def admit_epoch(
     tree = parse_expr(tree.model_dump())
     assign_node_ids(tree)
 
-    node_ids = {node.node_id for node in _walk(tree)}
-    for node in _walk(tree):
+    order = list(_walk(tree))
+    node_ids = {node.node_id for node in order}
+    position = {node.node_id: i for i, node in enumerate(order)}
+    paths = _ancestor_paths(tree)
+    for node in order:
         _check_capability(node)
         if isinstance(node, Do):
             if node.rig.name not in registry:
                 raise AdmissionError(f"unknown rig: {node.rig.name!r}")
             for ref in node.ctx:
-                if ref.kind == "node" and ref.ref not in node_ids:
-                    raise AdmissionError(
-                        f"ctx node ref {ref.ref!r} names no node in the epoch tree"
-                    )
+                if ref.kind == "node":
+                    _check_upstream_ctx_ref(node, ref.ref, node_ids, position, paths)
+    return _resume_identity(tree, epoch, projection)
 
+
+def _check_upstream_ctx_ref(
+    node: Do,
+    target: str,
+    node_ids: set[str],
+    position: dict[str, int],
+    paths: dict[str, list[Expr]],
+) -> None:
+    """A `ctx` node ref must resolve to an UPSTREAM result (hand-8, ADMISSION-REFERENCE):
+    the referenced node must exist, be strictly earlier in pre-order (rejects self- and
+    forward-refs), and not be a sibling reachable only across a `Dispatch` (whose children
+    complete in non-deterministic order). A ref into an elder `Seq` sibling is fine."""
+    if target not in node_ids:
+        raise AdmissionError(f"ctx node ref {target!r} names no node in the epoch tree")
+    if position[target] >= position[node.node_id]:
+        raise AdmissionError(
+            f"ctx node ref {target!r} is not upstream of {node.node_id!r} (self/forward ref)"
+        )
+    pr, pt = paths[node.node_id], paths[target]
+    i = 0
+    while i < len(pr) and i < len(pt) and pr[i].node_id == pt[i].node_id:
+        i += 1
+    lca = pr[i - 1]  # i >= 1: both share the root
+    if isinstance(lca, Dispatch):
+        raise AdmissionError(
+            f"ctx node ref {target!r} crosses a Dispatch (concurrent siblings, "
+            f"non-deterministic completion order)"
+        )
+
+
+def _resume_identity(tree: Expr, epoch: int, projection: RunProjection) -> Expr:
     if projection.epoch_opened(epoch) and not projection.epoch_closed(epoch):
         # RESUME IDENTITY: the admitted expr was journalled on the `opened` boundary for
         # replay. The planner re-shapes at epoch BOUNDARIES, never mid-epoch, so a

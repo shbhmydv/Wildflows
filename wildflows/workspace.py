@@ -14,6 +14,7 @@ failure) lives here and is superseded by discard-the-worktree once worktrees lan
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,12 +34,17 @@ _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 class Lease:
     """A node attempt's workspace lease: the shared workdir + its pre-run HEAD.
 
-    `pre_head` anchors rig-authored-commit discovery (`pre..post`) and the failure
-    revert. A per-node worktree is the later backend behind this same seam.
+    `pre_head` anchors rig-authored-commit discovery (`pre..post`), the provenance
+    range `pre_head..HEAD` used on resume, and the failure revert. `preexisting` is the
+    set of untracked+ignored paths present at lease open — failure cleanup removes ONLY
+    paths NOT in this set, so it never destroys pre-existing user files, the run_dir, or
+    anything the lease did not create (hand-8 lease-scoping). A per-node worktree is the
+    later backend behind this same seam.
     """
 
     node_key: NodeKey
     pre_head: str | None
+    preexisting: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -70,8 +76,13 @@ class WorkspaceEffects:
     # -- lease ---------------------------------------------------------------
 
     def open_lease(self, node_key: NodeKey) -> Lease:
-        """Begin a node attempt: snapshot pre-run HEAD (None on an unborn repo)."""
-        return Lease(node_key=node_key, pre_head=self.head_commit())
+        """Begin a node attempt: snapshot pre-run HEAD (None on an unborn repo) and the
+        untracked+ignored file set, so failure cleanup can scope to this lease's leaks."""
+        return Lease(
+            node_key=node_key,
+            pre_head=self.head_commit(),
+            preexisting=frozenset(self._untracked_ignored_paths()),
+        )
 
     # -- do finalization -----------------------------------------------------
 
@@ -93,27 +104,30 @@ class WorkspaceEffects:
         return DoIntegration(ok=True, receipt=IntegrationReceipt(commits=commits))
 
     def finalize_failure(self, lease: Lease, diff_name: str) -> Path | None:
-        """A failed rig's effects are REVERTED and captured (shared-workdir policy).
+        """A failed rig's effects are REVERTED and captured, scoped to THIS lease.
 
-        Evidence (committed rig work `pre..post`, uncommitted tracked changes, AND
-        untracked/ignored artifacts the rig created — defect 3) is captured to the run
-        log dir; the workdir is then reset to the lease's PRE-run HEAD (undoing commits
-        the failing rig made — defect 2) and `git clean -fdxq` removes untracked AND
-        ignored leftovers, so no later node can stage or observe the leak. Returns the
-        evidence path (journalled in the failed result) or None if nothing changed.
-
-        Per-node worktree isolation later replaces this with discard-the-worktree.
+        Evidence (committed rig work `pre..post`, uncommitted tracked changes, AND the
+        untracked/ignored artifacts THIS attempt created) is captured to the run log dir;
+        the workdir is then reset to the lease's PRE-run HEAD (undoing commits the failing
+        rig made) and this lease's untracked/ignored leaks are removed. Cleanup is
+        LEASE-SCOPED (hand-8): only paths absent from `lease.preexisting` are touched, and
+        the run_dir subtree is hard-excluded — so pre-existing user files, the journal
+        under a run_dir-inside-workdir, and anything the lease did not create all survive.
+        Nested Git repositories the rig left are captured (their file listing) and removed
+        recursively (a plain `git clean -fd` would refuse them). Returns the evidence path
+        or None if nothing changed. Per-node worktree isolation later replaces this with
+        discard-the-worktree.
         """
         pre = lease.pre_head
         # Working tree (incl any commit the failing rig made) vs the lease's PRE base —
         # the empty tree when the lease opened on an unborn repo — captures committed AND
-        # uncommitted tracked leaks; untracked/ignored are captured separately.
+        # staged/tracked leaks; this lease's untracked/ignored are captured separately.
         base = pre if pre is not None else _EMPTY_TREE
         parts: list[str] = []
         diff = self.git("diff", base)
         if diff.stdout.strip():
             parts.append(diff.stdout)
-        parts.extend(self._untracked_and_ignored_evidence())
+        parts.extend(self._leak_evidence(sorted(set(self._untracked_ignored_paths()) - lease.preexisting)))
 
         diff_path: Path | None = None
         if parts:
@@ -123,33 +137,86 @@ class WorkspaceEffects:
             diff_path.write_text("\n".join(parts), encoding="utf-8")
 
         if pre is not None:
-            self.git("reset", "--hard", pre)  # undo the failing rig's own commits (defect 2)
+            self.git("reset", "--hard", pre)  # undo the failing rig's own commits
         else:
             # Unborn at lease open: if the failing rig created the first commit, drop the
             # branch ref back to unborn so its effect cannot survive as durable history.
             ref = self.git("symbolic-ref", "-q", "HEAD").stdout.strip()
             if self.head_commit() is not None and ref:
                 self.git("update-ref", "-d", ref)
-            self.git("reset")  # unstage, then clean removes the files
-        self.git("clean", "-fdxq")  # -x also removes ignored artifacts
+            self.git("reset")  # unstage so staged leaks become untracked for the sweep
+        # Recompute leaks AFTER the reset: a leak the failing rig (or a failed core commit)
+        # had STAGED only surfaces as untracked once the index is reset. The sweep stays
+        # lease-scoped — preexisting user files and the run_dir subtree are never touched.
+        self._remove_leaks(sorted(set(self._untracked_ignored_paths()) - lease.preexisting))
         return diff_path
 
-    def _untracked_and_ignored_evidence(self) -> list[str]:
-        """Dump every untracked (`??`) and ignored (`!!`) file's content — git omits
-        these from `diff`, so a failing rig's ignored/untracked leak would otherwise
-        vanish uncaptured (defect 3)."""
+    def _untracked_ignored_paths(self) -> list[str]:
+        """The untracked (`??`) and ignored (`!!`) paths git reports, EXCLUDING the
+        run_dir subtree. Untracked directories (incl a nested Git repo) appear as one
+        `dir/` entry — git does not recurse into them."""
         status = self.git("status", "--ignored", "--porcelain", "-z")
         out: list[str] = []
         for entry in status.stdout.split("\0"):
             if not entry or entry[:2] not in ("??", "!!"):
                 continue
             rel = entry[3:]
-            try:
-                content = (self.workdir / rel).read_text(encoding="utf-8")
-            except OSError:
-                content = "<binary or unreadable>"
-            out.append(f"=== untracked/ignored: {rel} ===\n{content}")
+            if not self._overlaps_run_dir(rel):
+                out.append(rel)
         return out
+
+    def _leak_evidence(self, leaks: list[str]) -> list[str]:
+        """Dump each leaked path's content — git omits untracked/ignored from `diff`. A
+        directory (e.g. a nested Git repo) is WALKED so its file listing + contents are
+        recorded verbatim, never a bare `<unreadable>` (hand-8, defect 3)."""
+        out: list[str] = []
+        for rel in leaks:
+            target = self.workdir / rel
+            if target.is_dir() and not target.is_symlink():
+                for sub in sorted(p for p in target.rglob("*") if p.is_file()):
+                    srel = sub.relative_to(self.workdir).as_posix()
+                    out.append(f"=== untracked/ignored: {srel} ===\n{self._read_text(sub)}")
+            else:
+                out.append(f"=== untracked/ignored: {rel} ===\n{self._read_text(target)}")
+        return out
+
+    @staticmethod
+    def _read_text(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return "<binary or unreadable>"
+
+    def _remove_leaks(self, leaks: list[str]) -> None:
+        """Remove this lease's untracked/ignored leaks — files via unlink, directories
+        (incl nested Git repos, which `git clean -fd` refuses without `-ff`) recursively."""
+        for rel in leaks:
+            target = self.workdir / rel
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+
+    def _overlaps_run_dir(self, rel: str) -> bool:
+        """True if a workdir-relative path OVERLAPS the run_dir subtree — the run_dir
+        itself, anything inside it, OR an ANCESTOR of it. Git reports an untracked
+        directory as one top-level entry (e.g. `.wildflows/`), which is an ANCESTOR of a
+        `run_dir=<workdir>/.wildflows/run`; sweeping it would delete the live journal.
+        None of these may ever be captured or swept."""
+        try:
+            resolved = (self.workdir / rel).resolve()
+            run = self.run_dir.resolve()
+        except OSError:
+            return False
+        return resolved == run or resolved.is_relative_to(run) or run.is_relative_to(resolved)
+
+    def reconstruct_receipt(self, pre_head: str | None) -> IntegrationReceipt:
+        """The receipt for an attempt whose provenance anchor was `pre_head`: EVERY commit
+        in `pre_head..HEAD`, each with its paths. This is the resume recovery primitive —
+        the commits in that range are exactly the attempt's, so a crash anywhere in the
+        completion gap is reconstructed honestly (rig + core commits, and any revert the
+        range contains) instead of re-run (hand-8, RECEIPT-TEAR)."""
+        return IntegrationReceipt(commits=self._commit_receipts(pre_head, self.head_commit()))
 
     # -- inplace finalization ------------------------------------------------
 
@@ -168,22 +235,6 @@ class WorkspaceEffects:
             return Integration("failed", stderr=commit.stderr)
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         return Integration("committed", commit=sha, paths=list(declared))
-
-    # -- reconciliation (reachable-from-HEAD only) ---------------------------
-
-    def reconcile_committed(self, marker: str) -> IntegrationReceipt | None:
-        """A commit carrying this marker AND reachable from current HEAD (a crash after
-        the core committed but before it journalled) yields a retro receipt; an
-        unreachable marked commit (e.g. on a side branch, absent from the worktree) is
-        NOT retro-integrated — false durable attribution (defect 1)."""
-        # rev-list walks ONLY HEAD's ancestry, so a match is reachable by construction.
-        log = self.git(
-            "rev-list", "--max-count=1", "--fixed-strings", f"--grep={marker}", "HEAD"
-        )
-        sha = log.stdout.strip().splitlines()[0] if log.returncode == 0 and log.stdout.strip() else None
-        if sha is None:
-            return None
-        return IntegrationReceipt(commits=[CommitReceipt(sha=sha, paths=self._paths_in_commit(sha))])
 
     # -- git plumbing --------------------------------------------------------
 
@@ -291,6 +342,16 @@ class CompletionRecorder:
         """A successful result and, if it had a committed effect, its integrated receipt
         (one event carrying every attributed commit) — result first, integrated second."""
         self.journal.append(self._result_event(key, result))
+        if receipt.commits:
+            epoch, node_id = key
+            self.journal.append(Integrated(
+                run_id=self.run_id, epoch=epoch, node_id=node_id, commits=receipt.commits,
+            ))
+
+    def record_integrated(self, key: NodeKey, receipt: IntegrationReceipt) -> None:
+        """Journal a recovered integration for a node whose result is ALREADY durable
+        (the RECEIPT-TEAR torn window: result written, its integrated lost). Completes
+        the receipt without touching the existing result."""
         if receipt.commits:
             epoch, node_id = key
             self.journal.append(Integrated(
