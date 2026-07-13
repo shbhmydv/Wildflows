@@ -132,8 +132,11 @@ class IntentWrite(BaseModel):
     # ambiguous (an external hard-link alias may retain attempt bytes) and fails closed.
     started: bool = False
     # Fsynced after this path's reversal operation.  Absent pre-state targets remain in
-    # place for the transaction's checked leak sweep, avoiding an unlink→marker gap.
+    # place for the transaction's checked leak sweep.
     reversed: bool = False
+    # Fsynced immediately before the checked sweep unlinks this absent-prestate target.
+    # An absent started target without this proof remains a hidden-alias ambiguity.
+    swept: bool = False
 
 
 class InplaceIntent(BaseModel):
@@ -602,6 +605,30 @@ class WorkspaceEffects:
                 intent.reversed = True
                 self.write_intent(intent)
             self._reset_to_pre_head(lease, diff_path)
+            preexisting_dirs = (
+                None if lease.preexisting_dirs is None else set(lease.preexisting_dirs)
+            )
+
+            def prepare_sweep(rel: str) -> None:
+                if intent is None:
+                    return
+                # Recheck aliases immediately before publishing the per-path proof.  A
+                # prior swept path may now be absent; an unmarked disappearance still halts.
+                self._validate_intent_targets(intent, preexisting_dirs)
+                leak = Path(_fs_path(rel))
+                changed = False
+                for write in intent.writes:
+                    target = Path(_fs_path(write.path))
+                    if (
+                        write.pre_kind == "absent"
+                        and not write.swept
+                        and (target == leak or target.is_relative_to(leak))
+                    ):
+                        write.swept = True
+                        changed = True
+                if changed:
+                    self.write_intent(intent)
+
             def mark_swept() -> None:
                 if intent is not None:
                     intent.swept = True
@@ -609,8 +636,8 @@ class WorkspaceEffects:
 
             self._remove_leaks(
                 self._attempt_leaks(lease.preexisting, lease.preexisting_dirs),
-                None if lease.preexisting_dirs is None else set(lease.preexisting_dirs),
-                mark_swept if intent is not None else None,
+                preexisting_dirs, mark_swept if intent is not None else None,
+                prepare_sweep if intent is not None else None,
             )
 
             # Phase 5: byte-restore the user baseline through the shared checked loader.
@@ -1205,8 +1232,9 @@ class WorkspaceEffects:
     def _remove_leaks(
         self, leaks: list[str], preexisting_dirs: set[str] | None = None,
         completion: Callable[[], None] | None = None,
+        prepare: Callable[[str], None] | None = None,
     ) -> None:
-        """Checked lease-scoped sweep with an explicit absence postcondition."""
+        """Checked lease-scoped sweep with durable per-target preparation."""
         removed: list[Path] = []
         for rel in leaks:
             target = self._work_path(rel)
@@ -1216,6 +1244,8 @@ class WorkspaceEffects:
                 continue
             except OSError as exc:
                 raise WorkspaceFault(f"cannot stat leak before removal {rel}: {exc}") from exc
+            if prepare is not None:
+                prepare(rel)
             try:
                 if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                     shutil.rmtree(target)
@@ -1442,7 +1472,7 @@ class WorkspaceEffects:
             try:
                 info = actual.lstat()
             except FileNotFoundError:
-                if write.started and not intent.swept:
+                if write.started and not (write.swept or intent.swept):
                     disappeared.append(write.path)
                 continue
             except OSError as exc:

@@ -214,8 +214,9 @@ def test_inplace_sweep_completion_survives_recovery_crash(tmp_path: Path) -> Non
         def remove_then_die(
             leaks: list[str], preexisting_dirs: set[str] | None = None,
             completion: Callable[[], None] | None = None,
+            prepare: Callable[[str], None] | None = None,
         ) -> NoReturn:
-            real_remove(leaks, preexisting_dirs, completion)
+            real_remove(leaks, preexisting_dirs, completion, prepare)
             os._exit(0)
 
         setattr(engine.ws, "_remove_leaks", remove_then_die)
