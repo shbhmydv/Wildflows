@@ -41,6 +41,7 @@ from wildflows.expr import (
     Seq,
     Until,
     assign_node_ids,
+    parse_expr,
 )
 from wildflows.journal import Journal
 from wildflows.rig import RigRegistry, Result
@@ -83,10 +84,31 @@ class Engine:
         no second `opened` boundary, completed nodes are skipped, only not-yet-resulted
         nodes run (B1). A fresh epoch opens normally.
         """
+        # Refold the journal on every entry so a SECOND run_epoch on the same live
+        # Engine sees the epoch it just closed (pass-2 B1: no double-execution). Within
+        # a single run_epoch, `_state` is not re-folded as we journal — leaf/loop resume
+        # reads the pre-entry snapshot deliberately (see __init__).
+        self._state = _fold(self.journal.events())
+        # DEALIAS on admission (pass-2 NB2): round-trip through the wire model so two
+        # positions that share one Python instance become distinct objects, and
+        # `assign_node_ids` can never collapse two declared nodes onto one journal key.
+        # This also deep-copies, so the caller's tree is never mutated.
+        tree = parse_expr(tree.model_dump())
         assign_node_ids(tree)
         if self._state.epoch_closed(epoch):
             return
-        if not self._state.epoch_opened(epoch):
+        if self._state.epoch_opened(epoch):
+            # RESUME IDENTITY (pass-2 NB1): the admitted expression was journalled on the
+            # `opened` boundary specifically for replay. The planner re-shapes at epoch
+            # BOUNDARIES, never mid-epoch, so a resumed tree that differs from the one on
+            # the durable boundary is a caller error — reject it before any execution
+            # rather than run a later-shape decision under an already-open epoch.
+            admitted = self._state.epoch_expr.get(epoch)
+            if admitted is not None and admitted != tree.model_dump():
+                raise ValueError(
+                    f"resume tree for epoch {epoch} differs from the admitted boundary expr"
+                )
+        else:
             self.journal.append(
                 Boundary(
                     run_id=self.run_id,
@@ -128,9 +150,9 @@ class Engine:
         elif isinstance(node, Loop):
             self._exec_loop(node, epoch)
         elif isinstance(node, Do):
-            self._exec_do(node, epoch)
+            self._exec_do(node, epoch, floor_seq)
         elif isinstance(node, Inplace):
-            self._exec_inplace(node, epoch)
+            self._exec_inplace(node, epoch, floor_seq)
         else:
             raise NotImplementedError(f"{node.kind} is not executable in the PoC")
 
@@ -171,9 +193,22 @@ class Engine:
         resume_from = self._state.loop_iterations.get(key, 0)
         partial_floor = self._state.loop_last_iter_seq.get(key, -1)
 
+        # NB3: a crash BETWEEN the last loop_iter and the loop's final ResultEvent must
+        # not re-run a body that already converged or already hit the cap. A journalled
+        # loop_iter with converged=True (or a final capped iteration) means the loop is
+        # DONE — reconstruct its result from the journalled last-body artifact and emit
+        # the ResultEvent straight away, running no further body.
+        last_converged = self._state.loop_converged.get(key, False)
+        if resume_from > 0 and (last_converged or resume_from >= node.cap):
+            self._finish_loop(
+                node, epoch, self._state.loop_last_body.get(key),
+                iterations=resume_from, converged=last_converged,
+            )
+            return
+
         iterations = resume_from
         converged = False
-        last_body: Result | None = None
+        last_body: Result | None = self._state.loop_last_body.get(key)
         for i in range(resume_from, node.cap):
             floor = partial_floor if i == resume_from else _NO_RESUME
             before = len(self.journal.events())
@@ -191,11 +226,19 @@ class Engine:
                     iteration=i,
                     commit=commit,
                     converged=converged,
+                    body_text=last_body.text if last_body else "",
+                    body_files=last_body.files if last_body else [],
+                    body_exit_code=last_body.exit_code if last_body else None,
                 )
             )
             iterations = i + 1
             if converged:
                 break
+        self._finish_loop(node, epoch, last_body, iterations=iterations, converged=converged)
+
+    def _finish_loop(
+        self, node: Loop, epoch: int, last_body: Result | None, *, iterations: int, converged: bool
+    ) -> None:
         # SF6: the loop's result IS the last integrated iteration's body artifact
         # (text/files); the convergence/cap disposition rides in the separate
         # `loop_status`, so a downstream combine consumes the artifact, not the prose.
@@ -240,7 +283,13 @@ class Engine:
         proc = self._git("rev-parse", "HEAD")
         return proc.stdout.strip() if proc.returncode == 0 else None
 
-    def _exec_do(self, node: Do, epoch: int) -> None:
+    def _exec_do(self, node: Do, epoch: int, floor_seq: int = -1) -> None:
+        # NB4: a prior session may have committed this node then died before journalling.
+        # Reconcile from the marked commit instead of re-running the rig (top-level only;
+        # a loop body's per-iteration marker is intentionally not reconciled — the loop
+        # fold owns iteration resume). See `_reconcile_committed`.
+        if floor_seq == -1 and self._reconcile_committed(node.node_id, epoch, "do"):
+            return
         prompt = self._materialize_ctx(node, epoch)
         self.journal.append(
             Dispatched(
@@ -253,29 +302,53 @@ class Engine:
             )
         )
         if prompt is None:
-            # An unresolvable ctx ref is a failed RESULT, not a crash (SF2).
+            # An unresolvable/escaping ctx ref is a failed RESULT, not a crash (SF2/NB6).
             self._journal_result(
                 node.node_id,
                 epoch,
                 Result(text=f"unresolved ctx for {node.node_id}", ok=False, outcome="failed"),
             )
             return
-        rig = self.registry.resolve(node.rig.name)
+        pre_head = self._head_commit()  # NB5: snapshot to attribute rig-made commits
         try:
+            rig = self.registry.resolve(node.rig.name)  # SF3: unknown rig -> failed result
             result = rig.run(prompt, self.workdir)
         except Exception as exc:  # SF3: a rig exception never escapes after `dispatched`
+            diff_path = self._capture_and_reset_dirty(node, epoch)  # NB5(b)
             self._journal_result(
                 node.node_id,
                 epoch,
-                Result(text=f"rig raised: {exc}", ok=False, outcome="failed"),
+                Result(text=self._fail_text(f"rig raised: {exc}", diff_path), ok=False,
+                       outcome="failed"),
             )
             return
         if not result.ok:
-            self._journal_result(node.node_id, epoch, result)
+            # NB5(b): a failed rig's working-tree changes are captured verbatim to the
+            # run log dir and the workdir is reset to HEAD, so no LATER node can stage +
+            # claim the leaked diff as its own integration.
+            diff_path = self._capture_and_reset_dirty(node, epoch)
+            self._journal_result(
+                node.node_id,
+                epoch,
+                Result(text=self._fail_text(result.text, diff_path), ok=False,
+                       files=result.files, exit_code=result.exit_code, outcome=result.outcome),
+            )
             return
-        # Core-mediated integration: stage + commit whatever the rig changed. The
+        # NB5(a): the senior/script contract legitimately commits its OWN work. The core
+        # RECORDS those rig-made commits (pre_head..HEAD) as this node's integration
+        # rather than forbidding them. Then it integrates any REMAINING dirty state: the
         # committed diff (not the rig's word) is the durable record (B5).
-        integ = self._integrate(None, f"do {node.node_id}")
+        pending: list[Integrated] = []
+        integrated_paths: list[str] = []
+        post_head = self._head_commit()
+        if post_head is not None and post_head != pre_head:
+            rig_paths = self._paths_in_range(pre_head, post_head)
+            integrated_paths += rig_paths
+            pending.append(Integrated(
+                run_id=self.run_id, epoch=epoch, node_id=node.node_id,
+                commit=post_head, paths=rig_paths,
+            ))
+        integ = self._integrate(None, self._commit_msg("do", node.node_id, epoch))
         if integ.status == "failed":  # SF1: git failure -> journalled failed result
             self._journal_result(
                 node.node_id,
@@ -283,29 +356,28 @@ class Engine:
                 Result(text=f"do integration failed:\n{integ.stderr}", ok=False, outcome="failed"),
             )
             return
-        # Result first, THEN integrated: a torn tail leaves an effectful result without
-        # its `integrated`, which _is_durable correctly reads as NOT durable.
+        if integ.status == "committed":
+            integrated_paths += integ.paths
+            pending.append(Integrated(
+                run_id=self.run_id, epoch=epoch, node_id=node.node_id,
+                commit=integ.commit or "", paths=integ.paths,
+            ))
+        # Result first, THEN integrated (kept from B5): a torn tail leaves an effectful
+        # result without its `integrated`, which _is_durable correctly reads as NOT
+        # durable; the NB4 marker then reconciles the orphaned commit on resume.
         self._journal_result(
             node.node_id,
             epoch,
             Result(
                 text=result.text,
-                files=integ.paths,
+                files=integrated_paths,
                 ok=True,
                 exit_code=result.exit_code,
                 outcome=result.outcome,
             ),
         )
-        if integ.status == "committed":
-            self.journal.append(
-                Integrated(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=node.node_id,
-                    commit=integ.commit or "",
-                    paths=integ.paths,
-                )
-            )
+        for ev in pending:
+            self.journal.append(ev)
 
     def _materialize_ctx(self, node: Do, epoch: int) -> str | None:
         """Append declared `ctx` to the prompt; None if any ref is unresolvable (SF2).
@@ -325,7 +397,15 @@ class Engine:
 
     def _resolve_ctx(self, ref: CtxRef, epoch: int) -> str | None:
         if ref.kind == "file":
-            target = self.workdir / ref.ref
+            # NB6: containment guard identical to `inplace` — a file ctx ref must resolve
+            # INSIDE the workdir and never a git admin path. An absolute path, `../`
+            # escape, or in-worktree symlink pointing outside is a failed result at exec
+            # time (admission cannot resolve symlinks), not a host-file exfiltration.
+            target = (self.workdir / ref.ref).resolve()
+            if not target.is_relative_to(self.workdir.resolve()):
+                return None
+            if ".git" in Path(ref.ref).parts:
+                return None
             try:
                 content = target.read_text(encoding="utf-8")
             except OSError:
@@ -343,7 +423,9 @@ class Engine:
                 return ev.text
         return None
 
-    def _exec_inplace(self, node: Inplace, epoch: int) -> None:
+    def _exec_inplace(self, node: Inplace, epoch: int, floor_seq: int = -1) -> None:
+        if floor_seq == -1 and self._reconcile_committed(node.node_id, epoch, "inplace"):
+            return  # NB4: a marked commit from a crashed prior session — do not re-apply
         self.journal.append(
             Dispatched(
                 run_id=self.run_id,
@@ -368,7 +450,7 @@ class Engine:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(edit.content, encoding="utf-8")
             paths.append(edit.path)
-        integ = self._integrate(paths, f"inplace {node.node_id}")
+        integ = self._integrate(paths, self._commit_msg("inplace", node.node_id, epoch))
         if integ.status == "failed":  # SF1
             self._journal_result(
                 node.node_id,
@@ -380,24 +462,31 @@ class Engine:
                 ),
             )
             return
-        if integ.status == "committed":
-            self.journal.append(
-                Integrated(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=node.node_id,
-                    commit=integ.commit or "",
-                    paths=paths,
-                )
+        if integ.status == "noop":
+            # SHOULD-FIX 4: an already-identical edit produced no diff. Journal it as a
+            # DURABLE no-op — ok=True with an EMPTY file list — so `_is_durable` accepts
+            # the result on its own (no `integrated` required) and resume does not
+            # re-apply it forever. DESIGN §5: "empty/no-diff inplace is a durable no-op."
+            self._journal_result(
+                node.node_id,
+                epoch,
+                Result(text=f"inplace: no diff (already applied) for {', '.join(paths)}",
+                       files=[], ok=True),
             )
+            return
+        self.journal.append(
+            Integrated(
+                run_id=self.run_id,
+                epoch=epoch,
+                node_id=node.node_id,
+                commit=integ.commit or "",
+                paths=paths,
+            )
+        )
         self._journal_result(
             node.node_id,
             epoch,
-            Result(
-                text=f"wrote {', '.join(paths)}",
-                files=paths,
-                ok=integ.status == "committed",
-            ),
+            Result(text=f"wrote {', '.join(paths)}", files=paths, ok=True),
         )
 
     def _reject_admin_path(self, edit_path: str) -> None:
@@ -449,12 +538,78 @@ class Engine:
             return _Integration("failed", stderr=commit.stderr)
         sha = self._git("rev-parse", "HEAD").stdout.strip()
         if declared is None:
-            changed = self._git(
-                "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD"
-            ).stdout.split()
+            changed = self._paths_in_commit(sha)
         else:
             changed = list(declared)
         return _Integration("committed", commit=sha, paths=changed)
+
+    def _commit_msg(self, kind: str, node_id: str, epoch: int) -> str:
+        """A commit message carrying a machine-parsable reconciliation marker (NB4).
+
+        The marker `wf:<run_id>:<epoch>:<node_id>` lets a resumed run find a commit the
+        core made just before it crashed (commit succeeded, journal write did not) and
+        retro-journal it instead of re-executing.
+        """
+        return f"{kind} {node_id}\n\nwf:{self.run_id}:{epoch}:{node_id}"
+
+    def _reconcile_committed(self, node_id: str, epoch: int, kind: str) -> bool:
+        """NB4: if a marked commit for this node already exists (a crash after the core
+        committed but before it journalled), retro-journal `integrated` + `result` from
+        that commit and report the node done — never re-run its effect."""
+        marker = f"wf:{self.run_id}:{epoch}:{node_id}"
+        log = self._git("log", "--all", "--format=%H", "--fixed-strings", f"--grep={marker}")
+        if log.returncode != 0 or not log.stdout.strip():
+            return False
+        sha = log.stdout.strip().splitlines()[0]
+        paths = self._paths_in_commit(sha)
+        self.journal.append(
+            Integrated(run_id=self.run_id, epoch=epoch, node_id=node_id, commit=sha, paths=paths)
+        )
+        self._journal_result(
+            node_id, epoch,
+            Result(text=f"{kind} reconciled from marked commit {sha}", files=paths, ok=True),
+        )
+        return True
+
+    def _paths_in_commit(self, sha: str) -> list[str]:
+        """The paths a commit changed, NUL-parsed so whitespace filenames survive (SF6)."""
+        out = self._git(
+            "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-z", sha
+        ).stdout
+        return [p for p in out.split("\0") if p]
+
+    def _paths_in_range(self, pre: str | None, post: str) -> list[str]:
+        """Paths changed by pre..post (rig-made commits, NB5a); NUL-parsed (SF6)."""
+        if pre is None:
+            return self._paths_in_commit(post)
+        out = self._git("diff", "--name-only", "-z", pre, post).stdout
+        return [p for p in out.split("\0") if p]
+
+    def _capture_and_reset_dirty(self, node: Do, epoch: int) -> Path | None:
+        """NB5(b): capture a failed rig's dirty working-tree diff to the run log dir and
+        reset the workdir to HEAD, so a later node cannot stage + claim the leak. Returns
+        the diff file path (journalled in the failed result) or None if the tree is clean.
+
+        PoC policy (single shared workdir): superseded by per-node worktrees at step 4."""
+        self._git("add", "-A", "--", ".")
+        diff = self._git("diff", "--cached")
+        diff_path: Path | None = None
+        if diff.stdout.strip():
+            leak_dir = self.run_dir / "failed-diffs"
+            leak_dir.mkdir(parents=True, exist_ok=True)
+            diff_path = leak_dir / f"e{epoch}-{node.node_id}.diff"
+            diff_path.write_text(diff.stdout, encoding="utf-8")
+        if self._head_commit() is not None:
+            self._git("reset", "--hard", "HEAD")
+        else:
+            self._git("reset")  # no commit yet: unstage, then clean removes the files
+        self._git("clean", "-fdq")
+        return diff_path
+
+    def _fail_text(self, base: str, diff_path: Path | None) -> str:
+        if diff_path is None:
+            return base
+        return f"{base}\n[dirty working-tree diff captured: {diff_path}]"
 
     def _journal_result(self, node_id: str, epoch: int, result: Result) -> None:
         self.journal.append(
@@ -490,7 +645,14 @@ class ReplayState:
         self.loop_iterations: dict[tuple[int, str], int] = {}
         self.loop_last_commit: dict[tuple[int, str], str | None] = {}
         self.loop_last_iter_seq: dict[tuple[int, str], int] = {}
+        # NB3: the last journalled loop_iter's body artifact + convergence, so a crash
+        # before the loop's final ResultEvent reconstructs it without re-running the body.
+        self.loop_last_body: dict[tuple[int, str], Result] = {}
+        self.loop_converged: dict[tuple[int, str], bool] = {}
         self._epoch_phase: dict[int, str] = {}
+        # NB1: the admitted tree per epoch (from the `opened` boundary), for resume
+        # identity checking.
+        self.epoch_expr: dict[int, dict[str, object]] = {}
 
     def epoch_closed(self, epoch: int) -> bool:
         return self._epoch_phase.get(epoch) == "closed"
@@ -522,8 +684,14 @@ def _fold(events: list[Event]) -> ReplayState:
             state.loop_iterations[key] = ev.iteration + 1
             state.loop_last_commit[key] = ev.commit
             state.loop_last_iter_seq[key] = ev.seq
+            state.loop_last_body[key] = Result(
+                text=ev.body_text, files=ev.body_files, ok=True, exit_code=ev.body_exit_code
+            )
+            state.loop_converged[key] = ev.converged
         elif isinstance(ev, Boundary):
             state._epoch_phase[ev.epoch] = ev.phase  # latest boundary wins (B3)
+            if ev.phase == "opened" and ev.expr is not None:
+                state.epoch_expr[ev.epoch] = ev.expr
     return state
 
 
