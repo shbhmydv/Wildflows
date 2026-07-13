@@ -36,7 +36,7 @@ class _CountingRig:
     def run(self, prompt: str, workdir: Path) -> Result:
         self.calls += 1
         (Path(workdir) / f"{self.name}.txt").write_text(str(self.calls), encoding="utf-8")
-        return Result(text=f"{self.name} run {self.calls}", ok=True, exit_code=0)
+        return Result(text=f"{self.name} run {self.calls}", exit_code=0)
 
 
 # --------------------------------------------------------------------------- B2
@@ -73,7 +73,7 @@ def test_replay_scopes_node_state_to_epoch(tmp_path: Path) -> None:
 
     j = Journal(tmp_path)
     j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="opened"))
-    j.append(ResultEvent(run_id="r", epoch=0, node_id="n0", ok=True, text="epoch0 result"))
+    j.append(ResultEvent(run_id="r", epoch=0, node_id="n0", text="epoch0 result"))
     j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="closed"))
     j.append(Boundary(run_id="r", epoch=1, node_id="n0", phase="opened"))
     j.append(Dispatched(run_id="r", epoch=1, node_id="n0", rig="echo", task="t"))

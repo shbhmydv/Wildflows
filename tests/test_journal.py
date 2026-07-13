@@ -16,6 +16,7 @@ from wildflows.events import (
     parse_event,
 )
 from wildflows.journal import Journal
+from wildflows.result import CommitReceipt
 
 
 def test_append_assigns_increasing_seq(tmp_path: Path) -> None:
@@ -31,8 +32,9 @@ def test_all_event_types_roundtrip_through_ndjson(tmp_path: Path) -> None:
     events: list[Event] = [
         Boundary(run_id="r", epoch=0, node_id="n0", phase="opened"),
         Dispatched(run_id="r", epoch=0, node_id="n0.0", rig="echo", task="t"),
-        ResultEvent(run_id="r", epoch=0, node_id="n0.0", ok=True, text="done"),
-        Integrated(run_id="r", epoch=0, node_id="n0.0", commit="abc", paths=["a.txt"]),
+        ResultEvent(run_id="r", epoch=0, node_id="n0.0", text="done"),
+        Integrated(run_id="r", epoch=0, node_id="n0.0",
+                   commits=[CommitReceipt(sha="abc", paths=["a.txt"])]),
         Judged(run_id="r", epoch=0, node_id="n0.1", verdict="pass", ok=True, target_node="n0.0"),
         LoopIter(run_id="r", epoch=0, node_id="n0", iteration=0, commit="abc", converged=True),
         Asked(run_id="r", epoch=0, node_id="n0.2", question="which?"),
