@@ -47,8 +47,10 @@ def _commit_file(workdir: Path, name: str, content: str, msg: str) -> None:
 
 def test_dispatched_with_mid_rig_commit_is_not_recovered_as_success(tmp_path: Path) -> None:
     """A dispatched-only tail with a mid-rig checkpoint commit has NO completion certificate,
-    so it is never synthesized as success — the node RE-RUNS and the checkpoint commit stays
-    as reachable forensic residue."""
+    so it is never synthesized as success — the node RE-RUNS. Under hand-10 QUARANTINE-NEVER-
+    DESTROY the checkpoint commit is moved to a quarantine ref (reachable forensic residue)
+    and the branch is reset to pre_head, so the rerun starts clean and must own its own
+    receipt (it can never absorb the retained commit as unreceipted success)."""
     workdir = tmp_path / "work"
     pre = _base_repo(workdir)
     run_dir = tmp_path / "run"
@@ -61,13 +63,21 @@ def test_dispatched_with_mid_rig_commit_is_not_recovered_as_success(tmp_path: Pa
                         task="work", pre_head=pre))
     # A mid-rig checkpoint commit, then death before the rig returned (no result event).
     _commit_file(workdir, "chk.txt", "checkpoint", f"chk\n\nwf:{run_dir.name}:0:n0")
+    chk_sha = _head(workdir)
 
     rig = _CountingRig("c")
     Engine(run_dir=run_dir, workdir=workdir, registry=RigRegistry({"c": rig})).run_epoch(
         tree, epoch=0
     )
     assert rig.calls == 1  # re-ran; a checkpoint commit is not a completion certificate
-    assert (workdir / "chk.txt").exists()  # mid-rig commit remains as forensic residue
+    assert not (workdir / "chk.txt").exists()  # branch reset to pre_head; not at HEAD
+    # The checkpoint commit is preserved (reachable) in a quarantine ref — never destroyed.
+    quarantined = subprocess.run(
+        ["git", "for-each-ref", "--format=%(objectname)", "refs/wildflows/quarantine/"],
+        cwd=workdir, capture_output=True, text=True).stdout.split()
+    assert chk_sha in quarantined  # dead-attempt commit is safe, not lost
+    # The rerun owns its OWN active effect via a receipt — no unreceipted retained commit.
+    assert replay(run_dir).integrated[(0, "n0")]  # receipt present for the successful rerun
 
 
 def test_unborn_mid_rig_commit_is_not_completion(tmp_path: Path) -> None:
