@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 
 from wildflows.engine import Engine, PredicateEvaluationError, replay
-from wildflows.events import Event, LoopIter
+from wildflows.events import Boundary, Event, LoopIter
 from wildflows.expr import Edit, Inplace, Loop, Until
+from wildflows.journal import Journal, JournalPoisonedError
 from wildflows.rig import RigRegistry
 
 from tests.test_review_fixes_pass5 import _base_repo
@@ -83,3 +84,34 @@ def test_loop_predicate_effect_is_mediated_and_predicate_to_loop_iter_crash_is_r
         ["git", "status", "--porcelain"], cwd=redo_workdir, check=True,
         capture_output=True, text=True,
     ).stdout == ""
+
+
+def test_append_io_failure_poison_or_retry_cannot_create_sequence_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late append failure leaves no live-memory event and poisons that owner."""
+    journal = Journal(tmp_path / "run")
+    event = Boundary(run_id="r", epoch=0, node_id="n0", phase="opened")
+    real_fsync = os.fsync
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("injected journal fsync failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="injected"):
+        journal.append(event)
+    assert journal.events() == []
+    assert event.seq == -1
+
+    monkeypatch.setattr(os, "fsync", real_fsync)
+    with pytest.raises(JournalPoisonedError, match="fresh Journal"):
+        journal.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="closed"))
+
+    # The flushed line may in fact be durable after a failed fsync.  Only a fresh load
+    # decides that physical tail, then continues contiguously; the poisoned owner cannot.
+    reloaded = Journal.load(tmp_path / "run")
+    assert [item.seq for item in reloaded.events()] == [0]
+    assert reloaded.append(
+        Boundary(run_id="r", epoch=0, node_id="n0", phase="closed")
+    ) == 1
+    assert [item.seq for item in Journal.load(tmp_path / "run").events()] == [0, 1]

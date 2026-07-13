@@ -20,6 +20,10 @@ from wildflows.events import Event, parse_event
 from wildflows.projection import RunProjection
 
 
+class JournalPoisonedError(RuntimeError):
+    """This append owner saw uncertain durability and must be freshly loaded."""
+
+
 class JournalCompatibilityError(ValueError):
     """A journal the current engine refuses to resume/replay.
 
@@ -103,6 +107,7 @@ class Journal:
         self.path = self.run_dir / "events.ndjson"
         self._events: list[Event] = []
         self.projection = RunProjection()
+        self._poisoned = False
 
     def append(self, event: Event) -> int:
         """Append an event: assign the next seq, fsync, fold into the projection.
@@ -112,17 +117,29 @@ class Journal:
         keeps seqs collision-free even after a gap-truncated resume, so the strict
         ordering `load` checks always holds.
         """
+        if self._poisoned:
+            raise JournalPoisonedError(
+                "journal append owner is poisoned; load a fresh Journal before appending"
+            )
         seq = self._events[-1].seq + 1 if self._events else 0
+        assigned = event.model_copy(update={"seq": seq})
+        line = assigned.model_dump_json() + "\n"
+        new_journal = not self.path.exists()
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if new_journal:
+                _fsync_directory(self.run_dir)
+        except BaseException:
+            # A write/fsync exception cannot prove whether the line reached disk.  Keep
+            # memory at its durable prefix and forbid this owner from guessing; load()
+            # is the only authority that may classify the physical tail.
+            self._poisoned = True
+            raise
         event.seq = seq
         self._events.append(event)
-        line = event.model_dump_json() + "\n"
-        new_journal = not self.path.exists()
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
-        if new_journal:
-            _fsync_directory(self.run_dir)
         self.projection.apply(event)
         return seq
 
