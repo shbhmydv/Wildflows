@@ -48,6 +48,11 @@ class ResultEvent(_Header):
     text: str = ""
     files: list[str] = Field(default_factory=list)
     exit_code: int | None = None
+    # Outcome discriminator mirroring Result.outcome. A `busy` result (rate/session
+    # wall) journals ok=False AND outcome="busy" so it is NOT confused with a task
+    # failure; real backoff/re-entry on it is a later ladder step. Defaults to "ok"
+    # so pre-existing journal lines (no field) parse unchanged.
+    outcome: Literal["ok", "failed", "busy"] = "ok"
 
 
 class Integrated(_Header):

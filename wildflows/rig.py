@@ -6,12 +6,34 @@ engine change. Real rigs are NOT wired up in this build (no network, no model ca
 """
 from __future__ import annotations
 
+import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
+
+# Outcome discriminator (extends the plain ok/not-ok Result):
+#   ok     — the rig produced output and exited 0.
+#   failed — a real task/transport failure (non-zero exit, or a timeout kill).
+#   busy   — a rate/session/quota wall: NOT a task failure. The caller should back
+#            off and re-enter (real backoff policy is a later ladder step, not here).
+Outcome = Literal["ok", "failed", "busy"]
+
+# The rate/session-limit signatures the grindstone rigs surface on stderr (kept in
+# sync with models/picodex/{senior,planner}_request.sh + grindstone/ratelimit.py).
+DEFAULT_BUSY_PATTERNS = [
+    r"rate.?limit",
+    r"429",
+    r"quota",
+    r"usage limit",
+    r"session limit",
+    r"weekly limit",
+    r"plan limit",
+    r"too many requests",
+]
 
 
 class Result(BaseModel):
@@ -21,6 +43,7 @@ class Result(BaseModel):
     files: list[str] = Field(default_factory=list)
     ok: bool = True
     exit_code: int | None = None
+    outcome: Outcome = "ok"
 
 
 @runtime_checkable
@@ -60,6 +83,109 @@ class ShellRig:
             text=proc.stdout if proc.returncode == 0 else proc.stderr,
             ok=proc.returncode == 0,
             exit_code=proc.returncode,
+        )
+
+
+class ScriptRig:
+    """Drives a real grindstone-contract executor script — the production rig seam.
+
+    The script is invoked with EXACTLY the battle-tested request.sh argument contract:
+
+        <script> --worktree <dir> --prompt <file> --log-dir <dir> \
+                 --handle-out <file> --timeout <secs>
+
+    It grinds agentically inside the worktree, propagates its exit code, and surfaces
+    rate/session-limit signatures on stderr. `--prompt` is a FILE PATH (not inline
+    argv): the real rigs feed the prompt on stdin from that file to dodge the kernel's
+    MAX_ARG_STRLEN wall on large prior-failure context — ScriptRig writes the prompt to
+    `<dispatch-log>/prompt.txt` and passes its path, mirroring the contract exactly.
+
+    Per-dispatch logs land under `<log_dir>/<workdir.name>/` — in the real worktree
+    seam (ladder step 4) each `do` runs in a worktree named for its node_id, so the
+    dispatch key IS the node_id by construction. Captured stdout/stderr are written
+    there so the log dir is populated even if the script writes nothing itself.
+
+    NO real model is invoked by this class; it only shells out to whatever script it is
+    configured with. Real backoff/retry on a `busy` outcome is a later ladder step.
+    """
+
+    def __init__(
+        self,
+        script: Path,
+        log_dir: Path,
+        timeout_s: float = 900.0,
+        env: dict[str, str] | None = None,
+        busy_patterns: list[str] | None = None,
+    ) -> None:
+        self.script = Path(script)
+        self.log_dir = Path(log_dir)
+        self.timeout_s = timeout_s
+        self.env = dict(env or {})
+        self._busy_re = re.compile(
+            "|".join(busy_patterns or DEFAULT_BUSY_PATTERNS), re.IGNORECASE
+        )
+
+    def _classify(self, returncode: int, stdout: str, stderr: str) -> Outcome:
+        if returncode == 0:
+            return "ok"
+        # A limit can land on either stream (grindstone greps both).
+        if self._busy_re.search(stderr) or self._busy_re.search(stdout):
+            return "busy"
+        return "failed"
+
+    def run(self, prompt: str, workdir: Path) -> Result:
+        dispatch_dir = self.log_dir / Path(workdir).name
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        prompt_file = dispatch_dir / "prompt.txt"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        handle_out = dispatch_dir / "handle"
+
+        argv = [
+            str(self.script),
+            "--worktree", str(workdir),
+            "--prompt", str(prompt_file),
+            "--log-dir", str(dispatch_dir),
+            "--handle-out", str(handle_out),
+            "--timeout", str(int(self.timeout_s)),
+        ]
+        proc_env = {**os.environ, **self.env}
+
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                env=proc_env,
+                timeout=self.timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Timeout is represented as a `failed` outcome with a "[timeout]" marker;
+            # a dedicated timeout outcome is not warranted (the caller treats it like
+            # any other non-busy failure). Reaping the process GROUP is ladder step 4.
+            out = exc.stdout or b""
+            err = exc.stderr or b""
+            stdout = out.decode() if isinstance(out, bytes) else out
+            stderr = err.decode() if isinstance(err, bytes) else err
+            (dispatch_dir / "agent.stdout.log").write_text(stdout, encoding="utf-8")
+            (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
+            return Result(
+                text=f"[timeout] script exceeded {self.timeout_s}s\n{stderr}",
+                ok=False,
+                exit_code=None,
+                outcome="failed",
+            )
+
+        (dispatch_dir / "agent.stdout.log").write_text(proc.stdout, encoding="utf-8")
+        (dispatch_dir / "agent.stderr.log").write_text(proc.stderr, encoding="utf-8")
+
+        outcome = self._classify(proc.returncode, proc.stdout, proc.stderr)
+        text = proc.stdout if proc.returncode == 0 else (proc.stderr or proc.stdout)
+        return Result(
+            text=text,
+            ok=proc.returncode == 0,
+            exit_code=proc.returncode,
+            outcome=outcome,
         )
 
 

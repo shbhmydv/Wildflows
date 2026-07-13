@@ -197,6 +197,7 @@ class Engine:
                 text=result.text,
                 files=result.files,
                 exit_code=result.exit_code,
+                outcome=result.outcome,
             )
         )
 
@@ -226,7 +227,11 @@ def replay(run_dir: Path) -> ReplayState:
             state.dispatched.add(ev.node_id)
         elif isinstance(ev, ResultEvent):
             state.results[ev.node_id] = Result(
-                text=ev.text, files=ev.files, ok=ev.ok, exit_code=ev.exit_code
+                text=ev.text,
+                files=ev.files,
+                ok=ev.ok,
+                exit_code=ev.exit_code,
+                outcome=ev.outcome,
             )
         elif isinstance(ev, Integrated):
             state.integrated[ev.node_id] = ev.paths
