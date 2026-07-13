@@ -525,11 +525,12 @@ panel macro's first live exercise):
   dispatch(per-asset download-or-author) → combine(judge panel) → manifest lint`.
   **Success bar:** every graded-bad asset replaced, licenses receipted.
 
-Build order (D7/D8, bottom-up): **(1) PoC** — `do`+`inplace`, in-memory, one rig, prove
-the mind-steers loop on a toy task ← *this build*. (2) durability — journal file writes,
-resume-from-journal. (3) composition — `dispatch`/`combine`/`loop` + rails. (4) worktree
-hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup seam).
-(6) dashboard.
+Historical build order (D7/D8, bottom-up): (1) expression PoC; (2) durability;
+(3) composition + rails; (4) worktree hygiene; (5) target-local `.wildflows/`; (6)
+dashboard. **Current status:** the serial engine has fsynced journal replay, durable
+lease/intent/recovery transactions, and executable `do`/`inplace`/`seq`/serial-`dispatch`
+/command-`loop`. `combine`, general rails, real parallel dispatch, per-node worktrees,
+target-local run state, and the dashboard remain later steps.
 
 ---
 
@@ -1072,10 +1073,13 @@ than patching each row. Both are the transaction model of record — not a later
 61. **Reversal alias and portable case policy (B2/H5).** Intent validation re-stats every
     existing canonical target immediately before expected/pre-state classification. A
     regular file with `st_nlink != 1` is byte-captured and raises `WorkspaceFault` before
-    any overwrite or unlink. Each path also fsyncs `started=True` before its first write
-    and the intent publishes `reversed=True` after complete reversal; a started canonical
-    target that disappears before that marker fails closed because a hidden external alias
-    may retain attempt bytes. Initial planning uses `(st_dev, st_ino)` identity for
+    any overwrite or unlink. Each path fsyncs `started=True` before its first write and a
+    per-path `reversed=True` after restoration; absent-prestate targets stay linked until
+    the transaction's checked leak sweep, avoiding an unlink-before-progress crash gap.
+    The intent publishes its aggregate `reversed=True` after reversal/unstage. A started
+    canonical target that disappears before the recovery receipt still fails closed because
+    a hidden external alias may retain attempt bytes. Initial planning uses `(st_dev,
+    st_ino)` identity for
     existing targets and an
     NFC+casefold canonical key for all declarations. **Documented conservative deviation:**
     case-canonical declaration collisions are rejected on every filesystem, not only after

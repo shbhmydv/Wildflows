@@ -130,6 +130,9 @@ class IntentWrite(BaseModel):
     # Fsynced before this path's first write.  A started target that later disappears is
     # ambiguous (an external hard-link alias may retain attempt bytes) and fails closed.
     started: bool = False
+    # Fsynced after this path's reversal operation.  Absent pre-state targets remain in
+    # place for the transaction's checked leak sweep, avoiding an unlink→marker gap.
+    reversed: bool = False
 
 
 class InplaceIntent(BaseModel):
@@ -539,13 +542,15 @@ class WorkspaceEffects:
         if lease.baseline_manifest is not None:
             self._load_lease_baseline(lease.baseline_manifest, lease.baseline_digest)
         unexpected: list[str] = []
-        if intent is not None and not intent.reversed:
+        if intent is not None:
             self._validate_intent_targets(
                 intent, None if lease.preexisting_dirs is None else set(lease.preexisting_dirs)
             )
             unexpected = [
                 write.path for write in intent.writes
-                if not self._matches_expected(write) and not self._matches_prestate(write)
+                if not write.reversed
+                and not self._matches_expected(write)
+                and not self._matches_prestate(write)
             ]
 
         head = self._cleanup_head()
@@ -1345,17 +1350,22 @@ class WorkspaceEffects:
                     unexpected,
                 )
         for write in intent.writes:
+            if write.reversed:
+                continue
             target = self._work_path(write.path)
             if write.pre_kind == "file":
                 self._atomic_write(target, self._original_bytes(write), "inplace rollback")
             elif write.pre_kind == "absent":
-                self._remove_rollback_target(target, write.path)
+                # Leave the checked, singly-linked target for the lease leak sweep.  The
+                # per-path marker is durable first; every redo rechecks nlink if it remains.
+                pass
             elif write.pre_kind in ("dir", "other"):
                 if not self._matches_prestate(write):
                     raise WorkspaceFault(
                         f"legacy inplace intent cannot restore pre-state for {write.path}"
                     )
-        self._remove_created_inplace_dirs(intent)
+            write.reversed = True
+            self.write_intent(intent)
         if intent.writes:
             self._checked(
                 self.git(
@@ -1442,29 +1452,6 @@ class WorkspaceEffects:
                 "inplace reversal found post-intent hard-link aliases; refusing overwrite/unlink",
                 evidence,
             )
-
-    def _remove_created_inplace_dirs(self, intent: InplaceIntent) -> None:
-        for rel in sorted(intent.created_dirs, key=self._path_depth, reverse=True):
-            target = self._work_path(rel)
-            try:
-                target.rmdir()
-                self._fsync_dir(target.parent)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                # A created parent that is still nonempty contains an unexpected attempt
-                # or operator artifact. Capture the whole subtree before removing it.
-                if not target.is_dir() or target.is_symlink():
-                    raise WorkspaceFault(f"created inplace directory changed kind: {rel}")
-                self._capture_workspace(
-                    self.run_dir / "intent-reversal",
-                    f"{intent.epoch}-{intent.node_id}-{intent.attempt}-dir",
-                    "HEAD" if self._cleanup_head() is not None else self._empty_tree(),
-                    [rel],
-                )
-                self._remove_rollback_target(target, rel)
-            if os.path.lexists(target):
-                raise WorkspaceFault(f"created inplace directory remained after rollback: {rel}")
 
     def _original_bytes(self, write: IntentWrite) -> bytes:
         if write.original_b64 is not None:

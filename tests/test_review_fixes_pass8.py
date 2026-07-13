@@ -16,7 +16,7 @@ import pytest
 from wildflows.engine import Engine, replay
 from wildflows.expr import Do, Edit, Inplace, RigRef
 from wildflows.rig import RigRegistry, Result, ShellRig
-from wildflows.workspace import WorkspaceEffects, WorkspaceFault
+from wildflows.workspace import InplaceIntent, WorkspaceEffects, WorkspaceFault
 
 from tests.test_review_fixes import _CountingRig
 from tests.test_review_fixes_pass5 import _base_repo
@@ -132,6 +132,42 @@ def test_post_intent_hidden_hardlink_alias_fails_closed(tmp_path: Path) -> None:
     state = replay(run_dir)
     assert state.node((0, "n0")).workspace_unclean is True
     assert not state.epoch_closed(0)
+
+
+def test_inplace_reversal_path_progress_survives_recovery_crash(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    (workdir / "dest").mkdir()
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[
+        Edit(path="new/deep/file", content="ENGINE"),
+        Edit(path="dest", content="fails because dest is a directory"),
+    ])
+
+    def die_after_rollback() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        real_rollback = engine.ws.rollback_inplace
+
+        def rollback_then_die(
+            intent: InplaceIntent, preexisting_dirs: set[str] | None = None,
+            *, prevalidated: bool = False,
+        ) -> NoReturn:
+            real_rollback(intent, preexisting_dirs, prevalidated=prevalidated)
+            os._exit(0)
+
+        setattr(engine.ws, "rollback_inplace", rollback_then_die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_rollback) == 0
+    intent_path = next((run_dir / "intents").glob("*.json"))
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    assert intent["writes"][0]["reversed"] is True
+    assert intent["reversed"] is False
+
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert not (workdir / "new").exists()
+    assert not replay(run_dir).results[(0, "n0")].ok
+    assert replay(run_dir).epoch_closed(0)
 
 
 class _CommitThenSucceed:
