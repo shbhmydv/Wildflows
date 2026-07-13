@@ -1187,3 +1187,30 @@ than patching each row. Both are the transaction model of record — not a later
     a fresh `Journal.load`, which alone decides whether the uncertain tail is complete or
     torn and therefore which contiguous sequence comes next. M2's central append owner
     must replace a poisoned instance rather than reuse or retry through it.
+
+### Hand-15 calls (from the pass-11 correctness review) — VERIFY AND REAP
+
+69. **Index-independent predicate verification (hand-15).** Lease open byte-snapshots the
+    real repository index and hashes actual tracked worktree content through a fresh
+    temporary index seeded from `HEAD`; pre/post write-tree OIDs are compared without
+    consulting live-index hints. Verification always restores the exact index bytes.
+    Recovery captures paths from the temporary-tree delta, resets/restores content, restores
+    the exact index snapshot last, and verifies both proofs. `assume-unchanged` and
+    `skip-worktree` therefore cannot hide a predicate mutation or survive its recovery.
+70. **Predicate process barrier (hand-15).** Every command predicate has a positive timeout
+    and runs in a new session behind a session-leader supervisor. The effect command remains
+    gated until `(pid, pgid, /proc start-time)` is atomically written and fsynced under
+    `run_dir`. Normal completion and timeout SIGKILL the whole group before verification and
+    settle the record. Every lease recovery first loads the record, proves PID start-time
+    identity (never killing a recycled PID), SIGKILLs the group, and waits for termination.
+    The reaper is kill-only: it never captures, resets, restores, or otherwise mutates Git or
+    worktree state; those remain exclusively `recover_lease` phases.
+71. **Durable torn-tail repair (hand-15).** Any unterminated final journal record is uncertain
+    and discarded, even when the available bytes happen to parse as valid JSON. Before a
+    fresh append owner returns, `Journal.load` opens the file read/write, truncates to the
+    last newline-terminated record, and fsyncs the file. Malformed complete/middle records
+    still raise; append can no longer concatenate onto accepted torn bytes.
+72. **Create/load ownership split (hand-15).** `Journal(run_dir)` is creation-only and raises
+    typed `JournalExistsError` when `events.ndjson` is already nonempty. `Journal.load` is
+    the sole continuation path: it classifies/repairs the physical tail, replays projection
+    state, and returns the fresh append owner.
