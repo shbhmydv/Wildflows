@@ -300,6 +300,41 @@ A `RigRef(name, params)` in an expression names which rig and its config; the co
 resolves it through a **rig registry** at execution time. Rigs never touch integration
 git; they only write inside their `workdir`.
 
+### The script contract — THE integration seam (grindstone-compatible by construction)
+
+`ShellRig` proves the shell-out shape; the production seam is **`ScriptRig`**, which
+drives a configured executable through the exact contract grindstone's rigs already
+use, so a real script (`models/picodex/senior_request.sh`, `planner_request.sh`, the
+`codex`/`claude`/local-Qwen rigs) plugs in with no engine change:
+
+```
+<script> --worktree <dir> --prompt <file> --log-dir <dir> \
+         --handle-out <file> --timeout <secs>
+```
+
+The script grinds agentically **inside the worktree**, commits its own work (the
+deterministic gate is the committed diff, never a handoff file), propagates its exit
+code, and prints rate/session-limit signatures on stderr. `ScriptRig` classifies that
+exit + stderr into a typed **`Result.outcome`** — `ok` / `failed` / `busy`, where
+`busy` is a rate/session/quota wall that must NOT read as a task failure. Contract
+notes that are load-bearing:
+
+- **`--prompt` is a FILE PATH, not inline argv.** The real rigs feed the prompt to the
+  CLI on stdin from that file to dodge the kernel's `MAX_ARG_STRLEN` (~128 KB) wall on
+  large prior-failure context. `ScriptRig` writes the prompt to
+  `<log_dir>/<dispatch>/prompt.txt` and passes its path.
+- **Per-dispatch log dir** is `<log_dir>/<workdir.name>/`, populated with the captured
+  `agent.stdout.log` / `agent.stderr.log` (+ the prompt) so the dir is non-empty even
+  when the script writes nothing. In the real worktree seam (step 4) a `do` runs in a
+  worktree named for its node_id, so the dispatch key IS the node_id by construction.
+- **`busy` is journalled as `ResultEvent(ok=False, outcome="busy")`** — distinct from a
+  failure so a later ladder step can back off + re-enter. No backoff/retry policy is
+  built in this hand.
+- Real scripts live OUTSIDE this repo; `examples/rigs.yaml` ships the `script` rig
+  commented out. Rigs are declared in an owner-facing **`rigs.yaml`** (YAML by policy),
+  a Pydantic discriminated union (`echo|shell|script`) loaded by
+  `load_rigs(path) -> RigRegistry` — unknown kinds are rejected at load.
+
 ---
 
 ## 9. The BUILD + AUDIT run macro (SETTLED §2)
@@ -387,3 +422,25 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
    leaves untracked iteration artifacts in the workdir; the old whole-tree check would
    force a commit with nothing staged (git error). Staged-only is the correct
    "did the declared edits change anything" test and keeps `inplace` re-apply idempotent.
+
+### Hand-3 calls pending review
+
+9. **`Result.outcome` discriminator (`ok`/`failed`/`busy`)** added alongside `ok`,
+   mirrored on `ResultEvent` (defaults to `"ok"` so pre-existing journal lines parse
+   unchanged). A `busy` (rate/session/quota) wall journals `ok=False, outcome="busy"`
+   so the engine does not confuse a transport wall with a task failure — the minimal
+   representation until a real backoff/re-entry ladder step is built.
+10. **`ScriptRig` per-dispatch log dir keyed by `workdir.name`**, not an explicit
+    node_id param — the `Rig.run(prompt, workdir)` protocol carries no node_id, and the
+    real worktree seam (step 4) names each `do`'s worktree for its node_id, so the key
+    is node_id by construction. Revisit if step 4 names worktrees differently.
+11. **Timeout is represented as `outcome="failed"` + a `[timeout]` text marker**, not a
+    fourth outcome — the caller treats a timeout like any other non-busy failure.
+    `ScriptRig` kills the direct child only (`subprocess` timeout); reaping the process
+    GROUP is a step-4 (worktree hygiene) concern.
+12. **`ScriptRig` mirrors `senior_request.sh`'s arg contract** (`--worktree`/`--log-dir`
+    /`--handle-out`), NOT `planner_request.sh`'s (`--repo`/`--workdir`/`--out`). The two
+    reference scripts diverge: the planner adds `--out` (a decision.json fallback read
+    channel) and `--purpose`, and renames `--worktree`→`--workdir`, `--log-dir`→derived.
+    The executor/worker contract (senior) is the general seam; a planner rig is a
+    later, distinct role with its own extra flags.
