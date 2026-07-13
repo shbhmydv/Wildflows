@@ -501,6 +501,11 @@ class Engine:
                 raise ValueError(f"resolved target collision: {edit.path!r} -> {canonical!r}")
             resolved_paths.add(canonical)
             if resolved.is_file():
+                if resolved.stat().st_nlink != 1:
+                    raise ValueError(
+                        f"inplace target has hard-link aliases and cannot be canonicalized: "
+                        f"{edit.path}"
+                    )
                 original_b64 = base64.b64encode(resolved.read_bytes()).decode("ascii")
                 pre_kind: Literal["file", "dir", "absent"] = "file"
             elif resolved.is_dir():

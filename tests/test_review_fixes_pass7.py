@@ -216,6 +216,31 @@ def test_inplace_internal_symlink_alias_never_leaves_unreceipted_target_effect(
     ).stdout == "MUTATED"
 
 
+def test_inplace_rejects_internal_and_external_hard_link_aliases(tmp_path: Path) -> None:
+    for external in (False, True):
+        case = tmp_path / str(external)
+        case.mkdir()
+        workdir = case / "work"
+        _base_repo(workdir)
+        source = case / "outside" if external else workdir / "base.txt"
+        if external:
+            source.write_text("OUTSIDE", encoding="utf-8")
+        os.link(source, workdir / "alias")
+        run_dir = case / "run"
+
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(
+            Inplace(edits=[Edit(path="alias", content="MUTATED")]), 0
+        )
+
+        result = replay(run_dir).results[(0, "n0")]
+        assert not result.ok and "hard-link aliases" in result.text
+        assert source.read_text() == ("OUTSIDE" if external else "base")
+        assert subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=workdir,
+            check=True, capture_output=True, text=True,
+        ).stdout == ""
+
+
 def test_failed_inplace_removes_parent_directories_created_by_its_writes(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)
@@ -306,6 +331,46 @@ def test_unremovable_leak_marks_workspace_unclean_and_halts_resume(tmp_path: Pat
     Engine(run_dir, workdir, RigRegistry({"shell": rig})).run_epoch(tree, 0)
     assert not (workdir / "locked").exists()
     assert replay(run_dir).epoch_closed(0)
+
+
+def test_preexisting_untracked_bytes_and_empty_dirs_restore_on_failure_and_death(
+    tmp_path: Path,
+) -> None:
+    for mode in ("failed", "dead"):
+        case = tmp_path / mode
+        case.mkdir()
+        workdir = case / "work"
+        _base_repo(workdir)
+        (workdir / "user.bin").write_bytes(b"\xff\x00ORIGINAL")
+        (workdir / "keep-empty").mkdir()
+        run_dir = case / "run"
+        tree = Do(task=mode, rig=RigRef(name="rig"))
+
+        if mode == "dead":
+            class OverwriteAndDie:
+                name = "rig"
+
+                def run(self, prompt: str, workdir_arg: Path) -> Result:
+                    wd = Path(workdir_arg)
+                    (wd / "user.bin").write_bytes(b"MUTATED")
+                    (wd / "keep-empty").rmdir()
+                    os._exit(0)
+
+            assert _fork(lambda: Engine(
+                run_dir, workdir, RigRegistry({"rig": OverwriteAndDie()})
+            ).run_epoch(tree, 0)) == 0
+            Engine(run_dir, workdir, RigRegistry({"rig": _CountingRig("rerun")})).run_epoch(
+                tree, 0
+            )
+        else:
+            command = "printf MUTATED > user.bin; rmdir keep-empty; exit 7"
+            Engine(run_dir, workdir, RigRegistry({"rig": ShellRig(command, 30)})).run_epoch(
+                tree, 0
+            )
+
+        assert (workdir / "user.bin").read_bytes() == b"\xff\x00ORIGINAL"
+        assert (workdir / "keep-empty").is_dir()
+        assert b"\xff\x00ORIGINAL" in _capture_bytes(run_dir, "user.bin")
 
 
 def test_failed_and_dead_rig_empty_directories_are_captured_and_removed(tmp_path: Path) -> None:
@@ -613,6 +678,31 @@ def test_lease_record_publication_is_atomic_across_process_death(tmp_path: Path)
     Engine(run_dir, workdir, RigRegistry({"c": rig})).run_epoch(tree, 0)
     assert rig.calls == 1
     assert replay(run_dir).epoch_closed(0)
+
+
+def test_run_dir_inside_worktree_is_never_staged_or_committed(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = workdir / ".wildflows" / "run"
+    tree = Do(task="work", rig=RigRef(name="c"))
+
+    first = _CountingRig("first")
+    Engine(run_dir, workdir, RigRegistry({"c": first})).run_epoch(tree, 0)
+    assert first.calls == 1
+    tracked_run = subprocess.run(
+        ["git", "ls-files", "--", ".wildflows/run"], cwd=workdir,
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert tracked_run == ""
+    assert subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=workdir,
+        check=True, capture_output=True, text=True,
+    ).stdout == ""
+
+    second = _CountingRig("second")
+    Engine(run_dir, workdir, RigRegistry({"c": second})).run_epoch(tree, 1)
+    assert second.calls == 1
+    assert replay(run_dir).epoch_closed(1)
 
 
 def test_quarantine_ref_slug_is_valid_for_all_git_forbidden_run_id_chars(

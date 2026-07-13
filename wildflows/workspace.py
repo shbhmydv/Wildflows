@@ -19,9 +19,10 @@ Two consolidation principles (hand-10) live here:
   retries cleanup rather than closing an unsafe epoch.
 
 - PRINCIPLE B — DURABLE TRANSACTION INTENTS. Lease/intent records are atomically published
-  and directory-fsynced BEFORE the first mutation. Inplace records canonical targets,
-  exact original bytes, and expected written bytes; restart captures any divergent live
-  value before reversal. Corrupt present records fail closed and never trigger mutation.
+  and directory-fsynced BEFORE the first mutation. A lease byte-captures pre-existing
+  untracked/ignored baselines; inplace records canonical targets, exact original bytes,
+  expected writes, and created parents. Restart captures divergence before restoration.
+  Corrupt present records fail closed and never trigger mutation.
 
 Per-node worktree leases are a later step; the shared-workdir policy (quarantine + reset
 on failure) lives here and is superseded by discard-the-worktree once worktrees land.
@@ -75,7 +76,8 @@ class LeaseRecord(BaseModel):
 
     Restart cleanup loads THIS (never process memory) to quarantine + reset a dead attempt
     idempotently: `pre_head` is the reset target and quarantine range anchor; `preexisting`
-    and `preexisting_dirs` are the snapshots the sweep must leave in place.
+    and `preexisting_dirs` are the snapshots the sweep must restore/leave in place;
+    `baseline_manifest` points at their exact byte capture.
     """
 
     epoch: int
@@ -87,6 +89,8 @@ class LeaseRecord(BaseModel):
     # records fail closed rather than guessing which empty directories pre-existed.
     preexisting_dirs: list[str] | None = None
     ts: float
+    baseline_manifest: str | None = None
+    baseline_digest: str | None = None
     integrity: str | None = None
 
 
@@ -140,8 +144,9 @@ class Lease:
     `pre_head` anchors rig-authored-commit discovery (`pre..post`), the reset target on
     resume/failure, and the receipt reconstruction range. `preexisting` is the set of
     untracked+ignored paths present at lease open — cleanup removes ONLY paths NOT in this
-    set; `preexisting_dirs` likewise protects empty/user parent directories. `attempt`
-    keys durable records and capture groups; quarantine refs additionally include each
+    set; `preexisting_dirs` likewise protects empty/user parent directories, and the
+    baseline manifest restores overwritten/deleted untracked bytes. `attempt` keys durable
+    records and capture groups; quarantine refs additionally include each
     observed tip SHA so cleanup redos never clobber prior history.
     """
 
@@ -150,6 +155,8 @@ class Lease:
     attempt: int = 0
     preexisting: frozenset[str] = frozenset()
     preexisting_dirs: frozenset[str] = frozenset()
+    baseline_manifest: str | None = None
+    baseline_digest: str | None = None
 
 
 @dataclass
@@ -199,6 +206,7 @@ class WorkspaceEffects:
             preexisting=frozenset(self._untracked_ignored_paths()),
             preexisting_dirs=frozenset(self._workspace_dirs()),
         )
+        self._capture_lease_baseline(lease)
         self._write_lease_record(lease)
         return lease
 
@@ -284,9 +292,32 @@ class WorkspaceEffects:
             epoch=epoch, node_id=node_id, attempt=lease.attempt,
             pre_head=lease.pre_head, preexisting=sorted(lease.preexisting),
             preexisting_dirs=sorted(lease.preexisting_dirs), ts=time.time(),
+            baseline_manifest=lease.baseline_manifest,
+            baseline_digest=lease.baseline_digest,
         )
         record.integrity = self._record_integrity(record)
         return record
+
+    def _capture_lease_baseline(self, lease: Lease) -> None:
+        if not lease.preexisting:
+            return
+        epoch, node_id = lease.node_key
+        base = "HEAD" if lease.pre_head is not None else _EMPTY_TREE
+        index = self._capture_workspace(
+            self.run_dir / "lease-baselines",
+            f"{epoch}-{node_id}-{lease.attempt}",
+            base,
+            sorted(lease.preexisting),
+        )
+        if index is None:
+            raise WorkspaceFault("preexisting lease paths had no recoverable baseline")
+        manifest = index.with_suffix(".capture") / "manifest.json"
+        try:
+            raw = manifest.read_bytes()
+            lease.baseline_manifest = manifest.relative_to(self.run_dir).as_posix()
+        except (OSError, ValueError) as exc:
+            raise WorkspaceFault(f"cannot index lease baseline {manifest}: {exc}") from exc
+        lease.baseline_digest = hashlib.sha256(raw).hexdigest()
 
     def load_lease_record(self, epoch: int, node_id: str, attempt: int) -> LeaseRecord | None:
         path = self._record_path("leases", epoch, node_id, attempt)
@@ -424,6 +455,10 @@ class WorkspaceEffects:
             self._attempt_leaks(rec.preexisting, rec.preexisting_dirs),
             None if rec.preexisting_dirs is None else set(rec.preexisting_dirs),
         )
+        self._restore_preexisting(
+            rec.preexisting, rec.preexisting_dirs,
+            rec.baseline_manifest, rec.baseline_digest,
+        )
         return diff_path
 
     def quarantine_from_journal(
@@ -444,11 +479,12 @@ class WorkspaceEffects:
         head = self._cleanup_head()
         base = "HEAD" if head is not None else _EMPTY_TREE
         leaks = self._attempt_leaks(rec.preexisting, rec.preexisting_dirs)
+        capture_paths = sorted(set(leaks) | set(rec.preexisting))
         return self._capture_workspace(
             self.run_dir / "quarantine",
             f"{rec.epoch}-{rec.node_id}-{rec.attempt}",
             base,
-            leaks,
+            capture_paths,
         )
 
     def _capture_workspace(
@@ -598,6 +634,101 @@ class WorkspaceEffects:
             )
         return f"{header}\n{body}"
 
+    def _load_lease_baseline(
+        self, manifest_rel: str | None, digest: str | None
+    ) -> tuple[Path, CaptureManifest] | None:
+        if manifest_rel is None:
+            if digest is not None:
+                raise WorkspaceFault("lease baseline digest has no manifest")
+            return None
+        rel = Path(manifest_rel)
+        if rel.is_absolute() or ".." in rel.parts:
+            raise WorkspaceFault(f"lease baseline escapes run directory: {manifest_rel}")
+        path = self.run_dir / rel
+        try:
+            if path.resolve().parent.parent != (self.run_dir / "lease-baselines").resolve():
+                raise WorkspaceFault(f"lease baseline has invalid location: {manifest_rel}")
+            raw = path.read_bytes()
+            if digest is None or not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest):
+                raise WorkspaceFault(f"lease baseline integrity mismatch: {path}")
+            manifest = CaptureManifest.model_validate_json(raw)
+        except WorkspaceFault:
+            raise
+        except (OSError, ValidationError) as exc:
+            raise WorkspaceFault(f"lease baseline is unreadable or corrupt: {path}: {exc}") from exc
+        return path.parent, manifest
+
+    def _restore_preexisting(
+        self,
+        preexisting: list[str],
+        preexisting_dirs: list[str] | None,
+        manifest_rel: str | None,
+        digest: str | None,
+    ) -> None:
+        loaded = self._load_lease_baseline(manifest_rel, digest)
+        if preexisting and loaded is None:
+            return  # conservative no-record journal fallback: current paths were untouched
+        capture_dir: Path | None = None
+        manifest = CaptureManifest(entries=[])
+        if loaded is not None:
+            capture_dir, manifest = loaded
+            for rel in sorted(set(preexisting), key=lambda p: len(Path(p).parts)):
+                target = self._contained_record_target(rel, "preexisting path")
+                if os.path.lexists(target):
+                    self._remove_rollback_target(target, rel)
+        if preexisting_dirs is not None:
+            for rel in sorted(set(preexisting_dirs), key=lambda p: len(Path(p).parts)):
+                target = self._contained_record_target(rel, "preexisting directory")
+                if os.path.lexists(target) and (not target.is_dir() or target.is_symlink()):
+                    self._remove_rollback_target(target, rel)
+                try:
+                    target.mkdir(parents=True, exist_ok=True)
+                    self._fsync_dir(target.parent)
+                except OSError as exc:
+                    raise WorkspaceFault(f"cannot restore preexisting directory {rel}: {exc}") from exc
+        if capture_dir is None:
+            return
+        for entry in sorted(
+            manifest.entries,
+            key=lambda item: (0 if item.kind == "directory" else 1, len(Path(item.path).parts)),
+        ):
+            target = self._contained_record_target(entry.path, "baseline entry")
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if entry.kind == "directory":
+                    target.mkdir(exist_ok=True)
+                elif entry.kind == "file":
+                    if entry.blob is None or entry.sha256 is None or entry.size is None:
+                        raise WorkspaceFault(f"incomplete baseline file entry: {entry.path}")
+                    blob = capture_dir / entry.blob
+                    data = blob.read_bytes()
+                    if len(data) != entry.size or not hmac.compare_digest(
+                        hashlib.sha256(data).hexdigest(), entry.sha256
+                    ):
+                        raise WorkspaceFault(f"baseline blob integrity mismatch: {entry.path}")
+                    self._atomic_write(target, data, "lease baseline restore")
+                elif entry.kind == "symlink":
+                    if entry.link_target is None:
+                        raise WorkspaceFault(f"incomplete baseline symlink entry: {entry.path}")
+                    os.symlink(entry.link_target, target)
+                    self._fsync_dir(target.parent)
+                elif entry.kind != "absent":
+                    raise WorkspaceFault(f"unknown baseline entry kind: {entry.kind}")
+            except WorkspaceFault:
+                raise
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot restore lease baseline {entry.path}: {exc}") from exc
+
+    def _contained_record_target(self, rel: str, what: str) -> Path:
+        lexical = Path(rel)
+        root = self.workdir.resolve()
+        if not rel or lexical.is_absolute() or ".." in lexical.parts:
+            raise WorkspaceFault(f"invalid {what}: {rel!r}")
+        target = root / lexical
+        if not target.is_relative_to(root):
+            raise WorkspaceFault(f"{what} escapes workdir: {rel!r}")
+        return target
+
     def _checked(
         self, proc: subprocess.CompletedProcess[str], what: str, diff_path: Path | None = None
     ) -> None:
@@ -651,7 +782,8 @@ class WorkspaceEffects:
             list(lease.preexisting), list(lease.preexisting_dirs)
         )
         diff_path = self._capture_workspace(
-            self.run_dir / "failed-diffs", Path(diff_name).stem, base, leaks
+            self.run_dir / "failed-diffs", Path(diff_name).stem, base,
+            sorted(set(leaks) | set(lease.preexisting)),
         )
         if head is not None and head != pre:
             epoch, node_id = lease.node_key
@@ -684,6 +816,10 @@ class WorkspaceEffects:
         self._remove_leaks(
             self._attempt_leaks(list(lease.preexisting), list(lease.preexisting_dirs)),
             set(lease.preexisting_dirs),
+        )
+        self._restore_preexisting(
+            list(lease.preexisting), list(lease.preexisting_dirs),
+            lease.baseline_manifest, lease.baseline_digest,
         )
         return diff_path
 
@@ -1036,7 +1172,16 @@ class WorkspaceEffects:
 
     def _commit_all(self, message: str) -> Integration:
         """Stage + commit ALL worktree changes (a `do`'s dirty remainder)."""
-        add = self.git("add", "-A", "--", ".")
+        pathspecs = ["."]
+        work = Path(os.path.abspath(self.workdir))
+        run = Path(os.path.abspath(self.run_dir))
+        if run.is_relative_to(work):
+            rel = run.relative_to(work).as_posix()
+            unstage_run = self.git("reset", "-q", "--", rel)
+            if unstage_run.returncode != 0:
+                return Integration("failed", stderr=unstage_run.stderr)
+            pathspecs.extend([f":(exclude){rel}", f":(exclude){rel}/**"])
+        add = self.git("add", "-A", "--", *pathspecs)
         if add.returncode != 0:
             return Integration("failed", stderr=add.stderr)
         if self.git("diff", "--cached", "--quiet").returncode == 0:

@@ -959,8 +959,10 @@ than patching each row. Both are the transaction model of record — not a later
     write, rollback/unstage, staging, commit, result files, and receipt paths all use that
     target. Two declarations resolving to the same target are rejected before the first
     write. Internal symlinks therefore edit and receipt their resolved tracked target;
-    escapes/gitdir aliases remain rejected. Modern intents preserve original bytes as
-    base64 and the exact UTF-8 bytes the attempt expected to write.
+    escapes/gitdir aliases remain rejected. Multiply-linked regular files are rejected:
+    inode aliases (including outside-workdir hard links) have no sound single pathname to
+    stage/receipt. Modern intents preserve original bytes as base64 and the exact UTF-8
+    bytes the attempt expected to write.
 
 51. **Append-only quarantine histories (hand-11).** A quarantine ref is immutable per
     observed tip: its name includes the full tip SHA and creation uses compare-and-create.
@@ -974,8 +976,8 @@ than patching each row. Both are the transaction model of record — not a later
     enumeration, directory traversal, byte reads, capture publication, unlink/rmtree, and
     Git reset/ref operations are checked. Every removal has an `lexists` absence
     postcondition. The lease additionally snapshots pre-existing directories, allowing
-    attempt-created empty directory roots to be captured/removed and new empty parents to
-    be pruned without deleting a user's pre-existing empty directory. Any incomplete Git
+    attempt-created empty directory roots to be captured/removed and pre-existing empty
+    directories to be recreated if an attempt deletes them. Any incomplete Git
     status warning or filesystem failure raises `WorkspaceFault` and enters decision 49's
     persistent halt.
 
@@ -983,8 +985,11 @@ than patching each row. Both are the transaction model of record — not a later
     sweep, tracked current files, untracked/ignored files, symlinks, empty directories,
     and recursively enumerated nested-repository contents are copied exactly into a unique
     `.capture/` directory. `manifest.json` records path/kind/size/SHA-256/blob; raw blobs,
-    the manifest, and the human-readable binary Git patch/index are fsynced. Retry suffixes
-    make captures append-only. A hash summary is evidence, never the only retained copy.
+    the manifest, and the human-readable binary Git patch/index are fsynced. Lease open
+    also captures exact baseline bytes for pre-existing untracked/ignored objects; cleanup
+    captures their current value, then restores the baseline, so overwrite/deletion cannot
+    be absorbed by a retry. Retry suffixes make captures append-only. A hash summary is
+    evidence, never the only retained copy.
 
 54. **Divergent intent reversal (hand-11).** Rollback first compares each canonical live
     target with BOTH the expected attempt bytes and the recorded pre-state. A third state
@@ -1007,4 +1012,7 @@ than patching each row. Both are the transaction model of record — not a later
     `os._exit` at the record-publication, inplace-write, rig-death, quarantine-reset, and
     cleanup-before-redispatch windows. No deviation from the pass-7 intended directions:
     canonical symlink support was chosen over blanket rejection because the resolved path
-    can be used consistently by every transaction operation in the serial-M1 model.
+    can be used consistently by every transaction operation in the serial-M1 model;
+    hard-linked targets are rejected because pathname resolution cannot canonicalize an
+    inode alias. A run_dir inside the worktree is excluded and explicitly unstaged during
+    do integration, so journal/record files can never enter an effect commit.
