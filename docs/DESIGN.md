@@ -514,3 +514,73 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     (never an escape after `dispatched`). A `cmd` `Until` without a `cmd` is rejected at
     admission (SF5). `RigRef.params` is admitted but NOT yet consumed (reserved for the
     planner-config seam, §8) — narrowed rather than implemented this hand (SF2).
+
+### Hand-5 calls (from pass-2 external review) pending review
+
+19. **Resume identity (NB1).** `run_epoch` on an already-OPEN epoch canonically compares
+    the supplied tree (post-dealias, post-id-assignment `model_dump`) against the
+    journalled `boundary(opened).expr`; a mismatch RAISES before any execution. The
+    planner re-shapes at epoch boundaries, never mid-epoch, so a divergent resumed tree
+    is a caller error, not a shape the executor should silently run under an open epoch.
+
+20. **Dealias on admission (NB2).** `run_epoch` re-parses the supplied tree through the
+    wire model (`parse_expr(tree.model_dump())`) before id assignment, so two positions
+    that shared one Python instance become distinct objects and `assign_node_ids` can
+    never collapse two declared nodes onto one journal key. **Deviation from the owner
+    triage:** the triage prescribed `model_copy(deep=True)`, but Python's `deepcopy`
+    preserves shared references (memoized), so an aliased child stays aliased and the
+    collapse persists — verified empirically. The model round-trip genuinely dealiases
+    (serialization emits each occurrence; deserialization builds fresh objects) and also
+    deep-copies, so the caller's tree is never mutated. The reviewer's regression rides
+    on top and passes.
+
+21. **`do` reconciliation rule (NB4).** Every commit the CORE makes carries a
+    machine-parsable marker `wf:<run_id>:<epoch>:<node_id>` in its message. On resume,
+    before re-running an in-flight `do`/`inplace`, the core scans `git log` for that
+    marker; if a matching commit exists (the commit-then-crash window: git committed but
+    the journal write did not), it retro-journals `result`+`integrated` FROM that commit
+    instead of re-executing — no duplicated or lost effect. Reconciliation runs only for
+    TOP-LEVEL nodes (resume floor `-1`); a loop body's per-iteration commits reuse the
+    same marker, so loop resume is owned by the loop fold (NB3/B4), not the marker scan.
+
+22. **Rig-commit recording + shared-workdir reset policy (NB5).** After every `do` the
+    core snapshots pre-run HEAD. On SUCCESS, commits the rig itself made (`pre..HEAD` —
+    the senior/script contract legitimately commits its own work) are journalled as
+    `integrated` attributed to that node; the core then integrates any remaining dirty
+    state. On FAILURE (non-zero rig or exception), the dirty working-tree diff is
+    captured verbatim to `<run_dir>/failed-diffs/e<epoch>-<node_id>.diff` (the path rides
+    in the failed `result.text`) and the workdir is RESET to HEAD, so no later node can
+    stage and claim the leak as its own integration. This is a **PoC shared-workdir
+    policy**, superseded by per-node worktrees at ladder step 4.
+
+23. **`ctx` file containment (NB6).** A `CtxRef(kind="file")` is subject to the same
+    containment guard as `inplace`: the resolved path must be relative to the workdir and
+    must not touch `.git`. An absolute path, `../` escape, or in-worktree symlink pointing
+    outside is a FAILED result at exec time (admission cannot resolve symlinks), never a
+    host-file read transmitted into a rig prompt.
+
+24. **`loop_iter` carries the body artifact (NB3/SF6).** `loop_iter` gains additive
+    `body_text`/`body_files`/`body_exit_code` fields. On resume, a journalled
+    `converged=True` loop_iter (or a final capped iteration) short-circuits: the loop
+    result is reconstructed from the journalled last-body facts with NO body re-run.
+    Pre-existing loop_iter lines default these fields to empty, matching old behavior.
+
+25. **Non-empty no-diff `inplace` is a durable no-op (SHOULD-FIX 4).** An `inplace` whose
+    edits produce no git diff (content already identical) journals a durable no-op —
+    `result(ok=True, files=[])`, no `integrated` — so `_is_durable` accepts it on its
+    result alone and resume never re-applies it. This is the representation DESIGN §5's
+    "empty/no-diff inplace is a durable no-op" now points at for the non-empty-edits case.
+
+26. **Robustness fixes.** Torn-tail load reads RAW BYTES and drops the final record only
+    when it lacks a terminating newline AND fails to parse (a newline-terminated invalid
+    line is corruption → raise; a mid-UTF-8 unterminated tail recovers) (SHOULD-FIX 1/B2).
+    An unknown rig name is a journalled failed result, not a crash (SHOULD-FIX 2). A
+    `ShellRig` timeout kills the process GROUP (`start_new_session` + `killpg`) so
+    backgrounded children are reaped (SHOULD-FIX 3). A blank/whitespace `Until.cmd` is
+    rejected at admission (SHOULD-FIX 5). Core integration parses changed paths NUL-
+    delimited (`-z`) so whitespace filenames stay one path (SHOULD-FIX 6). A `ShellRig`
+    non-zero exit sets `outcome="failed"` (SHOULD-FIX 7).
+
+27. **N2 (single-writer journal) remains DEFERRED to ladder step 3** (§6) — documented,
+    not implemented this hand: the current fixes harden the SERIAL restart/effect
+    invariants that step 3's parallel dispatch would otherwise build on unsoundly.

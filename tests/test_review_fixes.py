@@ -139,6 +139,11 @@ def test_engine_restart_loads_journal_contiguously_and_resumes_only_inflight_nod
                 cut = i + 1
                 break
     (run2 / "events.ndjson").write_text("\n".join(lines[:cut]) + "\n")
+    # The `do` also committed in git; to simulate a crash BEFORE that commit (a genuine
+    # in-flight node, not the NB4 commit-then-crash window which has its own test), drop
+    # the do's commit so only the completed inplace commit remains.
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=wd2, check=True,
+                   capture_output=True)
 
     Engine(run_dir=run2, workdir=wd2, registry=reg2).run_epoch(tree, epoch=0)
     assert rig2.calls == 2  # the in-flight `do` re-ran
