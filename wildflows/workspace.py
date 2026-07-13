@@ -320,6 +320,14 @@ class WorkspaceEffects:
             )
         return bool(proc.stdout)
 
+    def verify_lease_unchanged(self, lease: Lease) -> None:
+        """Require the standard recovery postconditions without first mutating state."""
+        epoch, node_id = lease.node_key
+        record = self.load_lease_record(epoch, node_id, lease.attempt)
+        if record is None:
+            raise WorkspaceFault("predicate lease record disappeared before verification")
+        self._verify_recovery_postconditions(record, None)
+
     # -- durable transaction intents (PRINCIPLE B) ---------------------------
 
     def _record_path(self, kind: str, epoch: int, node_id: str, attempt: int) -> Path:
@@ -1885,7 +1893,7 @@ class WorkspaceEffects:
             return None
 
     def run_predicate(self, cmd: str) -> bool:
-        """Run a loop `until` predicate in the workdir; exit 0 means converged."""
+        """Run leased loop `until`; the caller verifies the read-only postcondition."""
         return subprocess.run(cmd, shell=True, cwd=self.workdir).returncode == 0
 
 

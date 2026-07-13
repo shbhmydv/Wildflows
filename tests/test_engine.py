@@ -9,7 +9,7 @@ import pytest
 from wildflows.admission import AdmissionError
 from wildflows.engine import Engine, replay
 from wildflows.expr import Ask, Do, Edit, Inplace, Loop, RigRef, Seq, Until
-from wildflows.rig import EchoRig, RigRegistry
+from wildflows.rig import EchoRig, RigRegistry, ShellRig
 
 
 def _git_init(workdir: Path) -> None:
@@ -22,7 +22,10 @@ def _engine(tmp_path: Path) -> Engine:
     workdir = tmp_path / "work"
     workdir.mkdir()
     _git_init(workdir)
-    reg = RigRegistry({"echo": EchoRig()})
+    counter = ShellRig(
+        "c=$(cat counter 2>/dev/null || echo 0); c=$((c+1)); echo $c > counter", 30
+    )
+    reg = RigRegistry({"echo": EchoRig(), "counter": counter})
     return Engine(run_dir=tmp_path / "run", workdir=workdir, registry=reg)
 
 
@@ -99,13 +102,13 @@ def _counter_loop_body() -> Seq:
     return Seq(
         children=[
             Inplace(edits=[Edit(path="marker.txt", content="body ran")]),
-            Do(task="tick", rig=RigRef(name="echo")),
+            Do(task="tick", rig=RigRef(name="counter")),
         ]
     )
 
 
-# Predicate maintains a counter file and converges once it reaches N.
-_CONVERGE_AT_3 = "c=$(cat counter 2>/dev/null || echo 0); c=$((c+1)); echo $c > counter; test $c -ge 3"
+# The body owns the counter effect; the predicate is a read-only, idempotent check.
+_CONVERGE_AT_3 = 'test "$(cat counter)" -ge 3'
 
 
 def test_loop_converges_and_journals_iterations(tmp_path: Path) -> None:

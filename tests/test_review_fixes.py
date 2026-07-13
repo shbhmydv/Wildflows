@@ -388,8 +388,8 @@ def test_loop_returns_the_last_integrated_body_result(tmp_path: Path) -> None:
     workdir.mkdir()
     _git_init(workdir)
     reg = RigRegistry({"build": _CountingRig("artifact")})
-    # Converge once the counter file reaches 2.
-    converge = "c=$(cat n 2>/dev/null||echo 0); c=$((c+1)); echo $c>n; test $c -ge 2"
+    # The body owns the counter effect; the predicate is a read-only check.
+    converge = 'test "$(cat artifact.txt)" -ge 2'
     loop = Loop(
         body=Do(task="build", rig=RigRef(name="build")),
         until=Until(kind="cmd", cmd=converge),

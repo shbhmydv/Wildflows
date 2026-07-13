@@ -44,7 +44,11 @@ from wildflows.workspace import (
     WorkspaceFault,
 )
 
-__all__ = ["Engine", "replay", "RunProjection"]
+__all__ = ["Engine", "PredicateEvaluationError", "replay", "RunProjection"]
+
+
+class PredicateEvaluationError(RuntimeError):
+    """A loop predicate could not prove its read-only postcondition."""
 
 
 class Engine:
@@ -162,6 +166,7 @@ class Engine:
 
         iterations = resume_from
         converged = False
+        predicate_floor = partial_floor
         for i in range(resume_from, node.cap):
             body_floor: Floor = partial_floor if i == resume_from else None
             outcome = self._exec(node.body, epoch, body_floor)
@@ -175,8 +180,8 @@ class Engine:
             if body_result is not None:
                 last_body = body_result
             body_seq = proj.node(body_key).result_seq
-            converged = self.ws.run_predicate(self._until_cmd(node.until))
-            self.journal.append(LoopIter(
+            converged = self._exec_predicate(node, epoch, predicate_floor)
+            predicate_floor = self.journal.append(LoopIter(
                 run_id=self.run_id, epoch=epoch, node_id=node.node_id,
                 iteration=i, commit=self.ws.head_commit(), converged=converged,
                 body_result_seq=body_seq,
@@ -208,6 +213,37 @@ class Engine:
     def _until_cmd(self, until: Until) -> str:
         assert until.cmd is not None  # admission guarantees a cmd predicate has a command
         return until.cmd
+
+    def _exec_predicate(self, node: Loop, epoch: int, floor: Floor) -> bool:
+        """Run `until` in a lease and accept only a byte-identical workspace."""
+        key = (epoch, f"{node.node_id}.until")
+        self._publish_pending_recovery(key)
+        action = self._proj.resume_action(key, floor)
+        if action == "recover" and self._recover_unclean(key):
+            action = "run"
+        if action == "done" or action == "recover":
+            result = self._proj.node(key).result
+            raise PredicateEvaluationError(
+                result.text if result is not None else "loop predicate evaluation failed"
+            )
+        attempt = self._proj.node(key).dispatch_count
+        lease = self._open_lease_or_fail(key, floor, attempt)
+        if lease is None:
+            raise PredicateEvaluationError("loop predicate lease was refused")
+        cmd = self._until_cmd(node.until)
+        self.journal.append(Dispatched(
+            run_id=self.run_id, epoch=epoch, node_id=key[1], cmd=cmd,
+            workdir=str(self.workdir), pre_head=lease.pre_head, lease_required=True,
+        ))
+        try:
+            converged = self.ws.run_predicate(cmd)
+            self.ws.verify_lease_unchanged(lease)
+            self.ws.settle_records(epoch, key[1], attempt)
+        except Exception as exc:
+            text = f"loop predicate failed read-only verification: {exc}"
+            self._finish_live_failure(key, Result(text=text, outcome="failed"))
+            raise PredicateEvaluationError(text) from exc
+        return converged
 
     def _recover_committed_attempt(self, key: tuple[int, str], floor: Floor) -> bool:
         """Two-boundary provenance recovery (hand-9, PROVENANCE-RANGE). The ONLY torn
