@@ -269,7 +269,13 @@ class WorkspaceEffects:
         try:
             if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
                 raise WorkspaceFault(f"lease record is not a regular file: {path}")
-            return LeaseRecord.model_validate_json(path.read_bytes())
+            record = LeaseRecord.model_validate_json(path.read_bytes())
+            if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
+                raise WorkspaceFault(
+                    f"lease record identity mismatch for {path}: "
+                    f"{record.epoch}/{record.node_id}/{record.attempt}"
+                )
+            return record
         except WorkspaceFault:
             raise
         except (OSError, ValidationError) as exc:
@@ -287,7 +293,13 @@ class WorkspaceEffects:
         try:
             if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
                 raise WorkspaceFault(f"intent record is not a regular file: {path}")
-            return InplaceIntent.model_validate_json(path.read_bytes())
+            record = InplaceIntent.model_validate_json(path.read_bytes())
+            if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
+                raise WorkspaceFault(
+                    f"intent record identity mismatch for {path}: "
+                    f"{record.epoch}/{record.node_id}/{record.attempt}"
+                )
+            return record
         except WorkspaceFault:
             raise
         except (OSError, ValidationError) as exc:
@@ -600,6 +612,7 @@ class WorkspaceEffects:
         discard-the-worktree.
         """
         pre = lease.pre_head
+        head = self._cleanup_head()
         # Working tree (incl any commit the failing rig made) vs the lease's PRE base —
         # the empty tree when the lease opened on an unborn repo — captures committed AND
         # staged/tracked leaks; this lease's untracked/ignored are captured separately.
@@ -608,6 +621,13 @@ class WorkspaceEffects:
         diff_path = self._capture_workspace(
             self.run_dir / "failed-diffs", Path(diff_name).stem, base, leaks
         )
+        if head is not None and head != pre:
+            epoch, node_id = lease.node_key
+            self._preserve_tip(LeaseRecord(
+                epoch=epoch, node_id=node_id, attempt=lease.attempt,
+                pre_head=pre, preexisting=sorted(lease.preexisting),
+                preexisting_dirs=sorted(lease.preexisting_dirs), ts=0.0,
+            ), head, diff_path)
 
         # EVERY revert git op is CHECKED (hand-10, PRINCIPLE A): if reset/update-ref fails,
         # the failing rig's live effect is NOT provably reverted, so raise WorkspaceFault
@@ -746,12 +766,12 @@ class WorkspaceEffects:
         directory as one top-level entry (e.g. `.wildflows/`), which is an ANCESTOR of a
         `run_dir=<workdir>/.wildflows/run`; sweeping it would delete the live journal.
         None of these may ever be captured or swept."""
-        try:
-            resolved = (self.workdir / rel).resolve()
-            run = self.run_dir.resolve()
-        except OSError:
-            return True  # fail conservative: never capture/sweep a path we cannot classify
-        return resolved == run or resolved.is_relative_to(run) or run.is_relative_to(resolved)
+        # Deliberately lexical/no-follow: an untracked symlink that merely POINTS at the
+        # run directory is an attempt-created effect and is safe to capture+unlink. Using
+        # resolve() here would exclude that alias and let a failed epoch close over it.
+        target = Path(os.path.abspath(self.workdir / rel))
+        run = Path(os.path.abspath(self.run_dir))
+        return target == run or target.is_relative_to(run) or run.is_relative_to(target)
 
     def reconstruct_receipt(
         self, pre_head: str | None, post_head: str | None

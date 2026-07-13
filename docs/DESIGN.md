@@ -888,8 +888,9 @@ than patching each row. Both are the transaction model of record — not a later
     content irrecoverably.
     - **Dead-attempt recovery (dispatched-only tail).** SUPERSEDES hand-9's `reset --hard
       HEAD` + sweep. The current tip (dead-attempt commits AND any post-crash operator
-      commit) is moved to a quarantine ref `refs/wildflows/quarantine/<run>-<epoch>-<node>-
-      <attempt>`, so all of it stays reachable; uncommitted dirt + non-preexisting untracked
+      commit) is moved to an encoded, append-only quarantine ref under
+      `refs/wildflows/quarantine/` (tip-SHA form specified by hand-11 entry 51), so all of
+      it stays reachable; uncommitted dirt + non-preexisting untracked
       leaks are captured to `run_dir/quarantine/`; the branch is reset to the DURABLE
       `pre_head` (from the lease record, §48); only NON-preexisting untracked leaks are then
       swept (the lease's per-file `preexisting` snapshot is left in place). This kills BOTH
@@ -962,9 +963,10 @@ than patching each row. Both are the transaction model of record — not a later
     base64 and the exact UTF-8 bytes the attempt expected to write.
 
 51. **Append-only quarantine histories (hand-11).** A quarantine ref is immutable per
-    observed tip: its name includes the full tip SHA and creation uses compare-and-create,
-    so a cleanup redo after an operator commit allocates a second ref and preserves both
-    histories. Run/node ref components use only `[A-Za-z0-9._-]`; lossy, empty, `.lock`,
+    observed tip: its name includes the full tip SHA and creation uses compare-and-create.
+    Dead attempts, operator tips observed on redo, and failed rigs that authored commits
+    are all preserved before reset; a redo allocates a second ref rather than moving the
+    first. Run/node ref components use only `[A-Za-z0-9._-]`; lossy, empty, `.lock`,
     dot-edge, and overlong forms receive a SHA-256 suffix. Thus arbitrary filesystem-valid
     run-directory names cannot make Git recovery fail solely through ref syntax.
 

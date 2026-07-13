@@ -75,6 +75,7 @@ class NodeProjection:
 
     dispatched: bool = False
     dispatch_count: int = 0  # number of Dispatched events = the next attempt's index
+    last_dispatch_seq: int = -1
     dispatched_pre_head: str | None = None  # provenance anchor (range START)
     result: Result | None = None
     result_seq: int = -1
@@ -94,6 +95,14 @@ class NodeProjection:
     loop_last_body: Result | None = None
     loop_converged: bool = False
     loop_iters: list[LoopIterRecord] = field(default_factory=list)
+
+    def has_unfinished_dispatch(self, floor: Floor) -> bool:
+        """Whether the latest in-scope dispatch has no result from that attempt."""
+        return (
+            floor is not None
+            and self.last_dispatch_seq > floor
+            and self.last_dispatch_seq > self.result_seq
+        )
 
 
 @dataclass
@@ -129,6 +138,7 @@ class RunProjection:
         if isinstance(ev, Dispatched):
             node.dispatched = True
             node.dispatch_count += 1
+            node.last_dispatch_seq = ev.seq
             node.dispatched_pre_head = ev.pre_head
         elif isinstance(ev, ResultEvent):
             node.result = Result(
@@ -172,16 +182,22 @@ class RunProjection:
         regardless of any artifact names the failed rig reported.
         """
         node = self.nodes.get(key)
-        if node is None or node.result is None:
+        if node is None:
             return "run"
-        if floor is None or node.result_seq <= floor:
+        if node.has_unfinished_dispatch(floor):
+            return "run"
+        if node.result is None or floor is None or node.result_seq <= floor:
             return "run"
         if node.workspace_unclean:
             return "recover"
         if node.recovery_action == "retry":
             return "run"
         if node.result.ok and node.result.files:
-            if node.receipt is None or node.integrated_seq <= floor:
+            if (
+                node.receipt is None
+                or node.integrated_seq <= floor
+                or node.integrated_seq <= node.result_seq
+            ):
                 return "run"
         return "done"
 

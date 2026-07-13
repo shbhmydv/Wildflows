@@ -245,6 +245,11 @@ class Engine:
         try:
             lease_record = self.ws.load_lease_record(epoch, node_id, attempt)
             intent = self.ws.load_intent(epoch, node_id, attempt)
+            if (
+                lease_record is not None
+                and lease_record.pre_head != node.dispatched_pre_head
+            ):
+                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
             if intent is not None:
                 self.ws.rollback_inplace(intent)
             if lease_record is not None:
@@ -330,7 +335,7 @@ class Engine:
         tracked/index worktree) records a durable failed result and returns None — the
         honest serial-M1 rule."""
         node = self._proj.node(key)
-        if floor == -1 and node.dispatched and node.result is None:
+        if node.has_unfinished_dispatch(floor):
             self._quarantine_dead_attempt(key, attempt)
         lease = self.ws.open_lease(key, attempt)
         if lease is None:
@@ -349,6 +354,11 @@ class Engine:
         dead = attempt - 1
         try:
             rec = self.ws.load_lease_record(epoch, node_id, dead)
+            if (
+                rec is not None
+                and rec.pre_head != self._proj.node(key).dispatched_pre_head
+            ):
+                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
             if rec is not None:
                 self.ws.quarantine_dead_attempt(rec)
             else:
@@ -393,7 +403,7 @@ class Engine:
             return ExecutionOutcome(key=key)
         attempt = self._proj.node(key).dispatch_count
         pnode = self._proj.node(key)
-        if floor == -1 and pnode.dispatched and pnode.result is None:
+        if pnode.has_unfinished_dispatch(floor):
             # Reverse a crashed inplace's DURABLE intent BEFORE anything else (PRINCIPLE B):
             # a partial write to a pre-existing (possibly untracked) file is restored from
             # the fsynced originals, which a `reset --hard` alone could not recover.
@@ -498,7 +508,12 @@ class Engine:
         try:
             # Validate both durable records before the first reversal write. A corrupt
             # lease must halt without letting a valid intent partially mutate the tree.
-            self.ws.load_lease_record(key[0], key[1], attempt)
+            lease_record = self.ws.load_lease_record(key[0], key[1], attempt)
+            if (
+                lease_record is not None
+                and lease_record.pre_head != self._proj.node(key).dispatched_pre_head
+            ):
+                raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
             intent = self.ws.load_intent(key[0], key[1], attempt)
             if intent is not None:
                 self.ws.rollback_inplace(intent)

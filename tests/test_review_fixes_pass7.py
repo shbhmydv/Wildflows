@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -85,8 +86,11 @@ def test_workspace_unclean_resume_remains_halted_until_cleanup_succeeds(
     # Releasing the cleanup obstruction lets resume re-run checked cleanup, explicitly
     # clear the halt, and only then close the failed attempt.
     (workdir / ".git" / "index.lock").unlink()
-    Engine(run_dir, workdir, RigRegistry({"shell": rig})).run_epoch(tree, 0)
+    should_not_rerun = _CountingRig("should-not-rerun")
+    Engine(run_dir, workdir, RigRegistry({"shell": should_not_rerun})).run_epoch(tree, 0)
     state = replay(run_dir)
+    assert should_not_rerun.calls == 0
+    assert state.node((0, "n0")).dispatch_count == 1
     assert (workdir / "base.txt").read_text() == "base"
     assert state.epoch_closed(0)
     assert state.node((0, "n0")).workspace_unclean is False
@@ -122,6 +126,71 @@ def test_retry_marker_survives_crash_between_cleanup_and_redispatch(tmp_path: Pa
     Engine(run_dir, workdir, RigRegistry({"die": rig})).run_epoch(tree, 0)
     assert rig.calls == 1
     assert replay(run_dir).epoch_closed(0)
+
+
+def test_post_retry_dispatched_only_do_is_quarantined_before_another_retry(
+    tmp_path: Path,
+) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Do(task="die", rig=RigRef(name="die"))
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": _DieAfterLeakRig("first-leak")})
+    ).run_epoch(tree, 0)) == 0
+    (workdir / ".git" / "index.lock").touch()
+    with pytest.raises(WorkspaceFault):
+        Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("blocked")})).run_epoch(tree, 0)
+    (workdir / ".git" / "index.lock").unlink()
+
+    class MutateTrackedAndDie:
+        name = "die"
+
+        def run(self, prompt: str, workdir_arg: Path) -> Result:
+            (Path(workdir_arg) / "base.txt").write_text("MUTATED", encoding="utf-8")
+            os._exit(0)
+
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": MutateTrackedAndDie()})
+    ).run_epoch(tree, 0)) == 0
+    assert (workdir / "base.txt").read_text() == "MUTATED"
+
+    rerun = _CountingRig("final")
+    Engine(run_dir, workdir, RigRegistry({"die": rerun})).run_epoch(tree, 0)
+    assert rerun.calls == 1
+    assert (workdir / "base.txt").read_text() == "base"
+    assert subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=workdir,
+        check=True, capture_output=True, text=True,
+    ).stdout == ""
+
+
+def test_post_retry_dispatched_only_inplace_reverses_latest_intent(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="base.txt", content="ENGINE")])
+
+    def die_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_write) == 0
+    (workdir / ".git" / "index.lock").touch()
+    with pytest.raises(WorkspaceFault):
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    (workdir / ".git" / "index.lock").unlink()
+
+    # Recovery clears the first halt, dispatches attempt 1, writes, and dies again.
+    assert _fork(die_after_write) == 0
+    assert (workdir / "base.txt").read_text() == "ENGINE"
+
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    state = replay(run_dir)
+    assert state.epoch_closed(0)
+    assert (workdir / "base.txt").read_text() == "ENGINE"
+    assert state.integrated[(0, "n0")] == ["base.txt"]
 
 
 def test_inplace_internal_symlink_alias_never_leaves_unreceipted_target_effect(
@@ -209,6 +278,8 @@ def test_unremovable_leak_marks_workspace_unclean_and_halts_resume(tmp_path: Pat
         with pytest.raises(WorkspaceFault):
             Engine(run_dir, workdir, RigRegistry({"shell": rig})).run_epoch(tree, 0)
         assert (workdir / "locked").exists()
+        halted = replay(run_dir).node((0, "n0"))
+        assert halted.workspace_unclean is True and halted.recovery_action == "fail"
         with pytest.raises(WorkspaceFault):
             Engine(run_dir, workdir, RigRegistry({"shell": rig})).run_epoch(tree, 0)
         assert not replay(run_dir).epoch_closed(0)
@@ -218,6 +289,57 @@ def test_unremovable_leak_marks_workspace_unclean_and_halts_resume(tmp_path: Pat
 
     Engine(run_dir, workdir, RigRegistry({"shell": rig})).run_epoch(tree, 0)
     assert not (workdir / "locked").exists()
+    assert replay(run_dir).epoch_closed(0)
+
+
+def test_failed_rig_net_zero_commits_remain_reachable_after_reset(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    rig = ShellRig(
+        "printf SECRET > secret.bin; git add secret.bin; git commit -qm add-secret; "
+        "git rm -q secret.bin; git commit -qm delete-secret; exit 7",
+        30,
+    )
+
+    Engine(run_dir, workdir, RigRegistry({"shell": rig})).run_epoch(
+        Do(task="fail", rig=RigRef(name="shell")), 0
+    )
+
+    recovered = False
+    for ref in _quarantine_refs(workdir):
+        commits = subprocess.run(
+            ["git", "rev-list", ref], cwd=workdir, check=True,
+            capture_output=True, text=True,
+        ).stdout.splitlines()
+        for commit in commits:
+            shown = subprocess.run(
+                ["git", "show", f"{commit}:secret.bin"], cwd=workdir,
+                capture_output=True,
+            )
+            recovered = recovered or shown.stdout == b"SECRET"
+    assert recovered
+    assert replay(run_dir).epoch_closed(0)
+
+
+def test_failed_rig_symlink_alias_to_run_dir_is_captured_and_removed(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    command = f"ln -s {shlex.quote(str(run_dir))} run-alias; exit 7"
+
+    Engine(run_dir, workdir, RigRegistry({"shell": ShellRig(command, 30)})).run_epoch(
+        Do(task="fail", rig=RigRef(name="shell")), 0
+    )
+
+    assert not os.path.lexists(workdir / "run-alias")
+    entries = [
+        entry
+        for manifest_path in run_dir.rglob("manifest.json")
+        for entry in json.loads(manifest_path.read_text(encoding="utf-8"))["entries"]
+    ]
+    assert any(entry["path"] == "run-alias" and entry["kind"] == "symlink"
+               for entry in entries)
     assert replay(run_dir).epoch_closed(0)
 
 
@@ -327,6 +449,48 @@ def test_torn_intent_record_fails_with_durable_workspace_fault_without_overwrite
     assert target.read_text() == "ENGINE"
     assert replay(run_dir).node((0, "n0")).workspace_unclean is True
     assert not replay(run_dir).epoch_closed(0)
+
+
+def test_schema_valid_lease_with_wrong_provenance_halts_before_cleanup(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Do(task="die", rig=RigRef(name="die"))
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": _DieAfterLeakRig("leak.txt")})
+    ).run_epoch(tree, 0)) == 0
+    lease = next((run_dir / "leases").glob("*.json"))
+    record = json.loads(lease.read_text(encoding="utf-8"))
+    record["pre_head"] = "0" * 40  # schema-valid but contradicts Dispatched.pre_head
+    lease.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(WorkspaceFault, match="pre_head"):
+        Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("die")})).run_epoch(tree, 0)
+    assert (workdir / "leak.txt").read_text() == "leak"
+    assert replay(run_dir).node((0, "n0")).workspace_unclean is True
+
+
+def test_schema_valid_intent_with_wrong_identity_halts_without_overwrite(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="base.txt", content="ENGINE")])
+
+    def crash_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(crash_after_write) == 0
+    intent = next((run_dir / "intents").glob("*.json"))
+    record = json.loads(intent.read_text(encoding="utf-8"))
+    record["node_id"] = "n999"
+    intent.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(WorkspaceFault, match="identity mismatch"):
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert (workdir / "base.txt").read_text() == "ENGINE"
+    assert replay(run_dir).node((0, "n0")).workspace_unclean is True
 
 
 def test_lease_record_publication_is_atomic_across_process_death(tmp_path: Path) -> None:
