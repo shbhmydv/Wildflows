@@ -232,7 +232,6 @@ class RecoveryRequest:
 class RecoveryOutcome:
     action: Literal["fail", "retry"]
     result: Result
-    diff_path: Path | None
 
 
 class WorkspaceEffects:
@@ -602,12 +601,10 @@ class WorkspaceEffects:
             )
             receipt.integrity = self._record_integrity(receipt)
             self._publish_recovery_record(receipt)
-        else:
-            diff_path = self._absolute_evidence(receipt.diff_path)
 
         # Phase 7: settlement completes before the engine may publish halt-clear/final.
         self.settle_records(epoch, node_id, request.attempt)
-        return RecoveryOutcome(receipt.action, receipt.result, diff_path)
+        return RecoveryOutcome(receipt.action, receipt.result)
 
     def resume_recovery(
         self, node_key: NodeKey, attempt: int, expected_pre_head: str | None
@@ -753,14 +750,6 @@ class WorkspaceEffects:
             return path.relative_to(self.run_dir).as_posix()
         except ValueError as exc:
             raise WorkspaceFault(f"recovery evidence escapes run directory: {path}") from exc
-
-    def _absolute_evidence(self, rel: str | None) -> Path | None:
-        if rel is None:
-            return None
-        path = self.run_dir / rel
-        if not path.resolve().is_relative_to(self.run_dir.resolve()):
-            raise WorkspaceFault(f"recovery evidence escapes run directory: {rel}")
-        return path
 
     def _capture_workspace(
         self, index_dir: Path, stem: str, tracked_base: str, leaks: list[str]
@@ -1260,7 +1249,9 @@ class WorkspaceEffects:
         self._checked(ancestor, "certificate reachability check")
         if not paths:  # an active allow-empty commit still requires its history receipt
             return True
-        active = self.git("diff", "--quiet", post_head, "--", *paths)
+        active = self.git(
+            "diff", "--quiet", post_head, "--", *[_fs_path(path) for path in paths]
+        )
         if active.returncode == 0:
             return True
         if active.returncode == 1:

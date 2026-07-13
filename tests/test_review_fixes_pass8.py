@@ -290,17 +290,80 @@ def test_quarantine_capture_manifest_corruption_is_detected(tmp_path: Path) -> N
     workdir = tmp_path / "work"
     _base_repo(workdir)
     run_dir = tmp_path / "run"
-    Engine(run_dir, workdir, RigRegistry({
-        "shell": ShellRig("printf evidence > leak; exit 7", 30),
-    })).run_epoch(Do(task="fail", rig=RigRef(name="shell")), 0)
+    tree = Do(task="die", rig=RigRef(name="die"))
 
-    manifest = next((run_dir / "failed-diffs").rglob("manifest.json"))
+    class LeakAndDie:
+        def run(self, prompt: str, workdir_arg: Path) -> Result:
+            (workdir_arg / "leak").write_text("evidence", encoding="utf-8")
+            os._exit(0)
+
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": LeakAndDie()})
+    ).run_epoch(tree, 0)) == 0
+    Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("rerun")})).run_epoch(tree, 0)
+
+    manifest = next((run_dir / "quarantine").rglob("manifest.json"))
     parsed = json.loads(manifest.read_text(encoding="utf-8"))
     file_entry = next(entry for entry in parsed["entries"] if entry["kind"] == "file")
-    (manifest.parent / file_entry["blob"]).write_bytes(b"CORRUPT")
-
-    with pytest.raises(WorkspaceFault, match="manifest|blob integrity"):
+    blob = manifest.parent / file_entry["blob"]
+    original = blob.read_bytes()
+    blob.write_bytes(b"CORRUPT")
+    with pytest.raises(WorkspaceFault, match="blob integrity"):
         WorkspaceEffects(workdir, run_dir).load_capture_manifest(manifest)
+
+    blob.write_bytes(original)
+    parsed["entries"][0]["path"] = "corrupt-mapping"
+    manifest.write_text(json.dumps(parsed), encoding="utf-8")
+    with pytest.raises(WorkspaceFault, match="integrity"):
+        WorkspaceEffects(workdir, run_dir).load_capture_manifest(manifest)
+
+
+def test_non_utf8_receipt_certificate_detects_operator_revert(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Do(task="bytes", rig=RigRef(name="bytes"))
+    raw_name = b"bad-\xff"
+
+    class CommitByteName:
+        def run(self, prompt: str, workdir_arg: Path) -> Result:
+            raw_workdir = os.fsencode(workdir_arg)
+            target = os.path.join(raw_workdir, raw_name)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(b"EFFECT")
+            subprocess.run([b"git", b"add", raw_name], cwd=raw_workdir, check=True)
+            subprocess.run(
+                [b"git", b"commit", b"-qm", b"byte effect"], cwd=raw_workdir, check=True
+            )
+            return Result(text="committed")
+
+    def die_after_result() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({"bytes": CommitByteName()}))
+
+        def result_then_die(
+            key: tuple[int, str], result: Result, receipt: object,
+            post_head: str | None = None,
+        ) -> None:
+            engine.rec.record_result(
+                key, result, post_head=post_head, receipt_required=True
+            )
+            os._exit(0)
+
+        setattr(engine.rec, "record_success", result_then_die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_result) == 0
+    os.unlink(os.path.join(os.fsencode(workdir), raw_name))
+    subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
+    subprocess.run(["git", "commit", "-qm", "operator revert"], cwd=workdir, check=True)
+
+    rerun = _CountingRig("rerun")
+    Engine(run_dir, workdir, RigRegistry({"bytes": rerun})).run_epoch(tree, 0)
+    assert rerun.calls == 1
+    receipt_paths = replay(run_dir).receipts[(0, "n0")].paths
+    assert not any(path.startswith("@wildflows-bytes:") for path in receipt_paths)
+    assert replay(run_dir).epoch_closed(0)
 
 
 def test_crash_after_recovery_settlement_before_publication_resumes_from_receipt(
