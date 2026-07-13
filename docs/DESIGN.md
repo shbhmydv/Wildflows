@@ -1020,14 +1020,17 @@ than patching each row. Both are the transaction model of record — not a later
     claimed hard exclusion was unsound; target-repo `.wildflows/` run state waits for the
     per-node worktree authority boundary.
 
-57. **Active completion certificate (hand-11).** Torn result→integrated recovery requires
-    the certified `post_head` to be an ancestor of live `HEAD`, not merely an extant Git
-    object. If an operator reset/diverged after the result, both the certified attempt tip
-    and current operator tip are quarantined, the lease baseline is restored, a durable
-    retry transition is journalled, and the node reruns. A receipt is never reconstructed
-    for an effect absent from the active tree.
+57. **Active completion certificate (hand-11).** A successful rig's `post_head` must
+    descend from its lease `pre_head`; backward/unrelated history movement is a failed
+    transaction and cleanup restores the original tip. Torn result→integrated recovery
+    additionally requires `post_head` to be an ancestor of live `HEAD` AND every receipted
+    path to match its `post_head` tree value. If an operator reset/diverged or committed a
+    descendant revert, both attempt and operator tips are quarantined, the lease baseline
+    is restored, a durable retry is journalled, and the node reruns. A receipt is never
+    reconstructed for an effect absent from the active tree.
 
 58. **Recovery topology containment (hand-11).** Baseline capture/restore validates every
     intermediate parent against its canonical workdir location before reading or deleting.
-    A post-crash parent-symlink substitution halts persistently without following it into
-    an external directory.
+    It preflights every manifest path and verifies every raw blob before the first deletion.
+    A post-crash parent-symlink substitution or corrupt late blob therefore halts without
+    losing live pre-existing bytes or following a path into an external directory.

@@ -274,6 +274,28 @@ def test_inplace_resolved_target_collision_is_rejected_before_write(tmp_path: Pa
     assert (workdir / "base.txt").read_text() == "base"
 
 
+def test_successful_rig_cannot_move_head_behind_lease_prehead(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    _commit_file(workdir, "second.txt", "second", "second")
+    pre = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    run_dir = tmp_path / "run"
+
+    Engine(run_dir, workdir, RigRegistry({
+        "shell": ShellRig("git reset --hard HEAD~1", 30),
+    })).run_epoch(Do(task="rewind", rig=RigRef(name="shell")), 0)
+
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == pre
+    assert (workdir / "second.txt").read_text() == "second"
+    assert not replay(run_dir).results[(0, "n0")].ok
+
+
 def test_inactive_torn_result_certificate_is_quarantined_and_rerun(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     pre = _base_repo(workdir)
@@ -308,6 +330,39 @@ def test_inactive_torn_result_certificate_is_quarantined_and_rerun(tmp_path: Pat
     state = replay(run_dir)
     assert state.epoch_closed(0) and "effect.txt" in state.integrated[(0, "n0")]
     assert (workdir / "effect.txt").exists()
+
+
+def test_descendant_revert_of_torn_result_is_quarantined_and_rerun(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Do(task="work", rig=RigRef(name="c"))
+
+    def die_after_result() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({"c": _CountingRig("effect") }))
+
+        def result_then_die(
+            key: tuple[int, str], result: Result, receipt: object,
+            post_head: str | None = None,
+        ) -> None:
+            engine.rec.record_result(key, result, post_head=post_head)
+            os._exit(0)
+
+        setattr(engine.rec, "record_success", result_then_die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_result) == 0
+    subprocess.run(["git", "rm", "-q", "effect.txt"], cwd=workdir, check=True)
+    subprocess.run(["git", "commit", "-qm", "operator revert"], cwd=workdir, check=True)
+    operator = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    rerun = _CountingRig("effect")
+    Engine(run_dir, workdir, RigRegistry({"c": rerun})).run_epoch(tree, 0)
+    assert rerun.calls == 1 and (workdir / "effect.txt").exists()
+    assert operator in set(_quarantine_refs(workdir).values())
 
 
 def test_crash_after_quarantine_reset_then_operator_commit_preserves_both_histories(
@@ -632,6 +687,28 @@ def test_torn_intent_record_fails_with_durable_workspace_fault_without_overwrite
     assert target.read_text() == "ENGINE"
     assert replay(run_dir).node((0, "n0")).workspace_unclean is True
     assert not replay(run_dir).epoch_closed(0)
+
+
+def test_corrupt_baseline_blob_is_detected_before_preexisting_bytes_are_deleted(
+    tmp_path: Path,
+) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    (workdir / "one").write_text("ONE", encoding="utf-8")
+    (workdir / "two").write_text("TWO", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    tree = Do(task="die", rig=RigRef(name="die"))
+    assert _fork(lambda: Engine(
+        run_dir, workdir, RigRegistry({"die": _DieAfterLeakRig("leak")})
+    ).run_epoch(tree, 0)) == 0
+    blob = next((run_dir / "lease-baselines").rglob("blobs/*"))
+    blob.write_bytes(b"CORRUPT")
+
+    with pytest.raises(WorkspaceFault, match="blob integrity"):
+        Engine(run_dir, workdir, RigRegistry({"die": _CountingRig("die")})).run_epoch(tree, 0)
+    assert (workdir / "one").read_text() == "ONE"
+    assert (workdir / "two").read_text() == "TWO"
+    assert replay(run_dir).node((0, "n0")).workspace_unclean is True
 
 
 def test_schema_valid_lease_with_wrong_provenance_halts_before_cleanup(tmp_path: Path) -> None:

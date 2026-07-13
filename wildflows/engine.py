@@ -223,12 +223,18 @@ class Engine:
             return False
         if node.result is None or not node.result.ok:
             return False  # dispatched-only or failed: no completion certificate to recover
-        if not self.ws.certificate_is_active(node.result_post_head):
+        try:
+            receipt = self.ws.reconstruct_receipt(
+                node.dispatched_pre_head, node.result_post_head
+            )
+            active = self.ws.certificate_is_active(
+                node.result_post_head, receipt.paths
+            )
+        except WorkspaceFault as fault:
+            self._halt_unclean(key, "result certificate validation", fault, "retry")
+        if not receipt.commits or not active:
             self._recover_inactive_certificate(key, node.result_post_head)
             return False
-        receipt = self.ws.reconstruct_receipt(node.dispatched_pre_head, node.result_post_head)
-        if not receipt.commits:
-            return False  # effectless result — durable on its own; resume_action handles it
         self.rec.record_integrated(key, receipt)
         return True
 

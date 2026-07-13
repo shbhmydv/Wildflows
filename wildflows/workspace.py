@@ -700,44 +700,77 @@ class WorkspaceEffects:
         manifest = CaptureManifest(entries=[])
         if loaded is not None:
             capture_dir, manifest = loaded
-            for rel in sorted(set(preexisting), key=lambda p: len(Path(p).parts)):
-                target = self._contained_record_target(rel, "preexisting path")
-                if os.path.lexists(target):
-                    self._remove_rollback_target(target, rel)
-        if preexisting_dirs is not None:
-            for rel in sorted(set(preexisting_dirs), key=lambda p: len(Path(p).parts)):
-                target = self._contained_record_target(rel, "preexisting directory")
-                if os.path.lexists(target) and (not target.is_dir() or target.is_symlink()):
-                    self._remove_rollback_target(target, rel)
-                try:
-                    target.mkdir(parents=True, exist_ok=True)
-                    self._fsync_dir(target.parent)
-                except OSError as exc:
-                    raise WorkspaceFault(f"cannot restore preexisting directory {rel}: {exc}") from exc
+        # Validate EVERY path and blob before the first delete. A corrupt late entry must
+        # never be discovered only after earlier user bytes have already been removed.
+        pre_targets = {
+            rel: self._contained_record_target(rel, "preexisting path")
+            for rel in set(preexisting)
+        }
+        dir_targets = {
+            rel: self._contained_record_target(rel, "preexisting directory")
+            for rel in set(preexisting_dirs or [])
+        }
+        entry_targets = {
+            entry.path: self._contained_record_target(entry.path, "baseline entry")
+            for entry in manifest.entries
+        }
+        blob_data: dict[str, bytes] = {}
+        if capture_dir is not None:
+            capture_root = capture_dir.resolve()
+            for entry in manifest.entries:
+                if entry.kind == "file":
+                    if entry.blob is None or entry.sha256 is None or entry.size is None:
+                        raise WorkspaceFault(f"incomplete baseline file entry: {entry.path}")
+                    blob = capture_dir / entry.blob
+                    try:
+                        if not blob.resolve().is_relative_to(capture_root):
+                            raise WorkspaceFault(f"baseline blob escapes capture: {entry.path}")
+                        data = blob.read_bytes()
+                    except WorkspaceFault:
+                        raise
+                    except OSError as exc:
+                        raise WorkspaceFault(
+                            f"cannot read baseline blob {entry.path}: {exc}"
+                        ) from exc
+                    if len(data) != entry.size or not hmac.compare_digest(
+                        hashlib.sha256(data).hexdigest(), entry.sha256
+                    ):
+                        raise WorkspaceFault(f"baseline blob integrity mismatch: {entry.path}")
+                    blob_data[entry.path] = data
+                elif entry.kind == "symlink" and entry.link_target is None:
+                    raise WorkspaceFault(f"incomplete baseline symlink entry: {entry.path}")
+                elif entry.kind not in ("directory", "symlink", "absent"):
+                    raise WorkspaceFault(f"unknown baseline entry kind: {entry.kind}")
+        for rel, target in sorted(pre_targets.items(), key=lambda item: len(Path(item[0]).parts)):
+            if os.path.lexists(target):
+                self._remove_rollback_target(target, rel)
+        for rel, target in sorted(
+            dir_targets.items(), key=lambda item: len(Path(item[0]).parts)
+        ):
+            if os.path.lexists(target) and (not target.is_dir() or target.is_symlink()):
+                self._remove_rollback_target(target, rel)
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                self._fsync_dir(target.parent)
+            except OSError as exc:
+                raise WorkspaceFault(
+                    f"cannot restore preexisting directory {rel}: {exc}"
+                ) from exc
         if capture_dir is None:
             return
         for entry in sorted(
             manifest.entries,
             key=lambda item: (0 if item.kind == "directory" else 1, len(Path(item.path).parts)),
         ):
-            target = self._contained_record_target(entry.path, "baseline entry")
+            target = entry_targets[entry.path]
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if entry.kind == "directory":
                     target.mkdir(exist_ok=True)
                 elif entry.kind == "file":
-                    if entry.blob is None or entry.sha256 is None or entry.size is None:
-                        raise WorkspaceFault(f"incomplete baseline file entry: {entry.path}")
-                    blob = capture_dir / entry.blob
-                    data = blob.read_bytes()
-                    if len(data) != entry.size or not hmac.compare_digest(
-                        hashlib.sha256(data).hexdigest(), entry.sha256
-                    ):
-                        raise WorkspaceFault(f"baseline blob integrity mismatch: {entry.path}")
-                    self._atomic_write(target, data, "lease baseline restore")
+                    self._atomic_write(target, blob_data[entry.path], "lease baseline restore")
                 elif entry.kind == "symlink":
-                    if entry.link_target is None:
-                        raise WorkspaceFault(f"incomplete baseline symlink entry: {entry.path}")
+                    assert entry.link_target is not None  # preflight above
                     os.symlink(entry.link_target, target)
                     self._fsync_dir(target.parent)
                 elif entry.kind != "absent":
@@ -785,6 +818,9 @@ class WorkspaceEffects:
         A git failure integrating the dirty remainder returns `ok=False` with stderr.
         """
         post = self.head_commit()
+        topology_error = self._range_topology_error(lease.pre_head, post)
+        if topology_error is not None:
+            return DoIntegration(ok=False, stderr=topology_error)
         commits = self._commit_receipts(lease.pre_head, post)
         integ = self._commit_all(message)
         if integ.status == "failed":
@@ -977,20 +1013,22 @@ class WorkspaceEffects:
                 self._fsync_dir(parent.parent)
                 parent = parent.parent
 
-    def certificate_is_active(self, post_head: str | None) -> bool:
-        if post_head is None:
+    def certificate_is_active(self, post_head: str | None, paths: list[str]) -> bool:
+        if post_head is None or not paths:
             return False
         live = self._cleanup_head()
         if live is None:
             return False
         ancestor = self.git("merge-base", "--is-ancestor", post_head, live)
-        if ancestor.returncode == 0:
-            return True
         if ancestor.returncode == 1:
             return False
-        raise WorkspaceFault(
-            f"certificate reachability check failed: {ancestor.stderr.strip()}"
-        )
+        self._checked(ancestor, "certificate reachability check")
+        active = self.git("diff", "--quiet", post_head, "--", *paths)
+        if active.returncode == 0:
+            return True
+        if active.returncode == 1:
+            return False
+        raise WorkspaceFault(f"certificate path check failed: {active.stderr.strip()}")
 
     def reconstruct_receipt(
         self, pre_head: str | None, post_head: str | None
@@ -1004,7 +1042,22 @@ class WorkspaceEffects:
         and can never be misattributed to this attempt. Only a torn result-then-integrated
         window (a durable result whose `integrated` was lost) is reconstructable; a
         dispatched-only tail has no `post_head` and is re-run, not recovered."""
+        topology_error = self._range_topology_error(pre_head, post_head)
+        if topology_error is not None:
+            raise WorkspaceFault(topology_error)
         return IntegrationReceipt(commits=self._commit_receipts(pre_head, post_head))
+
+    def _range_topology_error(self, pre: str | None, post: str | None) -> str | None:
+        if pre is None:
+            return None  # unborn lease: zero or more first commits are valid
+        if post is None:
+            return "attempt removed HEAD after opening from a committed base"
+        ancestor = self.git("merge-base", "--is-ancestor", pre, post)
+        if ancestor.returncode == 0:
+            return None
+        if ancestor.returncode == 1:
+            return f"attempt HEAD {post} does not descend from lease pre_head {pre}"
+        return f"attempt provenance check failed: {ancestor.stderr.strip()}"
 
     # -- inplace finalization ------------------------------------------------
 
