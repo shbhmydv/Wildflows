@@ -41,6 +41,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -148,6 +149,8 @@ class InplaceIntent(BaseModel):
     # Published after complete reversal so a recovery crash after an engine unlink can
     # redo without misclassifying the now-absent target as a hidden external alias.
     reversed: bool = False
+    # Set by the checked leak sweep's completion callback after all removals/fsyncs.
+    swept: bool = False
     integrity: str | None = None
 
 
@@ -230,6 +233,7 @@ class RecoveryRequest:
     attempt: int
     expected_pre_head: str | None
     lease_required: bool
+    intent_required: bool
     action: Literal["fail", "retry"]
     result: Result
     evidence_kind: Literal["failed-diffs", "quarantine"]
@@ -539,6 +543,8 @@ class WorkspaceEffects:
         if lease.pre_head != request.expected_pre_head:
             raise WorkspaceFault("lease record pre_head contradicts dispatched provenance")
         intent = self.load_intent(epoch, node_id, request.attempt)
+        if intent is None and request.intent_required:
+            raise WorkspaceFault("required modern inplace intent record is missing")
         if lease.baseline_manifest is not None:
             self._load_lease_baseline(lease.baseline_manifest, lease.baseline_digest)
         unexpected: list[str] = []
@@ -596,9 +602,15 @@ class WorkspaceEffects:
                 intent.reversed = True
                 self.write_intent(intent)
             self._reset_to_pre_head(lease, diff_path)
+            def mark_swept() -> None:
+                if intent is not None:
+                    intent.swept = True
+                    self.write_intent(intent)
+
             self._remove_leaks(
                 self._attempt_leaks(lease.preexisting, lease.preexisting_dirs),
                 None if lease.preexisting_dirs is None else set(lease.preexisting_dirs),
+                mark_swept if intent is not None else None,
             )
 
             # Phase 5: byte-restore the user baseline through the shared checked loader.
@@ -635,7 +647,8 @@ class WorkspaceEffects:
             return None
         return self.recover_lease(RecoveryRequest(
             node_key=node_key, attempt=attempt, expected_pre_head=expected_pre_head,
-            lease_required=True, action=receipt.action, result=receipt.result,
+            lease_required=True, intent_required=False,
+            action=receipt.action, result=receipt.result,
             evidence_kind="failed-diffs" if receipt.action == "fail" else "quarantine",
         ))
 
@@ -1190,7 +1203,8 @@ class WorkspaceEffects:
         return out
 
     def _remove_leaks(
-        self, leaks: list[str], preexisting_dirs: set[str] | None = None
+        self, leaks: list[str], preexisting_dirs: set[str] | None = None,
+        completion: Callable[[], None] | None = None,
     ) -> None:
         """Checked lease-scoped sweep with an explicit absence postcondition."""
         removed: list[Path] = []
@@ -1214,6 +1228,8 @@ class WorkspaceEffects:
                 raise WorkspaceFault(f"workspace leak remained after removal: {rel}")
             removed.append(target)
         if preexisting_dirs is None:
+            if completion is not None:
+                completion()
             return
         # Git's per-file status omits now-empty parent directories. Prune a parent only
         # when the modern lease proved it did not preexist, stopping at any nonempty/user
@@ -1247,6 +1263,8 @@ class WorkspaceEffects:
                     )
                 self._fsync_dir(parent.parent)
                 parent = parent.parent
+        if completion is not None:
+            completion()
 
     def certificate_is_active(self, post_head: str | None, paths: list[str]) -> bool:
         if post_head is None:
@@ -1424,7 +1442,7 @@ class WorkspaceEffects:
             try:
                 info = actual.lstat()
             except FileNotFoundError:
-                if write.started:
+                if write.started and not intent.swept:
                     disappeared.append(write.path)
                 continue
             except OSError as exc:

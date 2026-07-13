@@ -43,10 +43,11 @@ macro is not part of the serial PoC yet.
 
 ## Status
 
-Proof-of-concept (ladder step 1): the expression data model, the full journal
-event vocabulary, and an engine that executes `do` / `inplace` trees with two
-rigs (`EchoRig`, `ShellRig`). See [`docs/DESIGN.md`](docs/DESIGN.md) for the
-design-of-record and the build ladder.
+Serial proof-of-concept: fsynced journal/replay plus crash-safe workspace
+transactions; executable `do`, `inplace`, `seq`, serial `dispatch`, and command
+`loop`; and `EchoRig`, `ShellRig`, and `ScriptRig` seams. Parallel dispatch,
+per-node worktrees, general rails, planner macros, and the dashboard remain on the
+build ladder. See [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Develop
 

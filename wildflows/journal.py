@@ -1,7 +1,8 @@
 """The journal: the run's durable spine AND the single append owner.
 
 An append-only in-memory list mirrored to <run_dir>/events.ndjson (one event per line,
-fsynced on append). It is the ONLY durable run state resume and the dashboard consume.
+fsynced on append). It is the sole lifecycle/projection state resume and the dashboard
+consume; effect recovery also validates lease/intent/recovery certificates under run_dir.
 `append` is the one place that assigns a seq, fsyncs, and updates the live
 `RunProjection`; `load` replays the ndjson through the same `projection.apply`, so a
 running projection and a reloaded one are bit-identical. Parallel dispatch (step 3)

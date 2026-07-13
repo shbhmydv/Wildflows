@@ -87,8 +87,8 @@ The planner's own hands — a small fix with no sub-agent.
 - **Effects:** the **core** writes the files into the workdir and does `git add` +
   `git commit`. The model never runs git. This is the one primitive where the "agent"
   is the planner itself.
-- **Failure modes:** a write outside the workdir is rejected (path-escape guard); a
-  commit with nothing staged is a no-op result with `ok=False`.
+- **Failure modes:** a write outside the workdir is rejected (path-escape guard); an
+  already-identical edit with nothing staged is a durable no-op result with `ok=True`.
 
 ### `ask(owner)`
 The planner pings the owner with a genuine decision; the expression **parks** until
@@ -1076,8 +1076,9 @@ than patching each row. Both are the transaction model of record — not a later
     any overwrite or unlink. Each path fsyncs `started=True` before its first write and a
     per-path `reversed=True` after restoration; absent-prestate targets stay linked until
     the transaction's checked leak sweep, avoiding an unlink-before-progress crash gap.
-    The intent publishes its aggregate `reversed=True` after reversal/unstage. A started
-    canonical target that disappears before the recovery receipt still fails closed because
+    The intent publishes its aggregate `reversed=True` after reversal/unstage and `swept=True`
+    from inside the checked sweep's completion boundary. A started canonical target that
+    disappears before that durable sweep boundary still fails closed because
     a hidden external alias may retain attempt bytes. Initial planning uses `(st_dev,
     st_ino)` identity for
     existing targets and an
@@ -1099,8 +1100,10 @@ than patching each row. Both are the transaction model of record — not a later
     `rev-parse --show-object-format`; null OID width and empty-tree OID are selected for
     SHA-1 or SHA-256 rather than hard-coded to SHA-1.
 
-63. **Required modern leases and settle-before-clear (H2/H3).** New `Dispatched` events
-    carry `lease_required=True`; a missing current lease with neither a matching immutable
+63. **Required modern records and settle-before-clear (H2/H3).** New `Dispatched` events
+    carry `lease_required=True`; a planned non-empty inplace also carries
+    `intent_required=True` after publishing its intent and before the dispatch. Missing
+    required records fail closed; a missing current lease with neither a matching immutable
     settled-lease certificate nor recovery receipt fails closed. No global schema integer
     is needed: absence of the additive marker identifies the conservative legacy path.
     After postcondition verification, recovery writes an integrity-bound, create-once

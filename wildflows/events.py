@@ -58,6 +58,10 @@ class Dispatched(_Header):
     # recovery distinguish a missing modern record (corruption: fail closed) from a
     # pre-hand-12 journal that needs the conservative no-sweep compatibility path.
     lease_required: bool = False
+    # A planned non-empty modern inplace publishes its intent before this dispatch.
+    # Recovery therefore treats absence as corruption; false also covers do/legacy and
+    # inplace attempts that failed planning before any write could occur.
+    intent_required: bool = False
 
 
 class ResultEvent(_Header):

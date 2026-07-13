@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
@@ -134,6 +135,29 @@ def test_post_intent_hidden_hardlink_alias_fails_closed(tmp_path: Path) -> None:
     assert not state.epoch_closed(0)
 
 
+def test_missing_required_modern_intent_fails_closed(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="new.txt", content="ENGINE")])
+
+    def die_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _exit_now)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_write) == 0
+    next((run_dir / "intents").glob("*.json")).unlink()
+    alias = tmp_path / "hidden-alias"
+    os.link(workdir / "new.txt", alias)
+    (workdir / "new.txt").unlink()
+
+    with pytest.raises(WorkspaceFault, match="required.*intent|intent.*required"):
+        Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert alias.read_bytes() == b"ENGINE"
+    assert replay(run_dir).node((0, "n0")).workspace_unclean is True
+
+
 def test_inplace_reversal_path_progress_survives_recovery_crash(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)
@@ -167,6 +191,43 @@ def test_inplace_reversal_path_progress_survives_recovery_crash(tmp_path: Path) 
     Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
     assert not (workdir / "new").exists()
     assert not replay(run_dir).results[(0, "n0")].ok
+    assert replay(run_dir).epoch_closed(0)
+
+
+def test_inplace_sweep_completion_survives_recovery_crash(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="new/deep/file", content="ENGINE")])
+
+    def die_after_write() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        setattr(engine.ws, "integrate_declared", _exit_now)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_write) == 0
+
+    def die_after_sweep() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({}))
+        real_remove = engine.ws._remove_leaks
+
+        def remove_then_die(
+            leaks: list[str], preexisting_dirs: set[str] | None = None,
+            completion: Callable[[], None] | None = None,
+        ) -> NoReturn:
+            real_remove(leaks, preexisting_dirs, completion)
+            os._exit(0)
+
+        setattr(engine.ws, "_remove_leaks", remove_then_die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_sweep) == 0
+    intent_path = next((run_dir / "intents").glob("*.json"))
+    assert json.loads(intent_path.read_text(encoding="utf-8"))["swept"] is True
+    assert not (workdir / "new").exists()
+
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert (workdir / "new" / "deep" / "file").read_text(encoding="utf-8") == "ENGINE"
     assert replay(run_dir).epoch_closed(0)
 
 

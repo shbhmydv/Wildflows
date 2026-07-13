@@ -251,7 +251,8 @@ class Engine:
         return RecoveryRequest(
             node_key=key, attempt=node.dispatch_count - 1,
             expected_pre_head=node.dispatched_pre_head,
-            lease_required=node.lease_required, action=action, result=result,
+            lease_required=node.lease_required, intent_required=node.intent_required,
+            action=action, result=result,
             evidence_kind="failed-diffs" if action == "fail" else "quarantine",
             certified_post_head=certified_post_head,
         )
@@ -440,24 +441,24 @@ class Engine:
         lease = self._open_lease_or_fail(key, floor, attempt)
         if lease is None:
             return ExecutionOutcome(key=key)
-        self.journal.append(Dispatched(
+        dispatch = Dispatched(
             run_id=self.run_id, epoch=epoch, node_id=node.node_id,
             task=f"inplace: {len(node.edits)} edit(s)", workdir=str(self.workdir),
             pre_head=lease.pre_head, lease_required=True,
-        ))
+        )
         if not node.edits:  # an empty inplace is a no-op ok result with NO git calls
+            self.journal.append(dispatch)
             self.rec.record_result(key, Result(text="inplace: no edits", files=[]),
                                    post_head=self.ws.head_commit())
             self._settle(key)
             return ExecutionOutcome(key=key)
-        # A durable intent (every target's pre-state) is fsynced BEFORE the first write, so
-        # ANY exception after the first write — OR a crash — is reversed from the record,
-        # leaving NO partial effect (hand-10, PRINCIPLE B / INPLACE-TRANSACTIONAL). A path
-        # rejection at PLAN time (a symlink escape resolve_safe_path catches) is before any
-        # mutation, so no rollback is needed.
+        # Plan without mutation.  A successful non-empty plan publishes its durable intent
+        # BEFORE Dispatched(intent_required=True), so a missing modern intent on recovery is
+        # corruption rather than an unsafe pre-intent fallback.
         try:
             writes = self._plan_inplace_writes(node)
         except (ValueError, OSError) as exc:
+            self.journal.append(dispatch)
             self.rec.record_result(key, Result(
                 text=f"inplace path rejected: {exc}", outcome="failed"),
                 post_head=self.ws.head_commit())
@@ -467,6 +468,8 @@ class Engine:
             epoch=epoch, node_id=node.node_id, attempt=attempt, writes=writes,
             created_dirs=self._created_inplace_dirs(writes), ts=0.0)
         self.ws.write_intent(intent)
+        dispatch.intent_required = True
+        self.journal.append(dispatch)
         paths = [w.path for w in writes]
         try:
             self._apply_inplace_writes(intent)

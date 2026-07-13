@@ -78,6 +78,7 @@ class NodeProjection:
     last_dispatch_seq: int = -1
     dispatched_pre_head: str | None = None  # provenance anchor (range START)
     lease_required: bool = False
+    intent_required: bool = False
     result: Result | None = None
     result_seq: int = -1
     result_post_head: str | None = None  # HEAD when the result was recorded (range END)
@@ -143,6 +144,7 @@ class RunProjection:
             node.last_dispatch_seq = ev.seq
             node.dispatched_pre_head = ev.pre_head
             node.lease_required = ev.lease_required
+            node.intent_required = ev.intent_required
         elif isinstance(ev, ResultEvent):
             node.result = Result(
                 text=ev.text, files=ev.files, exit_code=ev.exit_code, outcome=ev.outcome,
