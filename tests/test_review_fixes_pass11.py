@@ -131,7 +131,10 @@ def test_partial_append_failure_fresh_load_repairs_tail_before_continuing(
     journal.append(Boundary(run_id="run", epoch=0, node_id="n0", phase="opened"))
     real_open = builtins.open
 
-    def partial_open(path: object, mode: str = "r", encoding: str | None = None) -> _PartialWriter:
+    def partial_open(
+        path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: str = "r", encoding: str | None = None,
+    ) -> _PartialWriter:
         inner = cast(IO[str], real_open(path, mode, encoding=encoding))
         return _PartialWriter(inner, valid_tail)
 

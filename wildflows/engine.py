@@ -236,7 +236,7 @@ class Engine:
             workdir=str(self.workdir), pre_head=lease.pre_head, lease_required=True,
         ))
         try:
-            converged = self.ws.run_predicate(cmd)
+            converged = self.ws.run_predicate(cmd, lease, node.until.timeout_s)
             self.ws.verify_lease_unchanged(lease)
             self.ws.settle_records(epoch, key[1], attempt)
         except Exception as exc:

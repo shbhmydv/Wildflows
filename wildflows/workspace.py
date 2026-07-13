@@ -1,31 +1,9 @@
-"""The workspace effect transaction (RAZE item 4) + the completion recorder.
+"""The workspace effect transaction and completion recorder.
 
-The engine says "run this node in this lease, then finalize success/failure"; it issues
-ZERO git commands. `WorkspaceEffects` owns a per-node-attempt lease (pre/post HEAD
-capture over the shared workdir — the seam, not yet a worktree), rig-authored commit
-discovery, staging/commit, failure evidence capture + revert, and path containment. It
-hands back one accumulated `IntegrationReceipt` (every attributed commit, per-commit
-paths). `CompletionRecorder` owns the ONE event ordering — result THEN integrated — for
-every completion path (do / inplace / recovery), replacing three inconsistent orderings.
-
-Two consolidation principles (hand-10) live here:
-
-- PRINCIPLE A — QUARANTINE, NEVER DESTROY. No cleanup path deletes content irrecoverably.
-  A dead dispatched-only attempt's tip (dead-attempt AND post-crash operator commits) is
-  moved to a quarantine ref before the branch is reset to the durable `pre_head`;
-  uncommitted dirt + non-preexisting leaks are byte-captured to immutable manifests; the
-  lease's preexisting file/directory snapshots are respected. EVERY Git/filesystem op in
-  cleanup is checked — a failure raises `WorkspaceFault` and the replayed persistent halt
-  retries cleanup rather than closing an unsafe epoch.
-
-- PRINCIPLE B — DURABLE TRANSACTION INTENTS. Lease/intent records are atomically published
-  and directory-fsynced BEFORE the first mutation. A lease byte-captures pre-existing
-  untracked/ignored baselines; inplace records canonical targets, exact original bytes,
-  expected writes, and created parents. Restart captures divergence before restoration.
-  Corrupt present records fail closed and never trigger mutation.
-
-Per-node worktree leases are a later step; the shared-workdir policy (quarantine + reset
-on failure) lives here and is superseded by discard-the-worktree once worktrees land.
+WorkspaceEffects owns durable leases, checked capture/recovery, git mediation, and path
+containment over the serial shared workdir. CompletionRecorder owns result→integration
+event ordering. Effects are quarantined, never destroyed, and recovery depends only on
+fsynced records published before mutation.
 """
 from __future__ import annotations
 
@@ -36,9 +14,12 @@ import hmac
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -81,13 +62,7 @@ def _fs_path(wire: str) -> str:
 
 
 class WorkspaceFault(Exception):
-    """A cleanup, rollback, capture, or durable-record op was not provably completed.
-
-    Raised from any CHECKED transaction path (PRINCIPLE A). The engine records the
-    failed result marked `workspace_unclean=True` and re-raises this to HALT the epoch — a
-    durable "failed" that lies a live effect was reverted is worse than a crash. `diff_path`
-    is the captured evidence, if any.
-    """
+    """An unproved effect/recovery; halt unclean and retain `diff_path` evidence."""
 
     def __init__(self, message: str, diff_path: "Path | None" = None) -> None:
         super().__init__(message)
@@ -95,13 +70,7 @@ class WorkspaceFault(Exception):
 
 
 class LeaseRecord(BaseModel):
-    """The durable lease intent (PRINCIPLE B), fsynced to run_dir BEFORE the first mutation.
-
-    Restart cleanup loads THIS (never process memory) to quarantine + reset a dead attempt
-    idempotently: `pre_head` is the reset target and quarantine range anchor; `preexisting`
-    and `preexisting_dirs` are the snapshots the sweep must restore/leave in place;
-    `baseline_manifest` points at their exact byte capture.
-    """
+    """Fsynced pre-mutation baseline used by idempotent restart recovery."""
 
     epoch: int
     node_id: str
@@ -125,20 +94,11 @@ class IntentWrite(BaseModel):
 
     path: str
     pre_kind: Literal["file", "dir", "absent", "other"]
-    # `original` reads hand-10 text intents; modern intents use base64 for exact binary
-    # reversal. `content` is what this attempt intended to write, allowing restart to
-    # distinguish the engine's bytes from a post-crash operator edit.
-    original: str | None = None
+    original: str | None = None  # legacy text; modern records use exact base64
     original_b64: str | None = None
     content: str | None = None
-    # Fsynced before this path's first write.  A started target that later disappears is
-    # ambiguous (an external hard-link alias may retain attempt bytes) and fails closed.
     started: bool = False
-    # Fsynced after this path's reversal operation.  Absent pre-state targets remain in
-    # place for the transaction's checked leak sweep.
     reversed: bool = False
-    # Fsynced immediately before the checked sweep unlinks this absent-prestate target.
-    # An absent started target without this proof remains a hidden-alias ambiguity.
     swept: bool = False
 
 
@@ -203,18 +163,19 @@ class CompletionSettlement(BaseModel):
     integrity: str | None = None
 
 
+class PredicateProcessRecord(BaseModel):
+    epoch: int
+    node_id: str
+    attempt: int
+    pid: int
+    pgid: int
+    start_time: str
+    integrity: str | None = None
+
+
 @dataclass
 class Lease:
-    """A node attempt's workspace lease: the shared workdir + its pre-run HEAD.
-
-    `pre_head` anchors rig-authored-commit discovery (`pre..post`), the reset target on
-    resume/failure, and the receipt reconstruction range. `preexisting` is the set of
-    untracked+ignored paths present at lease open — cleanup removes ONLY paths NOT in this
-    set; `preexisting_dirs` likewise protects empty/user parent directories, and the
-    baseline manifest restores overwritten/deleted untracked bytes. `attempt` keys durable
-    records and capture groups; quarantine refs additionally include each
-    observed tip SHA so cleanup redos never clobber prior history.
-    """
+    """A durable node-attempt baseline over the serial shared workdir."""
 
     node_key: NodeKey
     pre_head: str | None
@@ -636,6 +597,7 @@ class WorkspaceEffects:
         receipt and publishes the same deterministic disposition.
         """
         epoch, node_id = request.node_key
+        self.reap_predicate_process(epoch, node_id, request.attempt)
         receipt = self._load_recovery_record(epoch, node_id, request.attempt)
         settlement = self._load_completion_settlement(epoch, node_id, request.attempt)
         if settlement is not None and settlement.pre_head != request.expected_pre_head:
@@ -1747,11 +1709,11 @@ class WorkspaceEffects:
             read = ("read-tree", "--empty") if self._cleanup_head() is None else (
                 "read-tree", "HEAD"
             )
-            self._checked_bytes(self.git_bytes(*read, env=env), "seed temporary index")
+            self._checked_bytes(self._git_index(env, *read), "seed temporary index")
             self._checked_bytes(
-                self.git_bytes("add", "-u", "--", ".", env=env), "snapshot workspace content"
+                self._git_index(env, "add", "-u", "--", "."), "snapshot workspace content"
             )
-            tree = self.git_bytes("write-tree", env=env)
+            tree = self._git_index(env, "write-tree")
             self._checked_bytes(tree, "write temporary-index tree")
             try:
                 return tree.stdout.strip().decode("ascii")
@@ -1764,12 +1726,22 @@ class WorkspaceEffects:
         current = self._fresh_workspace_tree()
         if current == rec.content_tree:
             return []
-        diff = self.git_bytes(
-            "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+        diff = self._git_index(
+            os.environ.copy(), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
             rec.content_tree, current,
         )
         self._checked_bytes(diff, "compare temporary-index trees")
         return [_wire_path(path) for path in diff.stdout.split(b"\0") if path]
+
+    def _git_index(
+        self, env: dict[str, str], *args: str
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=self.workdir, capture_output=True, env=env
+            )
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot launch temporary-index git: {exc}") from exc
 
     # -- git plumbing --------------------------------------------------------
 
@@ -1783,13 +1755,11 @@ class WorkspaceEffects:
             raise WorkspaceFault(f"cannot launch/decode git {' '.join(args)}: {exc}") from exc
 
     def git_bytes(
-        self, *args: str, input_data: bytes | None = None,
-        env: dict[str, str] | None = None,
+        self, *args: str, input_data: bytes | None = None
     ) -> subprocess.CompletedProcess[bytes]:
         try:
             return subprocess.run(
                 ["git", *args], cwd=self.workdir, capture_output=True, input=input_data,
-                env=env,
             )
         except OSError as exc:
             raise WorkspaceFault(f"cannot launch git {' '.join(args)}: {exc}") from exc
@@ -2004,9 +1974,131 @@ class WorkspaceEffects:
         except OSError:
             return None
 
-    def run_predicate(self, cmd: str) -> bool:
-        """Run leased loop `until`; the caller verifies the read-only postcondition."""
-        return subprocess.run(cmd, shell=True, cwd=self.workdir).returncode == 0
+    def _predicate_process_path(self, epoch: int, node_id: str, attempt: int) -> Path:
+        return self._record_path("predicate-processes", epoch, node_id, attempt)
+
+    @staticmethod
+    def _proc_identity(pid: int) -> tuple[str, str] | None:
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot inspect predicate process {pid}: {exc}") from exc
+        _head, marker, tail = raw.rpartition(")")
+        fields = tail.split()
+        if not marker or len(fields) < 20:
+            raise WorkspaceFault(f"malformed process identity for predicate pid {pid}")
+        return fields[19], fields[0]
+
+    def _load_predicate_process(
+        self, epoch: int, node_id: str, attempt: int
+    ) -> PredicateProcessRecord | None:
+        path = self._predicate_process_path(epoch, node_id, attempt)
+        if not os.path.lexists(path):
+            return None
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
+                raise WorkspaceFault(f"predicate process record is not regular: {path}")
+            record = PredicateProcessRecord.model_validate_json(path.read_bytes())
+            self._verify_record_integrity(record, path)
+            if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
+                raise WorkspaceFault(f"predicate process identity record mismatch: {path}")
+            return record
+        except WorkspaceFault:
+            raise
+        except (OSError, ValidationError) as exc:
+            raise WorkspaceFault(f"predicate process record is corrupt: {path}: {exc}") from exc
+
+    def _settle_predicate_process(self, record: PredicateProcessRecord) -> None:
+        path = self._predicate_process_path(record.epoch, record.node_id, record.attempt)
+        try:
+            path.unlink(missing_ok=True)
+            self._fsync_dir(path.parent)
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot settle predicate process record: {exc}") from exc
+
+    def reap_predicate_process(self, epoch: int, node_id: str, attempt: int) -> None:
+        """Identity-check then kill the isolated group; never mutate the workspace."""
+        record = self._load_predicate_process(epoch, node_id, attempt)
+        if record is None:
+            return
+        identity = self._proc_identity(record.pid)
+        if identity is None:
+            try:
+                os.killpg(record.pgid, 0)
+            except ProcessLookupError:
+                self._settle_predicate_process(record)
+                return
+            raise WorkspaceFault("predicate leader vanished while its process group survives")
+        if identity[0] != record.start_time or os.getpgid(record.pid) != record.pgid:
+            raise WorkspaceFault("predicate pid was recycled; refusing to kill it")
+        try:
+            os.killpg(record.pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            current = self._proc_identity(record.pid)
+            if current is None or current[1] == "Z" or current[0] != record.start_time:
+                break
+            time.sleep(0.01)
+        else:
+            raise WorkspaceFault("predicate process group did not exit after SIGKILL")
+        self._settle_predicate_process(record)
+
+    def run_predicate(self, cmd: str, lease: Lease, timeout_s: float) -> bool:
+        """Run behind a recorded session-leader supervisor, then kill every descendant."""
+        gate_r, gate_w = os.pipe()
+        result_r, result_w = os.pipe()
+        supervisor = (
+            "import os,signal,subprocess,sys\n"
+            "g=int(sys.argv[2]);o=int(sys.argv[3]);b=os.read(g,1);os.close(g)\n"
+            "if not b: sys.exit(125)\n"
+            "p=subprocess.run(sys.argv[1],shell=True,stdin=subprocess.DEVNULL)\n"
+            "os.write(o,(str(p.returncode)+'\\n').encode());os.close(o);signal.pause()\n"
+        )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", supervisor, cmd, str(gate_r), str(result_w)],
+                cwd=self.workdir, pass_fds=(gate_r, result_w), start_new_session=True,
+            )
+        except OSError as exc:
+            for fd in (gate_r, gate_w, result_r, result_w):
+                os.close(fd)
+            raise WorkspaceFault(f"cannot launch predicate supervisor: {exc}") from exc
+        os.close(gate_r)
+        os.close(result_w)
+        identity = self._proc_identity(proc.pid)
+        if identity is None:
+            os.close(gate_w)
+            os.close(result_r)
+            proc.wait(timeout=5)
+            raise WorkspaceFault("predicate supervisor exited before identity publication")
+        epoch, node_id = lease.node_key
+        record = PredicateProcessRecord(
+            epoch=epoch, node_id=node_id, attempt=lease.attempt, pid=proc.pid,
+            pgid=os.getpgid(proc.pid), start_time=identity[0],
+        )
+        record.integrity = self._record_integrity(record)
+        try:
+            self._fsync_json(
+                self._predicate_process_path(epoch, node_id, lease.attempt), record
+            )
+            os.write(gate_w, b"1")
+            ready, _writable, _exceptional = select.select([result_r], [], [], timeout_s)
+            if not ready:
+                raise WorkspaceFault(f"predicate timed out after {timeout_s:g}s")
+            raw = os.read(result_r, 64)
+            try:
+                return int(raw.strip()) == 0
+            except ValueError as exc:
+                raise WorkspaceFault("predicate supervisor returned no exit status") from exc
+        finally:
+            os.close(gate_w)
+            os.close(result_r)
+            self.reap_predicate_process(epoch, node_id, lease.attempt)
+            proc.wait(timeout=5)
 
 
 class CompletionRecorder:

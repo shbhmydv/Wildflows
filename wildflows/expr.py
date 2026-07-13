@@ -82,6 +82,7 @@ class Until(BaseModel):
 
     kind: Literal["cmd", "flag"]
     cmd: str | None = None
+    timeout_s: float = Field(default=30.0, gt=0)
 
     @model_validator(mode="after")
     def _cmd_requires_command(self) -> "Until":
