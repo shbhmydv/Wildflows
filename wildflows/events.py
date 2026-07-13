@@ -91,6 +91,9 @@ class ResultEvent(_Header):
     # without a completion certificate and must dispatch again. None on ordinary results
     # and legacy unclean markers (which fail closed because their disposition is unknown).
     recovery_action: Literal["fail", "retry"] | None = None
+    # A commit is an effect even when it changes zero paths (`git commit --allow-empty`).
+    # Such a result still requires the following Integrated receipt before it is durable.
+    receipt_required: bool = False
 
     @model_validator(mode="before")
     @classmethod

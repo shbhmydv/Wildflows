@@ -1014,7 +1014,7 @@ class WorkspaceEffects:
                 parent = parent.parent
 
     def certificate_is_active(self, post_head: str | None, paths: list[str]) -> bool:
-        if post_head is None or not paths:
+        if post_head is None:
             return False
         live = self._cleanup_head()
         if live is None:
@@ -1023,6 +1023,8 @@ class WorkspaceEffects:
         if ancestor.returncode == 1:
             return False
         self._checked(ancestor, "certificate reachability check")
+        if not paths:  # an active allow-empty commit still requires its history receipt
+            return True
         active = self.git("diff", "--quiet", post_head, "--", *paths)
         if active.returncode == 0:
             return True
@@ -1352,6 +1354,7 @@ class CompletionRecorder:
         self, key: NodeKey, result: Result, post_head: str | None = None,
         workspace_unclean: bool = False,
         recovery_action: Literal["fail", "retry"] | None = None,
+        receipt_required: bool = False,
     ) -> None:
         """A terminal result with no integration (failure, effectless, or no-op).
 
@@ -1359,7 +1362,7 @@ class CompletionRecorder:
         it is journalled honestly and the engine then HALTS the epoch (WorkspaceFault)."""
         self.journal.append(self._result_event(
             key, result, post_head=post_head, workspace_unclean=workspace_unclean,
-            recovery_action=recovery_action))
+            recovery_action=recovery_action, receipt_required=receipt_required))
 
     def record_success(
         self, key: NodeKey, result: Result, receipt: IntegrationReceipt,
@@ -1369,7 +1372,9 @@ class CompletionRecorder:
         (one event carrying every attributed commit) — result first, integrated second.
         `post_head` is the workdir HEAD stamped on the result (the completion certificate
         the torn-window receipt reconstruction is bounded by)."""
-        self.journal.append(self._result_event(key, result, post_head=post_head))
+        self.journal.append(self._result_event(
+            key, result, post_head=post_head, receipt_required=bool(receipt.commits)
+        ))
         if receipt.commits:
             epoch, node_id = key
             self.journal.append(Integrated(
@@ -1396,6 +1401,7 @@ class CompletionRecorder:
         self, key: NodeKey, result: Result, loop_status: str | None = None,
         post_head: str | None = None, workspace_unclean: bool = False,
         recovery_action: Literal["fail", "retry"] | None = None,
+        receipt_required: bool = False,
     ) -> ResultEvent:
         epoch, node_id = key
         return ResultEvent(
@@ -1403,4 +1409,5 @@ class CompletionRecorder:
             text=result.text, files=result.files, exit_code=result.exit_code,
             outcome=result.outcome, loop_status=loop_status, post_head=post_head,
             workspace_unclean=workspace_unclean, recovery_action=recovery_action,
+            receipt_required=receipt_required,
         )

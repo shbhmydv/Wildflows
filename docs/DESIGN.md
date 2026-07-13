@@ -1000,8 +1000,10 @@ than patching each row. Both are the transaction model of record — not a later
 
 55. **Atomic durable-record lifecycle (hand-11).** Lease/intent and capture-manifest
     publication is same-directory temp write → file fsync → `os.replace` → parent-directory
-    fsync. Record unlink is followed by parent-directory fsync. Records carry a canonical
-    SHA-256 integrity digest in addition to identity/provenance checks, so schema-valid
+    fsync. Record unlink is followed by parent-directory fsync. Newly created run-directory
+    components and the first `events.ndjson` entry are parent-directory-fsynced before any
+    lease mutation. Records carry a canonical SHA-256 integrity digest in addition to
+    identity/provenance checks, so schema-valid
     field corruption cannot accidentally reclassify user files or add rollback targets
     (the digest is corruption detection, not hostile-writer authentication). A present
     unsigned, non-regular, unreadable, malformed, integrity-invalid, or schema-invalid
@@ -1027,7 +1029,9 @@ than patching each row. Both are the transaction model of record — not a later
     path to match its `post_head` tree value. If an operator reset/diverged or committed a
     descendant revert, both attempt and operator tips are quarantined, the lease baseline
     is restored, a durable retry is journalled, and the node reruns. A receipt is never
-    reconstructed for an effect absent from the active tree.
+    reconstructed for an effect absent from the active tree. Result events explicitly mark
+    `receipt_required`, so even an active `--allow-empty` commit (zero changed paths) cannot
+    become durable in the result→integrated tear without its history receipt.
 
 58. **Recovery topology containment (hand-11).** Baseline capture/restore validates every
     intermediate parent against its canonical workdir location before reading or deleting.

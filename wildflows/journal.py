@@ -76,10 +76,27 @@ def _refuse_legacy_interrupted_tail(raws: list[dict[str, object]]) -> None:
             )
 
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class Journal:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = Path(run_dir)
+        missing: list[Path] = []
+        cursor = self.run_dir
+        while not cursor.exists():
+            missing.append(cursor)
+            cursor = cursor.parent
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        # Persist every newly-created directory entry from the first existing ancestor
+        # down to run_dir before any workspace lease can open.
+        for created in reversed(missing):
+            _fsync_directory(created.parent)
         self.path = self.run_dir / "events.ndjson"
         self._events: list[Event] = []
         self.projection = RunProjection()
@@ -96,10 +113,13 @@ class Journal:
         event.seq = seq
         self._events.append(event)
         line = event.model_dump_json() + "\n"
+        new_journal = not self.path.exists()
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
+        if new_journal:
+            _fsync_directory(self.run_dir)
         self.projection.apply(event)
         return seq
 

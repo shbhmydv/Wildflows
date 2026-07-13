@@ -82,6 +82,7 @@ class NodeProjection:
     result_post_head: str | None = None  # HEAD when the result was recorded (range END)
     workspace_unclean: bool = False
     recovery_action: Literal["fail", "retry"] | None = None
+    receipt_required: bool = False
     receipt: IntegrationReceipt | None = None  # accumulated effect record
     integrated_seq: int = -1  # seq of the LAST integrated event (the resume frontier)
     # Loop-only: completed-iteration count, last integrated commit, the seq of the last
@@ -148,6 +149,7 @@ class RunProjection:
             node.result_post_head = ev.post_head
             node.workspace_unclean = ev.workspace_unclean
             node.recovery_action = ev.recovery_action
+            node.receipt_required = ev.receipt_required
             self._results_by_seq[ev.seq] = node.result
             self._last_result_seq = ev.seq
         elif isinstance(ev, Integrated):
@@ -192,7 +194,7 @@ class RunProjection:
             return "recover"
         if node.recovery_action == "retry":
             return "run"
-        if node.result.ok and node.result.files:
+        if node.result.ok and (node.result.files or node.receipt_required):
             if (
                 node.receipt is None
                 or node.integrated_seq <= floor

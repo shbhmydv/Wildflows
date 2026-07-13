@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 
 from wildflows.engine import Engine, replay
+from wildflows.events import Boundary
 from wildflows.expr import Do, Edit, Inplace, RigRef
+from wildflows.journal import Journal
 from wildflows.rig import RigRegistry, Result, ShellRig
 from wildflows.workspace import WorkspaceFault
 
@@ -272,6 +274,45 @@ def test_inplace_resolved_target_collision_is_rejected_before_write(tmp_path: Pa
     assert not state.results[(0, "n0")].ok
     assert "resolved target collision" in state.results[(0, "n0")].text
     assert (workdir / "base.txt").read_text() == "base"
+
+
+def test_allow_empty_commit_result_tear_still_requires_receipt(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run"
+    tree = Do(task="empty", rig=RigRef(name="empty"))
+
+    class EmptyCommitRig:
+        name = "empty"
+
+        def run(self, prompt: str, workdir_arg: Path) -> Result:
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-qm", "empty effect"],
+                cwd=workdir_arg, check=True,
+            )
+            return Result(text="empty committed")
+
+    def die_after_result() -> None:
+        engine = Engine(run_dir, workdir, RigRegistry({"empty": EmptyCommitRig()}))
+
+        def result_then_die(
+            key: tuple[int, str], result: Result, receipt: object,
+            post_head: str | None = None,
+        ) -> None:
+            engine.rec.record_result(
+                key, result, post_head=post_head, receipt_required=True
+            )
+            os._exit(0)
+
+        setattr(engine.rec, "record_success", result_then_die)
+        engine.run_epoch(tree, 0)
+
+    assert _fork(die_after_result) == 0
+    should_not_run = _CountingRig("unexpected")
+    Engine(run_dir, workdir, RigRegistry({"empty": should_not_run})).run_epoch(tree, 0)
+    assert should_not_run.calls == 0
+    receipt = replay(run_dir).receipts[(0, "n0")]
+    assert len(receipt.commits) == 1 and receipt.paths == []
 
 
 def test_successful_rig_cannot_move_head_behind_lease_prehead(tmp_path: Path) -> None:
@@ -800,6 +841,28 @@ def test_schema_valid_lease_cannot_reclassify_preexisting_user_bytes(tmp_path: P
     assert (workdir / "keep").read_text() == "USER"
     assert (workdir / "leak").read_text() == "leak"
     assert replay(run_dir).node((0, "n0")).workspace_unclean is True
+
+
+def test_new_run_and_journal_directory_entries_are_fsynced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import wildflows.journal as journal_module
+
+    calls: list[Path] = []
+    real_fsync = journal_module._fsync_directory
+
+    def recording_fsync(path: Path) -> None:
+        calls.append(path)
+        real_fsync(path)
+
+    monkeypatch.setattr(journal_module, "_fsync_directory", recording_fsync)
+    run_dir = tmp_path / "new-parent" / "run"
+    journal = Journal(run_dir)
+    assert tmp_path in calls and run_dir.parent in calls
+    journal.append(Boundary(
+        run_id="run", epoch=0, node_id="n0", phase="opened",
+    ))
+    assert run_dir in calls
 
 
 def test_lease_record_publication_is_atomic_across_process_death(tmp_path: Path) -> None:
