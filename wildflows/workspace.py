@@ -114,6 +114,9 @@ class LeaseRecord(BaseModel):
     ts: float
     baseline_manifest: str | None = None
     baseline_digest: str | None = None
+    index_snapshot: bool = False
+    index_b64: str | None = None
+    content_tree: str | None = None
     integrity: str | None = None
 
 
@@ -220,6 +223,9 @@ class Lease:
     preexisting_dirs: frozenset[str] = frozenset()
     baseline_manifest: str | None = None
     baseline_digest: str | None = None
+    index_snapshot: bool = False
+    index_b64: str | None = None
+    content_tree: str | None = None
 
 
 @dataclass
@@ -298,12 +304,13 @@ class WorkspaceEffects:
         """
         if self.tracked_dirty():
             return None
+        index = self._index_bytes()
         lease = Lease(
-            node_key=node_key,
-            pre_head=self.head_commit(),
-            attempt=attempt,
+            node_key=node_key, pre_head=self.head_commit(), attempt=attempt,
             preexisting=frozenset(self._untracked_ignored_paths()),
-            preexisting_dirs=frozenset(self._workspace_dirs()),
+            preexisting_dirs=frozenset(self._workspace_dirs()), index_snapshot=True,
+            index_b64=None if index is None else base64.b64encode(index).decode("ascii"),
+            content_tree=self._fresh_workspace_tree(),
         )
         self._capture_lease_baseline(lease)
         self._write_lease_record(lease)
@@ -321,11 +328,19 @@ class WorkspaceEffects:
         return bool(proc.stdout)
 
     def verify_lease_unchanged(self, lease: Lease) -> None:
-        """Require the standard recovery postconditions without first mutating state."""
+        """Compare actual content and the real index, restoring index bytes before return."""
         epoch, node_id = lease.node_key
         record = self.load_lease_record(epoch, node_id, lease.attempt)
         if record is None:
             raise WorkspaceFault("predicate lease record disappeared before verification")
+        expected = self._record_index_bytes(record)
+        try:
+            index_changed = self._index_bytes() != expected
+            content_changed = self._fresh_workspace_tree() != record.content_tree
+        finally:
+            self._restore_index_snapshot(record)
+        if index_changed or content_changed:
+            raise WorkspaceFault("predicate changed index metadata or workspace content")
         self._verify_recovery_postconditions(record, None)
 
     # -- durable transaction intents (PRINCIPLE B) ---------------------------
@@ -402,7 +417,8 @@ class WorkspaceEffects:
             pre_head=lease.pre_head, preexisting=sorted(lease.preexisting),
             preexisting_dirs=sorted(lease.preexisting_dirs), ts=time.time(),
             baseline_manifest=lease.baseline_manifest,
-            baseline_digest=lease.baseline_digest,
+            baseline_digest=lease.baseline_digest, index_snapshot=lease.index_snapshot,
+            index_b64=lease.index_b64, content_tree=lease.content_tree,
         )
         record.integrity = self._record_integrity(record)
         return record
@@ -605,6 +621,8 @@ class WorkspaceEffects:
             and left.preexisting == right.preexisting
             and left.preexisting_dirs == right.preexisting_dirs
             and left.baseline_digest == right.baseline_digest
+            and (left.index_snapshot, left.index_b64, left.content_tree)
+            == (right.index_snapshot, right.index_b64, right.content_tree)
         )
 
     # -- the ONE lease-recovery transaction ---------------------------------
@@ -672,6 +690,7 @@ class WorkspaceEffects:
         diff_path: Path | None = None
         if receipt is None or not self._recovery_postconditions(lease):
             # Phase 2: capture every byte before the first reset/unlink/overwrite.
+            snapshot_changes = self._snapshot_changed_paths(lease)
             base = (
                 lease.pre_head or self._empty_tree()
                 if request.evidence_kind == "failed-diffs"
@@ -682,7 +701,7 @@ class WorkspaceEffects:
                 self.run_dir / request.evidence_kind,
                 (f"e{epoch}-{node_id}" if request.evidence_kind == "failed-diffs"
                  else f"{epoch}-{node_id}-{request.attempt}"), base,
-                sorted(set(leaks) | set(lease.preexisting)),
+                sorted(set(leaks) | set(lease.preexisting) | set(snapshot_changes)),
             )
             if unexpected:
                 divergent = self._capture_workspace(
@@ -751,6 +770,8 @@ class WorkspaceEffects:
                 lease.preexisting, lease.preexisting_dirs,
                 lease.baseline_manifest, lease.baseline_digest,
             )
+            # Cleanup Git reads may refresh stat-cache bytes; restore the exact index last.
+            self._restore_index_snapshot(lease)
 
             # Phase 6: commands are not success; the complete end state is.
             self._verify_recovery_postconditions(lease, diff_path)
@@ -878,7 +899,12 @@ class WorkspaceEffects:
     ) -> None:
         if self._cleanup_head() != rec.pre_head:
             raise WorkspaceFault("recovery postcondition failed: HEAD differs from lease", diff_path)
-        if self.tracked_dirty():
+        if rec.index_snapshot:
+            if self._index_bytes() != self._record_index_bytes(rec):
+                raise WorkspaceFault("recovery postcondition failed: index bytes differ", diff_path)
+            if self._fresh_workspace_tree() != rec.content_tree:
+                raise WorkspaceFault("recovery postcondition failed: workspace content differs", diff_path)
+        elif self.tracked_dirty():
             raise WorkspaceFault("recovery postcondition failed: tracked/index state is dirty", diff_path)
         if self._attempt_leaks(rec.preexisting, rec.preexisting_dirs):
             raise WorkspaceFault("recovery postcondition failed: attempt leaks remain", diff_path)
@@ -888,6 +914,8 @@ class WorkspaceEffects:
                 preexisting=frozenset(rec.preexisting),
                 preexisting_dirs=frozenset(rec.preexisting_dirs),
                 baseline_manifest=rec.baseline_manifest, baseline_digest=rec.baseline_digest,
+                index_snapshot=rec.index_snapshot, index_b64=rec.index_b64,
+                content_tree=rec.content_tree,
             )
             if not self._preexisting_baseline_unchanged(lease):
                 raise WorkspaceFault(
@@ -1661,6 +1689,88 @@ class WorkspaceEffects:
         if os.path.lexists(target):
             raise WorkspaceFault(f"inplace rollback target remained after removal: {rel}")
 
+    # -- index-independent workspace snapshots ------------------------------
+
+    def _index_path(self) -> Path:
+        proc = self.git_bytes("rev-parse", "--git-path", "index")
+        self._checked_bytes(proc, "locate repository index")
+        path = Path(os.fsdecode(proc.stdout.rstrip(b"\n")))
+        return path if path.is_absolute() else self.workdir / path
+
+    def _index_bytes(self) -> bytes | None:
+        path = self._index_path()
+        if not os.path.lexists(path):
+            return None
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
+                raise WorkspaceFault(f"repository index is not a regular file: {path}")
+            return path.read_bytes()
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot snapshot repository index {path}: {exc}") from exc
+
+    @staticmethod
+    def _record_index_bytes(rec: LeaseRecord | Lease) -> bytes | None:
+        if not rec.index_snapshot:
+            raise WorkspaceFault("lease has no required index snapshot")
+        if rec.index_b64 is None:
+            return None
+        try:
+            return base64.b64decode(rec.index_b64, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise WorkspaceFault(f"lease index snapshot is corrupt: {exc}") from exc
+
+    def _restore_index_snapshot(self, rec: LeaseRecord | Lease) -> None:
+        if not rec.index_snapshot:
+            return
+        expected = self._record_index_bytes(rec)
+        path = self._index_path()
+        try:
+            if self._index_bytes() == expected:
+                return
+        except WorkspaceFault:
+            pass
+        if expected is not None:
+            self._atomic_write(path, expected, "index snapshot")
+        else:
+            try:
+                if os.path.lexists(path):
+                    path.unlink()
+                    self._fsync_dir(path.parent)
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot restore absent repository index: {exc}") from exc
+
+    def _fresh_workspace_tree(self) -> str:
+        """Hash actual worktree content through a temporary index, never the live index."""
+        with tempfile.TemporaryDirectory(prefix="wildflows-index-") as directory:
+            env = os.environ.copy()
+            env["GIT_INDEX_FILE"] = str(Path(directory) / "index")
+            read = ("read-tree", "--empty") if self._cleanup_head() is None else (
+                "read-tree", "HEAD"
+            )
+            self._checked_bytes(self.git_bytes(*read, env=env), "seed temporary index")
+            self._checked_bytes(
+                self.git_bytes("add", "-u", "--", ".", env=env), "snapshot workspace content"
+            )
+            tree = self.git_bytes("write-tree", env=env)
+            self._checked_bytes(tree, "write temporary-index tree")
+            try:
+                return tree.stdout.strip().decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise WorkspaceFault(f"temporary tree OID is invalid: {exc}") from exc
+
+    def _snapshot_changed_paths(self, rec: LeaseRecord) -> list[str]:
+        if not rec.index_snapshot or rec.content_tree is None:
+            return []
+        current = self._fresh_workspace_tree()
+        if current == rec.content_tree:
+            return []
+        diff = self.git_bytes(
+            "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+            rec.content_tree, current,
+        )
+        self._checked_bytes(diff, "compare temporary-index trees")
+        return [_wire_path(path) for path in diff.stdout.split(b"\0") if path]
+
     # -- git plumbing --------------------------------------------------------
 
     def git(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1673,11 +1783,13 @@ class WorkspaceEffects:
             raise WorkspaceFault(f"cannot launch/decode git {' '.join(args)}: {exc}") from exc
 
     def git_bytes(
-        self, *args: str, input_data: bytes | None = None
+        self, *args: str, input_data: bytes | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         try:
             return subprocess.run(
                 ["git", *args], cwd=self.workdir, capture_output=True, input=input_data,
+                env=env,
             )
         except OSError as exc:
             raise WorkspaceFault(f"cannot launch git {' '.join(args)}: {exc}") from exc
