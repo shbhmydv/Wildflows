@@ -5,16 +5,18 @@ in the single vocabulary. Effects are core-mediated: inplace writes + commits ar
 core's, never the model's. `replay` reconstructs run state from the ndjson alone,
 proving resume = fold-the-journal (no per-shape resume code).
 
-Only `do` and `inplace` are executable here; `dispatch` is the sequence container that
-walks its children in order. Combine/loop/ask/setup raise NotImplementedError — they
-are representable (expr.py) and journal-ready (events.py) but land at later ladder steps.
+Executable here: `do`, `inplace`, `seq` (strict order), `dispatch` (parallel semantics,
+executed serially in the PoC — real parallelism is ladder step 3), and `loop` (with a
+`cmd` predicate). Combine/ask/setup and `loop` with a `flag` predicate raise
+NotImplementedError — representable (expr.py) and journal-ready (events.py), landing at
+later ladder steps.
 """
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from wildflows.events import Boundary, Dispatched, Integrated, ResultEvent
-from wildflows.expr import Dispatch, Do, Expr, Inplace, assign_node_ids
+from wildflows.events import Boundary, Dispatched, Integrated, LoopIter, ResultEvent
+from wildflows.expr import Dispatch, Do, Expr, Inplace, Loop, Seq, Until, assign_node_ids
 from wildflows.journal import Journal
 from wildflows.rig import RigRegistry, Result
 
@@ -51,15 +53,74 @@ class Engine:
         )
 
     def _exec(self, node: Expr, epoch: int) -> None:
-        if isinstance(node, Dispatch):
-            for child in node.children:  # PoC: sequential, deterministic order
+        if isinstance(node, Seq):
+            for child in node.children:  # strict order
                 self._exec(child, epoch)
+        elif isinstance(node, Dispatch):
+            # Semantics: unordered-parallel. The PoC executes serially (real
+            # parallelism is ladder step 3); order here is an implementation detail,
+            # not a contract. Use Seq when order matters.
+            for child in node.children:
+                self._exec(child, epoch)
+        elif isinstance(node, Loop):
+            self._exec_loop(node, epoch)
         elif isinstance(node, Do):
             self._exec_do(node, epoch)
         elif isinstance(node, Inplace):
             self._exec_inplace(node, epoch)
         else:
             raise NotImplementedError(f"{node.kind} is not executable in the PoC")
+
+    def _exec_loop(self, node: Loop, epoch: int) -> None:
+        """Run `body` then check `until`; repeat until converged or `cap` iterations.
+
+        `cap` is a core-enforced rail. Cap-exhaustion is a *result* (ok=False), not a
+        crash — the planner reads it. Each iteration is journalled (LoopIter) so replay
+        knows how many ran and which commit was last integrated (D5 resume rule).
+        """
+        if node.until.kind != "cmd":
+            raise NotImplementedError(
+                "loop `until=flag` is planner-judged; lands with real planner integration"
+            )
+        iterations = 0
+        converged = False
+        for i in range(node.cap):
+            self._exec(node.body, epoch)
+            commit = self._head_commit()
+            converged = self._until_met(node.until)
+            self.journal.append(
+                LoopIter(
+                    run_id=self.run_id,
+                    epoch=epoch,
+                    node_id=node.node_id,
+                    iteration=i,
+                    commit=commit,
+                    converged=converged,
+                )
+            )
+            iterations = i + 1
+            if converged:
+                break
+        text = (
+            f"loop converged after {iterations} iteration(s)"
+            if converged
+            else f"loop hit cap {node.cap} without convergence (partial progress preserved)"
+        )
+        self._journal_result(node.node_id, epoch, Result(text=text, ok=converged))
+
+    def _until_met(self, until: Until) -> bool:
+        """Run the `until` predicate cmd in the workdir; exit 0 means converged."""
+        assert until.cmd is not None  # kind=="cmd" guarantees this
+        return (
+            subprocess.run(until.cmd, shell=True, cwd=self.workdir).returncode == 0
+        )
+
+    def _head_commit(self) -> str | None:
+        """The workdir's current HEAD sha, or None if it has no commits yet."""
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.workdir, capture_output=True, text=True
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else None
 
     def _exec_do(self, node: Do, epoch: int) -> None:
         self.journal.append(
@@ -89,7 +150,7 @@ class Engine:
         paths: list[str] = []
         for edit in node.edits:
             target = (self.workdir / edit.path).resolve()
-            if not str(target).startswith(str(self.workdir.resolve())):
+            if not target.is_relative_to(self.workdir.resolve()):
                 raise ValueError(f"inplace edit escapes workdir: {edit.path}")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(edit.content, encoding="utf-8")
@@ -114,10 +175,12 @@ class Engine:
     def _commit(self, paths: list[str], message: str) -> str | None:
         """Core-mediated commit; returns the commit sha, or None if nothing staged."""
         subprocess.run(["git", "add", *paths], cwd=self.workdir, check=True)
-        status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=self.workdir, capture_output=True, text=True
-        ).stdout
-        if not status.strip():
+        # Check the STAGED set only — unrelated untracked files (e.g. a loop
+        # predicate's iteration artifacts) must not force a commit with nothing staged.
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=self.workdir
+        ).returncode
+        if staged == 0:  # exit 0 = no staged diff
             return None
         subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.workdir, check=True)
         return subprocess.run(
@@ -145,6 +208,9 @@ class ReplayState:
         self.results: dict[str, Result] = {}
         self.integrated: dict[str, list[str]] = {}
         self.dispatched: set[str] = set()
+        # Per loop node_id: completed-iteration count + last integrated commit (D5).
+        self.loop_iterations: dict[str, int] = {}
+        self.loop_last_commit: dict[str, str | None] = {}
         self._closed_epochs: set[int] = set()
 
     def epoch_closed(self, epoch: int) -> bool:
@@ -164,6 +230,9 @@ def replay(run_dir: Path) -> ReplayState:
             )
         elif isinstance(ev, Integrated):
             state.integrated[ev.node_id] = ev.paths
+        elif isinstance(ev, LoopIter):
+            state.loop_iterations[ev.node_id] = ev.iteration + 1
+            state.loop_last_commit[ev.node_id] = ev.commit
         elif isinstance(ev, Boundary) and ev.phase == "closed":
             state._closed_epochs.add(ev.epoch)
     return state

@@ -67,6 +67,21 @@ class Judged(_Header):
     target_node: str
 
 
+class LoopIter(_Header):
+    """One completed loop iteration (body executed + `until` checked).
+
+    Carries the iteration index, the workdir HEAD after the body integrated, and
+    whether `until` converged. Replay folds these to expose, per loop node, the count
+    of completed iterations and the last integrated commit (D5 resume rule) — with no
+    special case beyond a two-line fold.
+    """
+
+    kind: Literal["loop_iter"] = "loop_iter"
+    iteration: int
+    commit: str | None = None
+    converged: bool = False
+
+
 class Asked(_Header):
     """An ask parked, awaiting the owner."""
 
@@ -84,7 +99,7 @@ class Answered(_Header):
 
 
 Event = Annotated[
-    Union[Boundary, Dispatched, ResultEvent, Integrated, Judged, Asked, Answered],
+    Union[Boundary, Dispatched, ResultEvent, Integrated, Judged, LoopIter, Asked, Answered],
     Field(discriminator="kind"),
 ]
 

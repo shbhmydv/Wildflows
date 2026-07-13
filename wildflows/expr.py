@@ -49,7 +49,22 @@ class Do(BaseModel):
 
 
 class Dispatch(BaseModel):
+    """Parallel `do()`s — children are unordered and disjoint by construction.
+
+    Dispatch declares *no* ordering: siblings may run concurrently (real parallelism
+    is ladder step 3; the PoC executes them serially but the semantics are
+    unordered-parallel). For strictly ordered execution use `Seq`.
+    """
+
     kind: Literal["dispatch"] = "dispatch"
+    node_id: str = ""
+    children: list["Expr"]
+
+
+class Seq(BaseModel):
+    """Strictly ordered execution: run each child in list order, one after another."""
+
+    kind: Literal["seq"] = "seq"
     node_id: str = ""
     children: list["Expr"]
 
@@ -92,12 +107,13 @@ class Setup(BaseModel):
 
 
 Expr = Annotated[
-    Union[Do, Dispatch, Combine, Loop, Inplace, Ask, Setup],
+    Union[Do, Dispatch, Seq, Combine, Loop, Inplace, Ask, Setup],
     Field(discriminator="kind"),
 ]
 
 # Resolve the forward references now that every member exists.
 Dispatch.model_rebuild()
+Seq.model_rebuild()
 Combine.model_rebuild()
 Loop.model_rebuild()
 
@@ -113,7 +129,7 @@ def parse_expr(data: dict[str, Any]) -> Expr:
 
 def children_of(expr: Expr) -> list[Expr]:
     """The direct sub-expressions of a node, in stable order."""
-    if isinstance(expr, Dispatch):
+    if isinstance(expr, (Dispatch, Seq)):
         return list(expr.children)
     if isinstance(expr, Combine):
         return list(expr.inputs)

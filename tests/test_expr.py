@@ -13,6 +13,7 @@ from wildflows.expr import (
     Inplace,
     Loop,
     RigRef,
+    Seq,
     Setup,
     Until,
     assign_node_ids,
@@ -20,16 +21,32 @@ from wildflows.expr import (
 )
 
 
-def test_all_seven_primitives_construct() -> None:
+def test_all_eight_expression_kinds_construct() -> None:
     do = Do(task="write", rig=RigRef(name="echo"))
     dispatch = Dispatch(children=[do, do])
+    seq = Seq(children=[do, do])
     combine = Combine(task="merge", rig=RigRef(name="echo"), inputs=[do])
     loop = Loop(body=do, until=Until(kind="flag"), cap=3)
     inplace = Inplace(edits=[Edit(path="a.txt", content="x")])
     ask = Ask(question="which?")
     setup = Setup(cmd="npm ci")
-    for e in (do, dispatch, combine, loop, inplace, ask, setup):
+    for e in (do, dispatch, seq, combine, loop, inplace, ask, setup):
         assert e.node_id == ""  # unassigned until admitted
+
+
+def test_seq_is_ordered_and_assigns_child_ids() -> None:
+    tree = Seq(
+        children=[
+            Inplace(edits=[Edit(path="a.txt", content="x")]),
+            Do(task="then", rig=RigRef(name="echo")),
+        ]
+    )
+    assign_node_ids(tree)
+    assert tree.kind == "seq"
+    assert tree.node_id == "n0"
+    assert [c.node_id for c in tree.children] == ["n0.0", "n0.1"]
+    back = parse_expr(tree.model_dump())
+    assert isinstance(back, Seq)
 
 
 def test_discriminated_parse_roundtrip() -> None:

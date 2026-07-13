@@ -11,6 +11,7 @@ from wildflows.events import (
     Integrated,
     Event,
     Judged,
+    LoopIter,
     ResultEvent,
     parse_event,
 )
@@ -33,6 +34,7 @@ def test_all_event_types_roundtrip_through_ndjson(tmp_path: Path) -> None:
         ResultEvent(run_id="r", epoch=0, node_id="n0.0", ok=True, text="done"),
         Integrated(run_id="r", epoch=0, node_id="n0.0", commit="abc", paths=["a.txt"]),
         Judged(run_id="r", epoch=0, node_id="n0.1", verdict="pass", ok=True, target_node="n0.0"),
+        LoopIter(run_id="r", epoch=0, node_id="n0", iteration=0, commit="abc", converged=True),
         Asked(run_id="r", epoch=0, node_id="n0.2", question="which?"),
         Answered(run_id="r", epoch=0, node_id="n0.2", answer="left", ok=True),
         Boundary(run_id="r", epoch=0, node_id="n0", phase="closed"),

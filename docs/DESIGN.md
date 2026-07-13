@@ -14,7 +14,8 @@ is silent, the minimal call is marked **(hand-1 call, review pending)**.
 
 ## 1. The primitive algebra
 
-A workflow is an **expression** over seven primitives. Named shapes (swarm, battle,
+A workflow is an **expression** over seven work primitives plus one ordering
+combinator (`seq`) — eight expression kinds in all. Named shapes (swarm, battle,
 senior→junior loop, grindstone-classic) are **macros** — saved expressions with a
 name — and act as *nudges*: the planner reaches for a fitting macro first, composes a
 wild expression only when nothing fits, and a wild expression that works is a
@@ -37,12 +38,24 @@ One agent, one task, in a fresh worktree.
   worktree and journal survive, the node re-enters from its last durable point.
 
 ### `dispatch(tasks)`
-Parallel `do()`s. One worktree per child; children are disjoint by construction.
+Parallel `do()`s — **unordered by contract**. One worktree per child; children are
+disjoint by construction and may run concurrently (real parallelism is ladder step 3;
+the PoC executes them serially, but that order is an implementation detail, never a
+contract). When execution order matters, wrap the steps in `seq`, not `dispatch`.
 - **Inputs:** a list of `do` (or any) sub-expressions.
 - **Output:** a list of results, positionally aligned with the inputs.
 - **Failure modes:** per-child, as `do`. A child BACKOFF does not fail its siblings;
   the core integrates the ready children and re-enters the parked child. Integration
   of sibling diffs uses the **disjoint-ownership merge** (below).
+
+### `seq(children)`
+Strictly ordered execution: run each child, in list order, one after another. The
+ordering combinator that `dispatch` deliberately is *not*. A loop `body` is typically a
+`seq` (edit → build → judge, in order).
+- **Inputs:** a list of sub-expressions.
+- **Output:** the ordered list of child results.
+- **Failure modes:** per-child, as the child's own kind; downstream children still run
+  (the planner reads the journal and re-shapes) — `seq` sequences, it does not gate.
 
 ### `combine(results, task)`
 A `do()` whose input is *other results* (collect, judge-panel synthesis, merge).
@@ -105,10 +118,11 @@ An expression is a small **recursive Pydantic model** — a discriminated union 
 in `wildflows/expr.py`.)
 
 ```
-Expr = Do | Dispatch | Combine | Loop | Inplace | Ask | Setup
+Expr = Do | Dispatch | Seq | Combine | Loop | Inplace | Ask | Setup
 
 Do:       kind="do"       task: str   rig: RigRef   ctx: list[CtxRef] = []
-Dispatch: kind="dispatch" children: list[Expr]
+Dispatch: kind="dispatch" children: list[Expr]              # unordered / parallel
+Seq:      kind="seq"      children: list[Expr]              # strictly ordered
 Combine:  kind="combine"  task: str   rig: RigRef   inputs: list[Expr]
 Loop:     kind="loop"     body: Expr  until: Until   cap: int
 Inplace:  kind="inplace"  edits: list[Edit]                 # Edit = (path, content)
@@ -128,9 +142,9 @@ join key between the expression tree and the journal — it is what makes resume
 not inside it (§4).
 
 One expression tree = one **epoch** = one planner re-entry point + one durability
-point (§3). The tree is validated by Pydantic on admission; only `do` and `inplace`
-are *executable* in the PoC (ladder step 1), but all seven are *representable* so the
-journal vocabulary and the model are proven complete from day one.
+point (§3). The tree is validated by Pydantic on admission; `do`, `inplace`, `seq`, `dispatch`, and
+`loop` (with a `cmd` predicate) are *executable* in the PoC, but all eight kinds are
+*representable* so the journal vocabulary and the model are proven complete from day one.
 
 ---
 
@@ -155,6 +169,7 @@ types (in `wildflows/events.py`), each a Pydantic model sharing a header
 | `result`     | an agent/primitive produced output        | `ok`, `text` tail, `files`, `exit_code?` |
 | `integrated` | the core applied+committed a result       | `commit`, `paths` (disjoint-ownership set) |
 | `judged`     | a `do`-as-judge produced a verdict         | `verdict`, `ok`, `target_node` |
+| `loop_iter`  | a `loop` completed one iteration          | `iteration`, `commit`, `converged` |
 | `asked`      | an `ask` parked                           | `question`, `options` |
 | `answered`   | the owner answered (or the ask expired)   | `answer`, `ok` |
 
@@ -166,6 +181,15 @@ Notes:
   say whether it co-exists with `result`; co-existing keeps `result` universal.
 - `setup` uses `dispatched` + `result` (exit code in `result.exit_code`); no special
   event, per "one vocabulary."
+- `loop_iter` is one event per completed loop iteration, carrying the iteration index,
+  the workdir HEAD after the body integrated, and whether `until` converged. **(hand-2
+  call, review pending)** — a dedicated event was chosen over an `iteration` field
+  smeared across every event: the loop is the only primitive that repeats a node, so a
+  per-repeat fact belongs to its own event, keeps every other event single-shot, and
+  lets replay expose "iterations-completed + last commit" (D5) in a two-line fold with
+  no special case. Each iteration's inner nodes still emit their normal
+  `dispatched`/`result`/`integrated`; `loop_iter` is the per-iteration cap/convergence
+  marker over them, not a replacement.
 - `integrated` is emitted only by the **core**, never a rig — it is the mediation
   proof (invariant 1).
 - Sequence numbers (`seq`) are a strictly increasing per-run integer; the journal is
@@ -346,3 +370,20 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
 4. An expired `ask` journals a synthetic empty `answered(ok=False)` for total replay.
 5. `setup` carries a planner-declared `idempotent` flag; non-idempotent setups are
    surfaced on resume, not auto-re-run.
+6. **REVERSED on review: `seq` added, `dispatch` is parallel-only.** Hand-1's call to
+   overload `dispatch` as a sequential ordering container was rejected. `seq` is now an
+   explicit 8th expression kind for strict ordering; `dispatch` returns to
+   unordered-parallel semantics (the PoC may still execute dispatch children serially,
+   but that is an implementation detail, not a contract). This is a settled reversal,
+   not a pending call.
+
+### Hand-2 calls pending review
+
+7. **`loop_iter` event** for per-iteration journalling (see §3 note): a dedicated event
+   over an `iteration` field on every event, so replay folds iterations-completed + last
+   commit in two lines and every other event stays single-shot.
+8. **`_commit` checks the STAGED diff only** (`git diff --cached --quiet`), not the whole
+   working tree (`git status --porcelain`). A loop's `until` predicate legitimately
+   leaves untracked iteration artifacts in the workdir; the old whole-tree check would
+   force a commit with nothing staged (git error). Staged-only is the correct
+   "did the declared edits change anything" test and keeps `inplace` re-apply idempotent.
