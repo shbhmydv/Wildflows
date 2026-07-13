@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import signal
 import subprocess
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
@@ -66,9 +67,12 @@ class ShellRig:
     This is the real plug-in path (e.g. template='claude -p {prompt}'); the command
     runs with cwd=workdir so a real rig writes its files inside the worktree.
 
-    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever (SF3). A
-    timed-out command is reaped and returned as `outcome="failed"` with a `[timeout]`
-    marker (reaping the process GROUP is ladder step 4).
+    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever (SF3). The
+    command runs in its OWN process group (`start_new_session=True`); on timeout the
+    core signals the whole GROUP (`killpg`), so background children the shell spawned
+    (`cmd & ...`) are reaped too, not orphaned (pass-2 SHOULD-FIX 3). A timeout is
+    returned as `outcome="failed"` with a `[timeout]` marker; any non-zero exit is
+    likewise `outcome="failed"` (pass-2 SHOULD-FIX 7).
     """
 
     def __init__(self, template: str, timeout_s: float) -> None:
@@ -77,28 +81,35 @@ class ShellRig:
 
     def run(self, prompt: str, workdir: Path) -> Result:
         cmd = self.template.replace("{prompt}", shlex.quote(prompt))
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,  # own process group -> killpg reaps descendants
+        )
         try:
-            proc = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=workdir,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_s,
-            )
-        except subprocess.TimeoutExpired as exc:
-            err = exc.stderr or b""
-            stderr = err.decode() if isinstance(err, bytes) else err
+            stdout, stderr = proc.communicate(timeout=self.timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            stdout, stderr = proc.communicate()
             return Result(
                 text=f"[timeout] command exceeded {self.timeout_s}s\n{stderr}",
                 ok=False,
                 exit_code=None,
                 outcome="failed",
             )
+        ok = proc.returncode == 0
         return Result(
-            text=proc.stdout if proc.returncode == 0 else proc.stderr,
-            ok=proc.returncode == 0,
+            text=stdout if ok else stderr,
+            ok=ok,
             exit_code=proc.returncode,
+            outcome="ok" if ok else "failed",
         )
 
 

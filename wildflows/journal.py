@@ -41,21 +41,30 @@ class Journal:
         """Reconstruct a journal from its ndjson alone (the resume/dashboard entrypoint).
 
         Tolerates exactly ONE torn tail: a kill/power-loss during the final `write()`
-        can leave the last line unterminated or malformed (`{"kind":"result"` with no
-        newline). That last-line-only failure is dropped silently — the record never
-        durably completed, so the next append safely reuses its seq. A malformed
-        COMPLETE or MIDDLE record still raises: only the final line may be torn (B2).
+        can leave the last record unterminated (no trailing `\\n`) or a partial multibyte
+        UTF-8 sequence. Only a record that lacks its terminating newline may be dropped,
+        and only if it fails to parse. A newline-TERMINATED record durably completed its
+        write, so if it is malformed the journal still raises — a complete invalid line
+        is corruption, not a torn tail (pass-2 B2 / SHOULD-FIX 1). The file is read as
+        RAW BYTES so a mid-UTF-8 unterminated tail is recoverable rather than a decode
+        crash outside the handler.
         """
         j = cls(run_dir)
         if not j.path.exists():
             return j
-        lines = [ln for ln in j.path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        last = len(lines) - 1
-        for i, line in enumerate(lines):
+        raw = j.path.read_bytes()
+        if not raw:
+            return j
+        # A trailing newline means the physical final record fully completed its write;
+        # its absence marks a possibly-torn tail we may drop on a parse/decode failure.
+        final_terminated = raw.endswith(b"\n")
+        records = [r for r in raw.split(b"\n") if r.strip()]
+        last = len(records) - 1
+        for i, rec in enumerate(records):
             try:
-                j._events.append(parse_event(json.loads(line)))
-            except (json.JSONDecodeError, ValidationError):
-                if i == last:
-                    break  # torn final record — drop it, no durable log
+                j._events.append(parse_event(json.loads(rec.decode("utf-8"))))
+            except (json.JSONDecodeError, ValidationError, UnicodeDecodeError):
+                if i == last and not final_terminated:
+                    break  # unterminated torn final record — drop it, no durable log
                 raise
         return j

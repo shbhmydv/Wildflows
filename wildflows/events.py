@@ -91,6 +91,13 @@ class LoopIter(_Header):
     iteration: int
     commit: str | None = None
     converged: bool = False
+    # The iteration's body artifact, folded so a crash BETWEEN the last loop_iter and
+    # the loop's final ResultEvent can reconstruct the loop result without re-running a
+    # converged/capped body (pass-2 NB3 / SF6). Additive: pre-existing loop_iter lines
+    # (no fields) default to an empty body, matching the old behavior.
+    body_text: str = ""
+    body_files: list[str] = Field(default_factory=list)
+    body_exit_code: int | None = None
 
 
 class Asked(_Header):

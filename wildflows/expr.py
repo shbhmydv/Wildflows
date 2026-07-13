@@ -57,9 +57,11 @@ class Until(BaseModel):
     @model_validator(mode="after")
     def _cmd_requires_command(self) -> "Until":
         # A `cmd` predicate without a command is invalid expression data, not an engine
-        # crash after the epoch is already open (SF5). Reject it on admission.
-        if self.kind == "cmd" and self.cmd is None:
-            raise ValueError("until(kind='cmd') requires a `cmd`")
+        # crash after the epoch is already open (SF5). A blank/whitespace-only cmd is
+        # equally invalid: POSIX `sh -c ""` exits 0, so it would be a predicate that
+        # ALWAYS converges with no test at all (pass-2 SHOULD-FIX 5). Reject both.
+        if self.kind == "cmd" and (self.cmd is None or not self.cmd.strip()):
+            raise ValueError("until(kind='cmd') requires a non-blank `cmd`")
         return self
 
 
