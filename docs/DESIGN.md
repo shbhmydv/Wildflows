@@ -321,13 +321,25 @@ replay rules:
   **Two-boundary provenance (hand-9, §Appendix 41):** the `result` event is a SECOND
   durable boundary carrying `post_head`; a torn result-then-integrated window reconstructs
   the receipt from EXACTLY `pre_head..post_head` (never `..HEAD`). A dispatched-only tail has
-  no `post_head` certificate — it is ALWAYS re-run after cleaning its leftover dirt, and a
-  dead attempt's mid-rig commits stay as reachable forensic residue, never reset away. The
-  re-run's lease REFUSES to open on a dirty tracked/index worktree (the honest serial-M1
-  rule), so a failed attempt's revert can only ever undo its own effects.
+  no `post_head` certificate — it is ALWAYS re-run. **Quarantine, never destroy (hand-10,
+  §Appendix 47):** before the re-run, the dead attempt's tip (its mid-rig commits AND any
+  post-crash operator commit) is moved to a quarantine ref and the branch reset to the
+  DURABLE `pre_head` (loaded from the on-disk lease record, not memory); uncommitted dirt +
+  non-preexisting untracked leaks are captured to run_dir; pre-existing untracked files are
+  left in place. Because the re-run starts from `pre_head`, an idempotent rig can never
+  absorb a retained commit as unreceipted success — it must author its own effect and earn
+  its own receipt. The re-run's lease still REFUSES to open on a dirty tracked/index
+  worktree (the honest serial-M1 rule); every cleanup/rollback git op is CHECKED and a
+  failure HALTS the epoch (a `workspace_unclean` failed result), never a durable "failed"
+  that lies the effect was reverted.
 - **`inplace`:** `integrated` present → done (the commit is durable); `dispatched`
-  without `integrated` → re-apply the edits (whole-file writes are idempotent). An
-  empty/no-diff inplace is a durable no-op.
+  without `integrated` → re-apply the edits (whole-file writes are idempotent). **Durable
+  intent (hand-10, §Appendix 47):** before the first write, the per-path original content is
+  fsynced to `run_dir/intents/`; a crash mid-edit is REVERSED from that record on restart
+  (a partial write to a pre-existing — possibly untracked — file is restored, which a
+  `reset --hard` alone cannot recover) before the node re-runs. Any exception after the
+  first write (not just a symlink `ValueError` — an `OSError` too) rolls back from the same
+  record. An empty/no-diff inplace is a durable no-op.
 - **`dispatch`:** fold each child independently; integrate ready children, re-dispatch
   in-flight ones.
 - **`loop` (D5):** live session state is gone. Find the **last integrated iteration**
@@ -864,3 +876,67 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     Admission rejects a ref to a structural `seq`/`dispatch` (which journals no node-level
     result) and to an unfinished ANCESTOR composite (its result cannot exist before the
     consumer inside it runs), instead of leaving it to fail as an unresolved ctx at run time.
+
+### Hand-10 calls (from the pass-6 exit review) — THE TRANSACTION MODEL OF RECORD
+
+Pass 6 (three converging review passes) found ONE root cause under all remaining data-loss
+and false-durability rows: **recovery state lived in process memory, and cleanup destroyed
+content with unchecked git ops.** Hand-10 eliminates the class with two principles rather
+than patching each row. Both are the transaction model of record — not a later refinement.
+
+47. **PRINCIPLE A — QUARANTINE, NEVER DESTROY.** No cleanup path may delete or reset-away
+    content irrecoverably.
+    - **Dead-attempt recovery (dispatched-only tail).** SUPERSEDES hand-9's `reset --hard
+      HEAD` + sweep. The current tip (dead-attempt commits AND any post-crash operator
+      commit) is moved to a quarantine ref `refs/wildflows/quarantine/<run>-<epoch>-<node>-
+      <attempt>`, so all of it stays reachable; uncommitted dirt + non-preexisting untracked
+      leaks are captured to `run_dir/quarantine/`; the branch is reset to the DURABLE
+      `pre_head` (from the lease record, §48); only NON-preexisting untracked leaks are then
+      swept (the lease's per-file `preexisting` snapshot is left in place). This kills BOTH
+      pass-6 blocker rows at once: no user file is destroyed (operator commits → quarantine
+      ref; pre-existing untracked → left in place), AND the *idempotent-rerun-absorbs-a-
+      retained-commit* false success is impossible, because the rerun starts from `pre_head`
+      and must produce its OWN receipt for any active effect.
+    - **Checked live failure/rollback.** `finalize_failure` keeps its revert, but EVERY git
+      op in ANY cleanup/rollback path (reset, update-ref, clean, unstage) is CHECKED; a
+      failure raises a typed `WorkspaceFault`. The engine then records a failed result
+      explicitly marked **`workspace_unclean=True`** and re-raises to HALT the epoch (no
+      `boundary(closed)` for a workspace it could not clean). A durable "failed" that lies
+      the live effect was reverted is worse than a crash.
+    - **`post_head=None` on an effectful result is refused.** A `result` with non-empty
+      declared `files` and no `post_head` completion certificate is classified as an
+      interrupted pre-v1 tail (`JournalCompatibilityError`), never accepted as a receipt-
+      less durable success. `post_head` is sampled from `head_commit()` on every modern
+      result; a loop's final result (non-None `loop_status`) is exempt (its durability rides
+      on the body iterations' own `integrated` events). Ledger note on the unsafe interval:
+      the rig-return-through-core-commit window is now SAFE — a crash there leaves a
+      dispatched-only tail, which quarantine+reset re-runs to its own receipt.
+48. **PRINCIPLE B — DURABLE TRANSACTION INTENTS.** Any state a restart needs to finish or
+    reverse an interrupted transaction is fsynced to `run_dir` BEFORE the first mutation.
+    - **Lease record.** `(pre_head, per-file preexisting untracked/ignored snapshot,
+      attempt, timestamp)` is fsynced to `run_dir/leases/<epoch>-<node>-<attempt>.json` at
+      lease open. Restart cleanup loads it — never process memory — so the reviewer's
+      old-user-file-vs-dead-attempt-leak distinction survives process death. Cleanup is
+      idempotent given the record: quarantine-ref creation, reset-to-`pre_head`, and
+      capture-append all redo safely after a crash mid-cleanup. A pre-hand-10 dispatched
+      line with no record falls back to a conservative journal-`pre_head` quarantine that
+      NEVER sweeps (treats all current untracked as preexisting).
+    - **Inplace intent.** Before the first write, every target path + whether it pre-existed
+      + its original content is fsynced to `run_dir/intents/<epoch>-<node>-<attempt>.json`.
+      Writes proceed; on ANY exception (a broad `except Exception`, not just `ValueError`)
+      the engine rolls back from the record and journals the durable failed result; a crash
+      at any point → restart finds the intent record with no matching durable result and
+      reverses it BEFORE anything else (restoring even a pre-existing untracked file's
+      content, which a `reset` cannot). Rollback ops are CHECKED (Principle A). The record is
+      settled (removed) only AFTER the result (+ integrated) are journalled.
+    - **Resume dirty check before any reset.** The resume path no longer blind-resets: it
+      quarantines/captures anything not explained by the lease record, never silently
+      discarding it.
+
+    **Deviations.** (1) The `attempt` index (the node's `dispatch_count` at lease open) keys
+    the lease/intent records AND the quarantine ref, so repeated dead attempts never clobber
+    one another's forensics — a small addition beyond the triage's bare sketch, required for
+    idempotent multi-crash recovery. (2) `workspace_unclean` was chosen (a marked failed
+    result) over a separate run-level fault event, per the triage's "choose one": it keeps
+    the honesty signal on the exact node whose effect survived, with zero new event kind.
+    Net: the serial-M1 restart matrix has no remaining data-loss or false-durability row.
