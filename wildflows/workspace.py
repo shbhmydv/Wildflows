@@ -30,9 +30,10 @@ on failure) lives here and is superseded by discard-the-worktree once worktrees 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -79,6 +80,9 @@ class LeaseRecord(BaseModel):
     attempt: int
     pre_head: str | None
     preexisting: list[str] = Field(default_factory=list)
+    # None marks a legacy record that did not snapshot directories; recovery then refuses
+    # to prune empty parents because it cannot distinguish user-created empty directories.
+    preexisting_dirs: list[str] | None = None
     ts: float
 
 
@@ -101,6 +105,23 @@ class InplaceIntent(BaseModel):
     ts: float
 
 
+class CaptureEntry(BaseModel):
+    """One exactly recoverable filesystem object in an immutable capture."""
+
+    path: str
+    kind: Literal["file", "directory", "symlink", "absent"]
+    size: int | None = None
+    sha256: str | None = None
+    blob: str | None = None
+    link_target: str | None = None
+
+
+class CaptureManifest(BaseModel):
+    """Durable index for raw blobs copied before a destructive reset/sweep."""
+
+    entries: list[CaptureEntry]
+
+
 @dataclass
 class Lease:
     """A node attempt's workspace lease: the shared workdir + its pre-run HEAD.
@@ -117,6 +138,7 @@ class Lease:
     pre_head: str | None
     attempt: int = 0
     preexisting: frozenset[str] = frozenset()
+    preexisting_dirs: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -164,6 +186,7 @@ class WorkspaceEffects:
             pre_head=self.head_commit(),
             attempt=attempt,
             preexisting=frozenset(self._untracked_ignored_paths()),
+            preexisting_dirs=frozenset(self._workspace_dirs()),
         )
         self._write_lease_record(lease)
         return lease
@@ -191,16 +214,16 @@ class WorkspaceEffects:
         except OSError as exc:
             raise WorkspaceFault(f"directory fsync failed for {path}: {exc}") from exc
 
-    def _fsync_json(self, path: Path, model: BaseModel) -> None:
-        """Crash-atomically publish a record: temp + file fsync + replace + dir fsync."""
+    def _atomic_write(self, path: Path, data: bytes, what: str) -> None:
+        """Crash-atomically publish bytes: same-dir temp + fsync + replace + dir fsync."""
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._fsync_dir(path.parent.parent)
             fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
             tmp = Path(raw_tmp)
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(model.model_dump_json())
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, path)
@@ -214,7 +237,10 @@ class WorkspaceEffects:
         except WorkspaceFault:
             raise
         except OSError as exc:
-            raise WorkspaceFault(f"atomic record publication failed for {path}: {exc}") from exc
+            raise WorkspaceFault(f"atomic {what} publication failed for {path}: {exc}") from exc
+
+    def _fsync_json(self, path: Path, model: BaseModel) -> None:
+        self._atomic_write(path, model.model_dump_json().encode("utf-8"), "record")
 
     def _write_lease_record(self, lease: Lease) -> None:
         epoch, node_id = lease.node_key
@@ -223,7 +249,7 @@ class WorkspaceEffects:
             LeaseRecord(
                 epoch=epoch, node_id=node_id, attempt=lease.attempt,
                 pre_head=lease.pre_head, preexisting=sorted(lease.preexisting),
-                ts=time.time(),
+                preexisting_dirs=sorted(lease.preexisting_dirs), ts=time.time(),
             ),
         )
 
@@ -265,9 +291,47 @@ class WorkspaceEffects:
 
     # -- dead-attempt recovery: QUARANTINE, NEVER DESTROY (PRINCIPLE A) -------
 
-    def _quarantine_ref(self, rec: LeaseRecord) -> str:
-        slug = f"{self.run_dir.name}-{rec.epoch}-{rec.node_id}-{rec.attempt}".replace("/", "-")
-        return f"refs/wildflows/quarantine/{slug}"
+    @staticmethod
+    def _ref_component(raw: str) -> str:
+        """Encode arbitrary text as one valid, collision-resistant Git ref component."""
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+        cleaned = re.sub(r"\.{2,}", ".", cleaned).strip(".")
+        changed = cleaned != raw
+        if not cleaned:
+            return f"q-{digest}"
+        if cleaned.endswith(".lock") or len(cleaned) > 80:
+            changed = True
+        cleaned = cleaned[:80].rstrip(".") or "q"
+        return f"{cleaned}-{digest}" if changed else cleaned
+
+    def _quarantine_ref(self, rec: LeaseRecord, head: str) -> str:
+        # The observed tip SHA makes recovery append-only: a redo with an operator commit
+        # allocates another immutable ref instead of moving the dead attempt's first ref.
+        run = self._ref_component(self.run_dir.name)
+        node = self._ref_component(rec.node_id)
+        return (
+            f"refs/wildflows/quarantine/{run}/"
+            f"e{rec.epoch}-{node}-a{rec.attempt}-{head}"
+        )
+
+    def _preserve_tip(self, rec: LeaseRecord, head: str, diff_path: Path | None) -> None:
+        ref = self._quarantine_ref(rec, head)
+        current = self.git("rev-parse", "--verify", "--quiet", ref)
+        if current.returncode == 0:
+            if current.stdout.strip() != head:
+                raise WorkspaceFault(
+                    f"quarantine ref collision at {ref}: expected {head}, "
+                    f"found {current.stdout.strip()}", diff_path,
+                )
+            return
+        if current.returncode != 1:
+            raise WorkspaceFault(
+                f"quarantine ref lookup failed: {current.stderr.strip()}", diff_path)
+        zero = "0" * 40
+        self._checked(
+            self.git("update-ref", ref, head, zero), "quarantine append-only update-ref", diff_path
+        )
 
     def quarantine_dead_attempt(self, rec: LeaseRecord) -> Path | None:
         """Recover a dead dispatched-only attempt without destroying anything (PRINCIPLE A).
@@ -283,8 +347,7 @@ class WorkspaceEffects:
         head = self.head_commit()
         diff_path = self._capture_dead_attempt(rec)
         if head is not None and head != pre:
-            self._checked(self.git("update-ref", self._quarantine_ref(rec), head),
-                          "quarantine update-ref", diff_path)
+            self._preserve_tip(rec, head, diff_path)
         if pre is not None:
             self._checked(self.git("reset", "--hard", pre), "quarantine reset --hard", diff_path)
         else:
@@ -296,7 +359,8 @@ class WorkspaceEffects:
                               "quarantine unborn update-ref -d", diff_path)
             self._checked(self.git("reset"), "quarantine unborn reset", diff_path)
         self._remove_leaks(
-            sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
+            sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting)),
+            None if rec.preexisting_dirs is None else set(rec.preexisting_dirs),
         )
         return diff_path
 
@@ -309,27 +373,168 @@ class WorkspaceEffects:
         swept (never-destroy in the absence of a snapshot)."""
         rec = LeaseRecord(
             epoch=epoch, node_id=node_id, attempt=attempt, pre_head=pre_head,
-            preexisting=self._untracked_ignored_paths(), ts=0.0,
+            preexisting=self._untracked_ignored_paths(), preexisting_dirs=None, ts=0.0,
         )
         return self.quarantine_dead_attempt(rec)
 
     def _capture_dead_attempt(self, rec: LeaseRecord) -> Path | None:
-        """Capture a dead attempt's uncommitted dirt + non-preexisting untracked leaks to
-        run_dir/quarantine/ (committed work is already reachable via the quarantine ref)."""
-        parts: list[str] = []
-        diff = self.git("diff", "HEAD")
-        if diff.returncode == 0 and diff.stdout.strip():
-            parts.append(diff.stdout)
-        parts.extend(self._leak_evidence(
-            sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
-        ))
-        if not parts:
+        """Byte-exactly capture dirt before quarantine reset/sweep."""
+        head = self.head_commit()
+        base = "HEAD" if head is not None else _EMPTY_TREE
+        leaks = sorted(set(self._untracked_ignored_paths()) - set(rec.preexisting))
+        return self._capture_workspace(
+            self.run_dir / "quarantine",
+            f"{rec.epoch}-{rec.node_id}-{rec.attempt}",
+            base,
+            leaks,
+        )
+
+    def _capture_workspace(
+        self, index_dir: Path, stem: str, tracked_base: str, leaks: list[str]
+    ) -> Path | None:
+        """Durably copy exact current bytes plus a binary Git patch before destruction.
+
+        The human-readable ``.diff`` remains an index, while every current regular file
+        (tracked binary dirt, untracked/ignored files, and nested-repository contents) is
+        copied into an immutable sibling ``.capture`` directory and named by a manifest.
+        Any enumerate/read/write/fsync failure raises ``WorkspaceFault`` before reset/sweep.
+        """
+        diff = self.git("diff", "--binary", tracked_base)
+        self._checked(diff, "capture git diff")
+        names = self.git("diff", "--name-only", "-z", tracked_base)
+        self._checked(names, "capture git diff --name-only")
+        tracked = [name for name in names.stdout.split("\0") if name]
+        if not tracked and not leaks:
             return None
-        cap_dir = self.run_dir / "quarantine"
-        cap_dir.mkdir(parents=True, exist_ok=True)
-        path = cap_dir / f"{rec.epoch}-{rec.node_id}-{rec.attempt}.diff"
-        path.write_text("\n".join(parts), encoding="utf-8")
-        return path
+
+        index_path, capture_dir = self._allocate_capture(index_dir, stem)
+        entries: list[CaptureEntry] = []
+        seen: set[str] = set()
+        try:
+            for rel in [*tracked, *leaks]:
+                self._capture_path(rel, self.workdir / rel, capture_dir, entries, seen)
+            manifest = CaptureManifest(entries=entries)
+            self._fsync_json(capture_dir / "manifest.json", manifest)
+            parts = [diff.stdout] if diff.stdout.strip() else []
+            parts.extend(self._capture_evidence(capture_dir, entry) for entry in entries)
+            self._atomic_write(
+                index_path, "\n".join(p for p in parts if p).encode("utf-8"), "capture index"
+            )
+            self._fsync_dir(capture_dir)
+            return index_path
+        except WorkspaceFault:
+            raise
+        except OSError as exc:
+            raise WorkspaceFault(f"filesystem capture failed: {exc}", index_path) from exc
+
+    def _allocate_capture(self, index_dir: Path, stem: str) -> tuple[Path, Path]:
+        try:
+            index_dir.mkdir(parents=True, exist_ok=True)
+            self._fsync_dir(index_dir.parent)
+            suffix = 0
+            while True:
+                name = stem if suffix == 0 else f"{stem}-{suffix}"
+                capture_dir = index_dir / f"{name}.capture"
+                try:
+                    capture_dir.mkdir()
+                    self._fsync_dir(index_dir)
+                    return index_dir / f"{name}.diff", capture_dir
+                except FileExistsError:
+                    suffix += 1
+        except WorkspaceFault:
+            raise
+        except OSError as exc:
+            raise WorkspaceFault(f"capture directory allocation failed: {exc}") from exc
+
+    def _capture_path(
+        self,
+        rel: str,
+        target: Path,
+        capture_dir: Path,
+        entries: list[CaptureEntry],
+        seen: set[str],
+    ) -> None:
+        rel = Path(rel).as_posix().rstrip("/")
+        if rel in seen:
+            return
+        seen.add(rel)
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            entries.append(CaptureEntry(path=rel, kind="absent"))
+            return
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot stat capture source {rel}: {exc}") from exc
+
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                link_target = os.readlink(target)
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot read captured symlink {rel}: {exc}") from exc
+            entries.append(CaptureEntry(path=rel, kind="symlink", link_target=link_target))
+            return
+        if stat.S_ISDIR(info.st_mode):
+            entries.append(CaptureEntry(path=rel, kind="directory"))
+            try:
+                children = sorted(os.scandir(target), key=lambda entry: entry.name)
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot enumerate capture directory {rel}: {exc}") from exc
+            for child in children:
+                child_rel = f"{rel}/{child.name}" if rel else child.name
+                self._capture_path(
+                    child_rel, Path(child.path), capture_dir, entries, seen)
+            return
+        if not stat.S_ISREG(info.st_mode):
+            raise WorkspaceFault(f"cannot byte-capture special filesystem object: {rel}")
+        entries.append(self._capture_file(rel, target, capture_dir))
+
+    def _capture_file(self, rel: str, source: Path, capture_dir: Path) -> CaptureEntry:
+        blobs = capture_dir / "blobs"
+        try:
+            blobs.mkdir(exist_ok=True)
+            fd, raw_tmp = tempfile.mkstemp(prefix=".blob-", dir=blobs)
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+                    while chunk := src.read(1024 * 1024):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        dst.write(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                sha = digest.hexdigest()
+                blob = blobs / sha
+                os.replace(raw_tmp, blob)
+                self._fsync_dir(blobs)
+            except BaseException:
+                try:
+                    Path(raw_tmp).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        except WorkspaceFault:
+            raise
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot byte-capture file {rel}: {exc}") from exc
+        return CaptureEntry(
+            path=rel, kind="file", size=size, sha256=sha,
+            blob=(Path("blobs") / sha).as_posix(),
+        )
+
+    def _capture_evidence(self, capture_dir: Path, entry: CaptureEntry) -> str:
+        header = f"=== captured: {entry.path} ({entry.kind}) ==="
+        if entry.kind != "file" or entry.blob is None:
+            return f"{header}\n{entry.link_target or ''}"
+        data = (capture_dir / entry.blob).read_bytes()
+        try:
+            body = data.decode("utf-8")
+        except UnicodeDecodeError:
+            body = (
+                f"<binary artifact: {entry.size} bytes, sha256={entry.sha256}, "
+                f"blob={entry.blob}>"
+            )
+        return f"{header}\n{body}"
 
     def _checked(
         self, proc: subprocess.CompletedProcess[str], what: str, diff_path: Path | None = None
@@ -379,18 +584,10 @@ class WorkspaceEffects:
         # the empty tree when the lease opened on an unborn repo — captures committed AND
         # staged/tracked leaks; this lease's untracked/ignored are captured separately.
         base = pre if pre is not None else _EMPTY_TREE
-        parts: list[str] = []
-        diff = self.git("diff", base)
-        if diff.stdout.strip():
-            parts.append(diff.stdout)
-        parts.extend(self._leak_evidence(sorted(set(self._untracked_ignored_paths()) - lease.preexisting)))
-
-        diff_path: Path | None = None
-        if parts:
-            leak_dir = self.run_dir / "failed-diffs"
-            leak_dir.mkdir(parents=True, exist_ok=True)
-            diff_path = leak_dir / diff_name
-            diff_path.write_text("\n".join(parts), encoding="utf-8")
+        leaks = sorted(set(self._untracked_ignored_paths()) - lease.preexisting)
+        diff_path = self._capture_workspace(
+            self.run_dir / "failed-diffs", Path(diff_name).stem, base, leaks
+        )
 
         # EVERY revert git op is CHECKED (hand-10, PRINCIPLE A): if reset/update-ref fails,
         # the failing rig's live effect is NOT provably reverted, so raise WorkspaceFault
@@ -409,8 +606,38 @@ class WorkspaceEffects:
         # Recompute leaks AFTER the reset: a leak the failing rig (or a failed core commit)
         # had STAGED only surfaces as untracked once the index is reset. The sweep stays
         # lease-scoped — preexisting user files and the run_dir subtree are never touched.
-        self._remove_leaks(sorted(set(self._untracked_ignored_paths()) - lease.preexisting))
+        self._remove_leaks(
+            sorted(set(self._untracked_ignored_paths()) - lease.preexisting),
+            set(lease.preexisting_dirs),
+        )
         return diff_path
+
+    def _workspace_dirs(self) -> list[str]:
+        """Snapshot preexisting directories so cleanup may safely prune only new parents."""
+        found: list[str] = []
+        errors: list[OSError] = []
+
+        def onerror(exc: OSError) -> None:
+            errors.append(exc)
+
+        for root, dirs, _files in os.walk(
+            self.workdir, topdown=True, onerror=onerror, followlinks=False
+        ):
+            root_path = Path(root)
+            kept: list[str] = []
+            for name in dirs:
+                path = root_path / name
+                rel = path.relative_to(self.workdir).as_posix()
+                if name == ".git" and root_path == self.workdir:
+                    continue
+                if self._overlaps_run_dir(rel) or path.is_symlink():
+                    continue
+                found.append(rel)
+                kept.append(name)
+            dirs[:] = kept
+        if errors:
+            raise WorkspaceFault(f"cannot snapshot workspace directories: {errors[0]}")
+        return found
 
     def _untracked_ignored_paths(self) -> list[str]:
         """The untracked (`??`) and ignored (`!!`) paths git reports PER FILE
@@ -419,6 +646,11 @@ class WorkspaceEffects:
         nested Git repo still appears as ONE `dir/` entry — git never recurses into it —
         and is walked/removed as a directory by the evidence/sweep helpers."""
         status = self.git("status", "--ignored", "--porcelain", "-z", "--untracked-files=all")
+        self._checked(status, "enumerate untracked/ignored paths")
+        if status.stderr.strip():
+            raise WorkspaceFault(
+                f"enumerate untracked/ignored paths was incomplete: {status.stderr.strip()}"
+            )
         out: list[str] = []
         for entry in status.stdout.split("\0"):
             if not entry or entry[:2] not in ("??", "!!"):
@@ -428,47 +660,62 @@ class WorkspaceEffects:
                 out.append(rel)
         return out
 
-    def _leak_evidence(self, leaks: list[str]) -> list[str]:
-        """Dump each leaked path's content — git omits untracked/ignored from `diff`. A
-        directory (e.g. a nested Git repo) is WALKED so its file listing + contents are
-        recorded verbatim, never a bare `<unreadable>` (hand-8, defect 3)."""
-        out: list[str] = []
+    def _remove_leaks(
+        self, leaks: list[str], preexisting_dirs: set[str] | None = None
+    ) -> None:
+        """Checked lease-scoped sweep with an explicit absence postcondition."""
+        removed: list[Path] = []
         for rel in leaks:
             target = self.workdir / rel
-            if target.is_dir() and not target.is_symlink():
-                for sub in sorted(p for p in target.rglob("*") if p.is_file()):
-                    srel = sub.relative_to(self.workdir).as_posix()
-                    out.append(f"=== untracked/ignored: {srel} ===\n{self._read_text(sub)}")
-            else:
-                out.append(f"=== untracked/ignored: {rel} ===\n{self._read_text(target)}")
-        return out
-
-    @staticmethod
-    def _read_text(path: Path) -> str:
-        """Capture a leaked file's content, tolerating BINARY (hand-9, FAILURE-LEASE): a
-        decode failure records size + sha256 instead of raising, so no exception escapes
-        after `dispatched`. An unreadable path (permission/gone) is noted, not fatal."""
-        try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
             try:
-                data = path.read_bytes()
-            except OSError:
-                return "<binary or unreadable>"
-            digest = hashlib.sha256(data).hexdigest()
-            return f"<binary artifact: {len(data)} bytes, sha256={digest}>"
-        except OSError:
-            return "<binary or unreadable>"
-
-    def _remove_leaks(self, leaks: list[str]) -> None:
-        """Remove this lease's untracked/ignored leaks — files via unlink, directories
-        (incl nested Git repos, which `git clean -fd` refuses without `-ff`) recursively."""
-        for rel in leaks:
-            target = self.workdir / rel
-            if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target, ignore_errors=True)
-            else:
-                target.unlink(missing_ok=True)
+                info = target.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot stat leak before removal {rel}: {exc}") from exc
+            try:
+                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            except OSError as exc:
+                raise WorkspaceFault(f"cannot remove workspace leak {rel}: {exc}") from exc
+            if os.path.lexists(target):
+                raise WorkspaceFault(f"workspace leak remained after removal: {rel}")
+            removed.append(target)
+        if preexisting_dirs is None:
+            return
+        # Git's per-file status omits now-empty parent directories. Prune a parent only
+        # when the modern lease proved it did not preexist, stopping at any nonempty/user
+        # directory and verifying every successful removal.
+        for target in removed:
+            parent = target.parent
+            while parent != self.workdir:
+                rel_parent = parent.relative_to(self.workdir).as_posix()
+                if rel_parent in preexisting_dirs or self._overlaps_run_dir(rel_parent):
+                    break
+                try:
+                    parent.rmdir()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    if parent.exists():  # nonempty is a safe stop; other errors are faults
+                        try:
+                            next(parent.iterdir())
+                        except StopIteration:
+                            raise WorkspaceFault(
+                                f"cannot remove empty leak directory {rel_parent}: {exc}"
+                            ) from exc
+                        except OSError as inspect_exc:
+                            raise WorkspaceFault(
+                                f"cannot verify leak directory {rel_parent}: {inspect_exc}"
+                            ) from inspect_exc
+                    break
+                if os.path.lexists(parent):
+                    raise WorkspaceFault(
+                        f"workspace leak directory remained after removal: {rel_parent}"
+                    )
+                parent = parent.parent
 
     def _overlaps_run_dir(self, rel: str) -> bool:
         """True if a workdir-relative path OVERLAPS the run_dir subtree — the run_dir
@@ -480,7 +727,7 @@ class WorkspaceEffects:
             resolved = (self.workdir / rel).resolve()
             run = self.run_dir.resolve()
         except OSError:
-            return False
+            return True  # fail conservative: never capture/sweep a path we cannot classify
         return resolved == run or resolved.is_relative_to(run) or run.is_relative_to(resolved)
 
     def reconstruct_receipt(
