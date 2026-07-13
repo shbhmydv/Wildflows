@@ -741,3 +741,57 @@ hygiene. (5) `.wildflows/` target-repo folder (config, skills, run state, setup 
     record and durability predicate; the full artifact/effect divorce lands with per-node
     worktrees (step 4), when the two genuinely diverge. Event-shape versioning is a
     per-model compatibility reader, not yet an explicit schema integer (§6).
+
+### Hand-8 calls (from the pass-4 exit review) pending review
+
+36. **Provenance-based recovery replaces the marker scan (RECEIPT-TEAR).** `dispatched`
+    carries `pre_head` — the workdir HEAD when the attempt opened (nullable; absent on a
+    pre-v1 line). On resume, a top-level `do`/`inplace` that was dispatched but is not
+    durable is recovered from its OWN commit range `pre_head..HEAD`: those commits are
+    exactly that attempt's, so the full receipt (every rig + core commit) is reconstructed
+    and retro-journalled — never re-run, never a lost rig commit. This SUBSUMES entry 21's
+    reachable-marker scan for the serial model; the `wf:<run>:<epoch>:<node>` marker stays
+    in commit messages as FORENSIC metadata only (the scan path is deleted, zero dead code).
+    **Deviation from the owner triage:** the triage prescribed flipping the recorder to
+    integrated-then-result; that ordering makes a torn tail indistinguishable from a legacy
+    order AND breaks the loop partial-iteration resume floor (B4), which keys off
+    result/integrated presence separately. The completion order is KEPT result-then-
+    integrated; provenance recovery covers the torn window in BOTH directions (result
+    without integrated → journal the receipt; nothing past dispatched → journal result +
+    receipt), which is the finding's real requirement (crash-recoverable receipts) with no
+    collateral damage.
+37. **Lease-scoped failure transaction (FAILURE-TRANSACTION).** (a) A git failure
+    integrating a SUCCESSFUL rig's dirty state now routes through `finalize_failure`
+    (revert + capture), never a bare `ok=False`. (b) The `Lease` snapshots the untracked +
+    ignored file set at open; failure cleanup removes ONLY paths absent from that snapshot
+    (recomputed AFTER the index reset, so a staged-then-unstaged leak is swept), so
+    pre-existing user files survive. The run_dir subtree is hard-excluded — and because git
+    reports an untracked directory as one ANCESTOR entry (`.wildflows/` for a
+    `run_dir=<workdir>/.wildflows/run`), the exclusion covers ancestors-of / equal-to / and
+    inside the run_dir, so a run_dir inside the workdir keeps its journal. (c) Nested Git
+    repositories are captured (their file listing + contents, never a bare `<unreadable>`)
+    and removed recursively (a plain `git clean -fd` refuses them).
+38. **Explicit loop body-outcome reference (LOOP-OUTCOME-REFERENCE).** `loop_iter` carries
+    `body_result_seq` — the journal seq of the body leaf's `ResultEvent`. The projection
+    folds the iteration's body artifact through THAT reference, not the process-global
+    last-folded result (which was only coincidentally right under serial in-order dispatch
+    and wrong the moment a positional `Dispatch` completes out of order). A legacy line
+    (no reference) falls back to the last result before it — the documented old-journal
+    semantics, scoped strictly to compatibility, not the live fold. An empty composite loop
+    body (no executable `do`/`inplace` leaf) is rejected at admission.
+39. **Pre-v1 journal policy (LEGACY-COMPLETION-TAIL).** Journals are declared pre-v1 and
+    unstable. A COMPLETE legacy history still folds via the compatibility readers (the
+    frozen fixtures prove it), but `Journal.load` raises `JournalCompatibilityError` on an
+    INTERRUPTED legacy tail — a pre-v1 event shape (a `dispatched` with no `pre_head`, a
+    single-commit `integrated`, a `loop_iter` with `body_*`, an `outcome`-less `result`)
+    appearing after the last boundary, which cannot be provenance-recovered. Load also
+    refuses a reordered/duplicated seq stream (the floors trust seq); the append seq is
+    derived from the last event's seq, not the list length, so a gap-truncated resume never
+    collides. `Integrated` requires a non-empty receipt and rejects a `commit` that
+    contradicts `commits` (MALFORMED-RECEIPT).
+40. **Upstream ctx refs (ADMISSION-REFERENCE).** A `CtxRef(kind="node")` must be UPSTREAM:
+    admission rejects a self-ref, a forward ref (pre-order position ≥ the referring node),
+    and a ref that crosses a `Dispatch` (concurrent siblings, non-deterministic completion);
+    a ref into an elder `Seq` sibling is fine. An `inplace` edit path that escapes only via
+    a symlink (uncatchable at admission) becomes a durable FAILED result at write time,
+    never an exception escaping after `dispatched`.
