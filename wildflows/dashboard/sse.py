@@ -1,0 +1,83 @@
+"""Read-only Server-Sent Event tailing for v2 journals."""
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator
+import json
+from pathlib import Path
+import time
+from typing import cast
+
+from wildflows.events import Event, parse_event
+
+
+DEFAULT_POLL_INTERVAL = 0.2
+DEFAULT_HEARTBEAT_INTERVAL = 15.0
+
+
+def _parse_record(record: bytes) -> Event:
+    decoded = json.loads(record)
+    if not isinstance(decoded, dict):
+        raise ValueError("journal record is not an event object")
+    return parse_event(cast(dict[str, object], decoded))
+
+
+def _message(event: Event) -> str:
+    payload = event.model_dump_json(exclude_computed_fields=True)
+    return f"id: {event.seq}\nevent: journal\ndata: {payload}\n\n"
+
+
+async def tail_events(
+    path: Path,
+    after: int = -1,
+    *,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
+    heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+) -> AsyncGenerator[str, None]:
+    """Yield validated, complete journal records as SSE messages.
+
+    Cancellation is deliberately allowed to propagate to ``StreamingResponse``.
+    The journal is only ever opened for reading.
+    """
+    if type(after) is not int:
+        raise TypeError("after must be an integer sequence number")
+    if poll_interval <= 0:
+        raise ValueError("poll_interval must be positive")
+    if heartbeat_interval < 0:
+        raise ValueError("heartbeat_interval must not be negative")
+
+    offset = 0
+    pending = b""
+    last = after
+    last_activity = time.monotonic()
+
+    while True:
+        try:
+            if path.stat().st_size < offset:
+                offset = 0
+                pending = b""
+            with path.open("rb") as journal:
+                journal.seek(offset)
+                chunk = journal.read()
+        except FileNotFoundError:
+            chunk = b""
+
+        if chunk:
+            offset += len(chunk)
+            pending += chunk
+            complete_end = pending.rfind(b"\n")
+            if complete_end >= 0:
+                records = pending[:complete_end].split(b"\n")
+                pending = pending[complete_end + 1 :]
+                for record in records:
+                    event = _parse_record(record)
+                    if event.seq > last:
+                        last = event.seq
+                        yield _message(event)
+                        last_activity = time.monotonic()
+
+        now = time.monotonic()
+        if now - last_activity >= heartbeat_interval:
+            yield ": heartbeat\n\n"
+            last_activity = now
+        await asyncio.sleep(poll_interval)
