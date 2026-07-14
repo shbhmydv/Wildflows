@@ -33,8 +33,7 @@ def _die_with_parent(parent_pid: int) -> None:
 
 class RepositoryError(RuntimeError):
     """A repository or plain Git operation failed."""
-class RepositoryTransientError(RepositoryError):
-    """A concurrent or interrupted repository writer requires a retry."""
+class RepositoryTransientError(RepositoryError): pass
 class BranchDivergedError(RepositoryError):
     """The run branch no longer has the exact journalled tip."""
 class IntegrationError(RepositoryError):
@@ -284,20 +283,21 @@ class Repository:
             *literal, "diff", "--cached", "--quiet", tree, "--", path
         ], check=False).returncode for tree in (base, candidate)]
         if 0 not in index_states: return False
-        if not status.startswith(("?? ", "!! ")):
-            worktrees = [self.git(
-                [*literal, "diff", "--quiet", tree, "--", path], check=False
-            ).returncode for tree in (base, candidate)]
-            return 0 in worktrees
         entry = self.git([*literal, "ls-tree", candidate, "--", path]).stdout.split()
         target = self.root / path
+        if not entry and not os.path.lexists(target): return True
+        if len(entry) >= 2 and entry[0] == "040000" and target.is_dir(): return True
         if len(entry) >= 3 and entry[0] == "120000" and target.is_symlink():
-            return os.readlink(target) == self.git(["cat-file", "blob", entry[2]]).stdout
-        if len(entry) < 3 or target.is_symlink() or not target.is_file():
-            return False
-        mode = "100755" if os.access(target, os.X_OK) else "100644"
-        hashed = self.git(["hash-object", f"--path={path}", "--", path], check=False)
-        return entry[0] == mode and hashed.returncode == 0 and entry[2] == hashed.stdout.strip()
+            if os.readlink(target) == self.git(["cat-file", "blob", entry[2]]).stdout: return True
+        if len(entry) >= 3 and not target.is_symlink() and target.is_file():
+            mode = "100755" if os.access(target, os.X_OK) else "100644"
+            hashed = self.git(["hash-object", f"--path={path}", "--", path], check=False)
+            if entry[0] == mode and hashed.returncode == 0 and entry[2] == hashed.stdout.strip(): return True
+        if status.startswith(("?? ", "!! ")): return False
+        worktrees = [self.git(
+            [*literal, "diff", "--quiet", tree, "--", path], check=False
+        ).returncode for tree in (base, candidate)]
+        return 0 in worktrees
     def sync_run_ref(self) -> None:
         ref_path = self._lock_path(self.ref)
         if not ref_path.exists(): ref_path = self._lock_path("packed-refs")
@@ -305,32 +305,22 @@ class Repository:
         self._sync_path(ref_path.parent, directory=True)
     def _sync_checkout(self, paths: list[str]) -> None:
         for target in [self._lock_path("index"), *(self.root / path for path in paths)]:
-            if target.is_file() and not target.is_symlink():
-                self._sync_path(target)
-            if target.parent.is_dir():
-                self._sync_path(target.parent, directory=True)
+            if target.is_file() and not target.is_symlink(): self._sync_path(target)
+            if target.parent.is_dir(): self._sync_path(target.parent, directory=True)
     def restore_interrupted_integration(self, base: str, candidate: str) -> bool:
         cleaned = self.recover_interrupted_locks()
         owners = self._branch_worktrees()
-        if not owners:
-            return cleaned
+        if not owners: return cleaned
         if self.root not in owners:
             raise RepositoryTransientError("run branch acquired another worktree owner")
         paths = self.receipt(base, candidate).paths
         if any(not self._matches_resume_tree(base, candidate, path) for path in paths):
             raise RepositoryTransientError("run worktree changed outside the interrupted integration")
-        if not paths:
-            return cleaned
+        if not paths: return cleaned
         reset = self._move_ref(["--literal-pathspecs", "reset", "-q", base, "--", *paths], cwd=self.root)
         if reset.returncode != 0: raise RepositoryTransientError("could not restore interrupted integration index")
         base_paths = [path for path in paths if self.git(
             ["--literal-pathspecs", "ls-tree", base, "--", path]).stdout]
-        if base_paths:
-            restored = self._move_ref([
-                "--literal-pathspecs", "restore", f"--source={base}", "--worktree", "--", *base_paths
-            ], cwd=self.root)
-            if restored.returncode != 0:
-                raise RepositoryTransientError("could not restore interrupted integration tree")
         for path in set(paths) - set(base_paths):
             target = self.root / path
             if os.path.lexists(target):
@@ -338,6 +328,17 @@ class Repository:
                     target.unlink()
                 except OSError as exc:
                     raise RepositoryTransientError(f"could not remove interrupted integration path: {exc}") from exc
+        for path in base_paths:
+            target = self.root / path
+            if target.is_dir():
+                try: target.rmdir()
+                except OSError as exc: raise RepositoryTransientError(f"could not restore path type: {exc}") from exc
+        if base_paths:
+            restored = self._move_ref([
+                "--literal-pathspecs", "restore", f"--source={base}", "--worktree", "--", *base_paths
+            ], cwd=self.root)
+            if restored.returncode != 0:
+                raise RepositoryTransientError("could not restore interrupted integration tree")
         dirty = self.git([
             "--literal-pathspecs", "status", "--porcelain", "--untracked-files=all", "--", *paths
         ]).stdout

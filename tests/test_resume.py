@@ -268,8 +268,8 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
 
-    git(repo, "config", "filter.slow.smudge", "cat")
     try:
+        git(repo, "config", "filter.slow.smudge", "cat")
         deadline = time.monotonic() + 5
         while True:
             try:
@@ -717,9 +717,9 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
 
-    assert git(repo, "rev-parse", "HEAD") == base
-    assert (repo / "first").read_text(encoding="utf-8") == "candidate-first"
     try:
+        assert git(repo, "rev-parse", "HEAD") == base
+        assert (repo / "first").read_text(encoding="utf-8") == "candidate-first"
         deadline = time.monotonic() + 5
         while True:
             try:
@@ -815,8 +815,8 @@ def test_sigkill_during_unchecked_out_ref_update_recovers_ref_lock(
             os.waitpid(pid, 0)
 
     ref_lock = repo / ".git" / "refs" / "heads" / "workflow.lock"
-    assert ref_lock.exists()
     try:
+        assert ref_lock.exists()
         deadline = time.monotonic() + 5
         while True:
             try:
@@ -985,6 +985,50 @@ def test_interrupted_integration_restores_both_sides_of_rename(
     assert engine.repo.receipt(base, candidate).paths == ["new", "old"]
 
 
+@pytest.mark.parametrize("direction", ["file-to-directory", "directory-to-file"])
+def test_interrupted_integration_restores_file_directory_transition(
+    tmp_path: Path, direction: str,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    switch = repo / "switch"
+    if direction == "file-to-directory":
+        switch.write_text("base", encoding="utf-8")
+    else:
+        switch.mkdir()
+        (switch / "child").write_text("base", encoding="utf-8")
+    git(repo, "add", "switch")
+    git(repo, "commit", "-qm", "base shape")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "rm", "-qr", "switch")
+    if direction == "file-to-directory":
+        switch.mkdir()
+        (switch / "child").write_text("candidate", encoding="utf-8")
+    else:
+        switch.write_text("candidate", encoding="utf-8")
+    git(repo, "add", "switch")
+    git(repo, "commit", "-qm", "candidate shape")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    if switch.is_dir():
+        (switch / "child").unlink()
+        switch.rmdir()
+    else:
+        switch.unlink()
+    if direction == "file-to-directory":
+        switch.mkdir()
+        (switch / "child").write_text("candidate", encoding="utf-8")
+    else:
+        switch.write_text("candidate", encoding="utf-8")
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    assert engine.repo.restore_interrupted_integration(base, candidate) is False
+
+    expected = switch if direction == "file-to-directory" else switch / "child"
+    assert expected.read_text(encoding="utf-8") == "base"
+    assert git(repo, "status", "--porcelain") == ""
+
+
 def test_interrupted_integration_restores_candidate_symlink_addition(
     tmp_path: Path,
 ) -> None:
@@ -1039,19 +1083,26 @@ def test_missing_claim_ref_is_resynced_before_repeated_fallback(
     missing = git(repo, "rev-parse", "HEAD")
     (repo / ".git" / "objects" / missing[:2] / missing[2:]).unlink()
     sync = Repository.sync_run_ref
+    fallback = Engine._journal_fallback
     calls = 0
 
-    def crash_first_sync(self: Repository) -> None:
+    def count_sync(self: Repository) -> None:
         nonlocal calls
         calls += 1
-        if calls == 1:
-            raise RepositoryTransientError("simulated ref sync crash")
         sync(self)
 
-    monkeypatch.setattr(Repository, "sync_run_ref", crash_first_sync)
-    with pytest.raises(RepositoryTransientError, match="simulated ref sync crash"):
-        Engine(run_dir, repo, registry())
+    def crash_before_fallback(
+        self: Engine, epoch_id: int, start: int, text: str, tip: str,
+    ) -> None:
+        raise SystemExit("before fallback publication")
 
+    monkeypatch.setattr(Repository, "sync_run_ref", count_sync)
+    monkeypatch.setattr(Engine, "_journal_fallback", crash_before_fallback)
+    with pytest.raises(SystemExit, match="before fallback publication"):
+        Engine(run_dir, repo, registry())
+    assert calls == 1
+
+    monkeypatch.setattr(Engine, "_journal_fallback", fallback)
     resumed = Engine(run_dir, repo, registry())
     assert calls >= 2
     assert any(

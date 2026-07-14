@@ -1315,7 +1315,8 @@ than patching each row. Both are the transaction model of record — not a later
     must match either the verified base or the interrupted candidate; a third state is
     preserved with a typed transient refusal. Receipts disable rename collapsing so both
     sides are restored; ignored additions and candidate file mode/type/blob (including
-    symlinks) are verified before removal. Parent-bound, path-scoped Git reset/restore then
+    symlinks) are verified before removal, and file↔directory transitions remove only
+    verified candidate leaves/empty collision directories. Parent-bound, path-scoped Git reset/restore then
     returns those paths to the base and removes only verified candidate additions, so a
     mid-checkout kill cannot leave unjournalled candidate files behind and unrelated
     worktree state is untouched. The restored index, files, deletions, and containing
