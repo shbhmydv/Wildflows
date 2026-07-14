@@ -60,12 +60,18 @@ def _wait_process_absent(pid: int) -> None:
         pytest.fail(f"process {pid} did not disappear")
 
 
-def _process_is_live(pid: int) -> bool:
+def _process_identity(pid: int) -> tuple[str, str] | None:
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
     except FileNotFoundError:
-        return False
-    return raw.rpartition(")")[2].split()[0] != "Z"
+        return None
+    fields = raw.rpartition(")")[2].split()
+    return fields[19], fields[0]
+
+
+def _same_process_is_live(pid: int, start_time: str) -> bool:
+    current = _process_identity(pid)
+    return current is not None and current[0] == start_time and current[1] != "Z"
 
 
 def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_pipe_breaks(
@@ -100,7 +106,7 @@ def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_p
         supervisor_pid = int(json.loads(records[0].read_text())["pid"])
     finally:
         _kill_and_wait(engine_pid)
-    foreground_exit.touch()  # foreground exits only after the result reader is gone
+        foreground_exit.touch()  # release even when setup assertions fail
     _wait_process_absent(supervisor_pid)
 
     Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
@@ -139,6 +145,9 @@ def test_killed_engine_reaps_inflight_shell_rig_before_recovery_and_after_closur
         _kill_and_wait(engine_pid)
     assert (workdir / "base.txt").read_bytes() == b"base"
     old_child = int(delayed_pid.read_text().strip())
+    child_identity = _process_identity(old_child)
+    assert child_identity is not None
+    old_child_start = child_identity[0]
     original_reap = WorkspaceEffects.reap_process
     reaped_before_recovery = False
 
@@ -148,7 +157,7 @@ def test_killed_engine_reaps_inflight_shell_rig_before_recovery_and_after_closur
         nonlocal reaped_before_recovery
         original_reap(ws, epoch, node_id, attempt)
         if node_id == "n0" and attempt == 0:
-            assert not _process_is_live(old_child)
+            assert not _same_process_is_live(old_child, old_child_start)
             reaped_before_recovery = True
 
     monkeypatch.setattr(WorkspaceEffects, "reap_process", assert_reaped)
@@ -158,7 +167,7 @@ def test_killed_engine_reaps_inflight_shell_rig_before_recovery_and_after_closur
     assert (workdir / "base.txt").read_bytes() == b"base"
     time.sleep(1.4)
     assert (workdir / "base.txt").read_bytes() == b"base"
-    assert not _process_is_live(old_child)
+    assert not _same_process_is_live(old_child, old_child_start)
     assert not list((run_dir / "processes").glob("*.json"))
 
 

@@ -446,7 +446,7 @@ Rig.run(prompt: str, workdir: Path) -> Result
 
 prompt in, text/files out — exactly grindstone's shape-agnostic `request.sh` contract,
 which is why real rigs (`claude -p`, `pi`, local Qwen, `codex exec`) plug in later with
-no engine change. The PoC ships two:
+no engine change. The PoC ships three:
 - **`EchoRig`** — deterministic, returns a canned/derived result; the test substrate.
 - **`ShellRig`** — shells out to an arbitrary command template (e.g.
   `claude -p {prompt}` run in `{workdir}`), capturing stdout/exit as the result. This
