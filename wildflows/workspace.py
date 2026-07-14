@@ -215,7 +215,7 @@ class Repository:
             ["git", *args], cwd=cwd, check=False, parent_lifetime=True
         )
     @staticmethod
-    def _lock_has_owner(device: int, inode: int, uid: int) -> bool:
+    def _git_writer_is_live(uid: int) -> bool:
         procfs = Path("/proc")
         if not procfs.is_dir():
             return True
@@ -227,18 +227,15 @@ class Repository:
                     continue
                 fields = (process / "stat").read_text(encoding="utf-8").split()
                 command = (process / "comm").read_text(encoding="utf-8").strip()
-                if len(fields) > 2 and fields[2] != "Z" and command.startswith("git"):
-                    return True
-                descriptors = list((process / "fd").iterdir())
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError):
                 continue
-            for descriptor in descriptors:
-                try:
-                    opened = descriptor.stat()
-                except (FileNotFoundError, PermissionError, ProcessLookupError):
-                    continue
-                if (opened.st_dev, opened.st_ino) == (device, inode):
-                    return True
+            except PermissionError:
+                return True
+            if (
+                len(fields) > 2 and fields[2] != "Z"
+                and (command == "git" or command.startswith("git-"))
+            ):
+                return True
         return False
     def recover_interrupted_index_lock(self) -> bool:
         """Remove only an ownerless root index lock at a proven resume tear."""
@@ -252,9 +249,7 @@ class Repository:
             return False
         except OSError as exc:
             raise RepositoryTransientError(f"could not inspect run index lock: {exc}") from exc
-        if observed.st_uid != os.geteuid() or self._lock_has_owner(
-            observed.st_dev, observed.st_ino, observed.st_uid
-        ):
+        if observed.st_uid != os.geteuid() or self._git_writer_is_live(observed.st_uid):
             raise RepositoryTransientError("run worktree index is owned by a live writer")
         try:
             current = lock.stat()

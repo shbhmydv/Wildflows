@@ -1298,13 +1298,16 @@ than patching each row. Both are the transaction model of record — not a later
     interrupted index-write windows: an effectful result is durable at the exact base but
     its integration did not land, or a missing current claim is being restored to its
     verified predecessor. The run branch must still be owned by the supplied worktree,
-    the lock must belong to the engine's uid, `/proc` must show neither a live same-uid Git
-    process nor any process with that exact lock inode open, and the pathname must still
-    name the observed inode immediately before unlink. Otherwise recovery leaves the lock
-    untouched and raises typed `RepositoryTransientError`. A new Git writer cannot acquire
-    an already-existing lock; an existing live operator is caught by its Git process even
-    in Git's close-before-rename interval, while open-descriptor matching also catches a
-    blocked writer or descendant. Successful cleanup is named in the fallback boundary.
+    the lock must belong to the engine's uid, `/proc` must show no live same-uid Git
+    process, and the pathname must still name the observed inode immediately before unlink.
+    Otherwise recovery leaves the lock untouched and raises typed
+    `RepositoryTransientError`. A new ordinary Git writer cannot acquire an already-existing
+    lock; an existing live operator is caught by its Git process even in Git's
+    close-before-rename interval. A filter descended from the already-dead Git process may
+    retain an inherited descriptor, but it does not own Git's lock protocol and cannot land
+    the ref move. This rule deliberately excludes an operator manually deleting/replacing
+    Git's lock file concurrently with resume; manual lock surgery must occur only while the
+    engine is stopped. Successful cleanup is named in the fallback boundary.
 
 84. **Missing-claim restore has the same lifetime and residue boundary.** Its checked-out
     `read-tree --reset -u` now uses the parent-bound launcher already used by ref movers.

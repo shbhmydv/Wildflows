@@ -223,12 +223,14 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
     missing = git(repo, "rev-parse", "HEAD")
 
     started = tmp_path / "restore-filter-started"
+    finished = tmp_path / "restore-filter-finished"
     filter_script = tmp_path / "slow-restore-smudge.sh"
     filter_script.write_text(
         "#!/bin/sh\n"
         f"printf x >> {shlex.quote(str(started))}\n"
-        "sleep 1\n"
-        "cat\n",
+        "sleep 2\n"
+        "cat\n"
+        f"printf done > {shlex.quote(str(finished))}\n",
         encoding="utf-8",
     )
     filter_script.chmod(0o755)
@@ -262,6 +264,7 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
 
+    git(repo, "config", "filter.slow.smudge", "cat")
     deadline = time.monotonic() + 5
     while True:
         try:
@@ -272,6 +275,7 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
                 raise
             time.sleep(0.01)
 
+    assert not finished.exists(), "replacement waited for an unbound restore writer"
     assert git(repo, "rev-parse", "HEAD") == base
     assert (repo / "target").read_text(encoding="utf-8") == "base"
     assert git(repo, "status", "--porcelain") == ""
@@ -281,6 +285,15 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
         and "missing current claimed commit" in (event.reason or "")
         for event in resumed.journal.events()
     )
+
+    resumed.run_epoch(tree, 0)
+    assert (repo / "target").read_text(encoding="utf-8") == "candidate"
+    assert git(repo, "status", "--porcelain") == ""
+
+    deadline = time.monotonic() + 5
+    while not finished.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert finished.exists(), "original filter did not exit after its Git parent died"
 
 
 def test_exact_verified_prefix_rewind_reruns_only_two_node_suffix(
@@ -691,7 +704,15 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
             os.waitpid(pid, 0)
 
     assert git(repo, "rev-parse", "HEAD") == base
-    resumed = Engine(run_dir, repo, registry())
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            resumed = Engine(run_dir, repo, registry())
+            break
+        except RepositoryTransientError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
     fallback = [
         event for event in resumed.journal.events()
         if event.kind == "boundary" and event.fallback_from is not None
