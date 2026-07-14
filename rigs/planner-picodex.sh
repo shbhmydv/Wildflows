@@ -60,10 +60,8 @@ import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-fences = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-if len(fences) > 1:
-    raise SystemExit("planner-picodex: expected one JSON fence")
-candidate = fences[0].strip() if fences else text.strip()
+fence = re.search(r"```(?:json)?\s*(.*)```", text, flags=re.IGNORECASE | re.DOTALL)
+candidate = fence.group(1).strip() if fence else text.strip()
 try:
     value = json.loads(candidate)
 except json.JSONDecodeError as exc:

@@ -117,8 +117,8 @@ class ScriptRig:
         env: dict[str, str] | None = None,
         busy_patterns: list[str] | None = None,
     ) -> None:
-        self.script = Path(script)
-        self.log_dir = Path(log_dir)
+        self.script = Path(script).resolve()
+        self.log_dir = Path(log_dir).resolve()
         self.timeout_s = timeout_s
         self.env = dict(env or {})
         self._busy_re = re.compile(
@@ -131,8 +131,16 @@ class ScriptRig:
             return "busy"
         return "failed"
     def run(self, prompt: str, workdir: Path) -> Result:
-        dispatch_dir = self.log_dir / workdir.name
-        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        suffix = 0
+        while True:
+            name = workdir.name if suffix == 0 else f"{workdir.name}-{suffix}"
+            dispatch_dir = self.log_dir / name
+            try:
+                dispatch_dir.mkdir()
+                break
+            except FileExistsError:
+                suffix += 1
         prompt_file = dispatch_dir / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
         handle_out = dispatch_dir / "handle"
@@ -147,7 +155,7 @@ class ScriptRig:
             "--handle-out",
             str(handle_out),
             "--timeout",
-            str(int(self.timeout_s)),
+            str(self.timeout_s),
         ]
         result = _capture(
             argv,

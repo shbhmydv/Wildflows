@@ -79,6 +79,10 @@ class Journal:
         previous = -1
         for position, record in enumerate(records):
             data = json.loads(record.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise IncompatibleJournalError(
+                    "journal record is not a v1 event object"
+                )
             version = data.get("version")
             if type(version) is not int or version != 1:
                 raise IncompatibleJournalError(

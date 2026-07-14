@@ -34,6 +34,7 @@ case "${STUB_MODE:?}" in
   worker) printf 'senior report text' ;;
   busy) echo '429: usage limit reached' >&2; exit 9 ;;
   garbage) printf '```json\nnot-json\n```\n' ;;
+  embedded) printf 'noise\n```json\n{"expression":{"kind":"inplace","edits":[{"path":"x","content":"```python\\nx\\n```"}]}}\n```\n' ;;
   *) exit 2 ;;
 esac
 ''')
@@ -97,6 +98,11 @@ def test_planner_adapter_reads_stdin_and_prints_only_valid_json(tmp_path: Path) 
     assert json.loads(result.text) == {"end": True, "expression": None}
     assert result.text.strip() == '{"end":true,"expression":null}'
     assert capture.read_text(encoding="utf-8") == "input prompt"
+
+    embedded, _ = _run(tmp_path / "embedded", "planner-picodex.sh", "embedded")
+    assert json.loads(embedded.text)["expression"]["edits"][0]["content"] == (
+        "```python\nx\n```"
+    )
 
 
 def test_planner_adapter_rejects_garbage_nonzero(tmp_path: Path) -> None:

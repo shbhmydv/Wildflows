@@ -29,9 +29,6 @@ request="$log_dir/request.json"; response="$log_dir/response.json"; err="$log_di
 python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"messages":[{"role":"user","content":sys.stdin.read()}]}))' \
   "$model" < "$prompt" > "$request"
 headers=(-H 'Content-Type: application/json')
-if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  headers+=(-H "Authorization: Bearer $OPENAI_API_KEY")
-fi
 curl_args=(--silent --show-error --fail-with-body)
 [[ -n "$timeout" ]] && curl_args+=(--max-time "$timeout")
 

@@ -117,6 +117,17 @@ def test_script_rig_log_dir_per_dispatch_is_populated(tmp_path: Path) -> None:
     assert (dispatch_dir / "agent.stderr.log").exists()
     assert (dispatch_dir / "prompt.txt").read_text() == "hello"
 
+    rig.run("retry", workdir)
+    assert (logs / "n0.1-1" / "prompt.txt").read_text() == "retry"
+
+
+def test_script_rig_preserves_fractional_timeout_argument(tmp_path: Path) -> None:
+    script = _write_script(tmp_path / "timeout.sh", _SUCCESS + '\necho "timeout=$timeout"\n')
+    workdir = tmp_path / "wt"
+    workdir.mkdir()
+    result = ScriptRig(script, tmp_path / "logs", timeout_s=1.5).run("x", workdir)
+    assert "timeout=1.5" in result.text
+
 
 def test_script_rig_passes_extra_env(tmp_path: Path) -> None:
     script = _write_script(

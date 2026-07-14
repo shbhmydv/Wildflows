@@ -2,15 +2,15 @@ rigs:
   planner:
     kind: script
     script: ../../rigs/planner-picodex.sh
-    log_dir: .logs/planner
+    log_dir: /tmp/wildflows-toy-run/planner
     timeout_s: 1800
   local:
     kind: script
     script: ../../rigs/worker-local.sh
-    log_dir: .logs/local
+    log_dir: /tmp/wildflows-toy-run/local
     timeout_s: 900
   senior:
     kind: script
     script: ../../rigs/worker-picodex.sh
-    log_dir: .logs/senior
+    log_dir: /tmp/wildflows-toy-run/senior
     timeout_s: 1800

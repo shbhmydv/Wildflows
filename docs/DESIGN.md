@@ -148,9 +148,8 @@ resume = "replay the log against the tree." A rails block will ride alongside th
 expression, not inside it (§4, deferred).
 
 One expression tree = one **epoch** = one planner re-entry point + one durability
-point (§3). The tree is validated by Pydantic on admission; `do`, `inplace`, `ask`,
-`setup`, `seq`, `dispatch`, and `loop` (with a `cmd` predicate) are executable. `combine`
-remains representable but is not yet admitted.
+point (§3). The tree is validated by Pydantic on admission; all eight kinds are
+executable except a `loop` with a planner-judged `flag` predicate.
 
 ### Code homes (hand-6 authority split, from the bloat audit)
 
@@ -184,8 +183,8 @@ rejection it raises **`AdmissionError`** (a `ValueError` subclass) and NO journa
 is written — a representable-but-unrunnable shape never opens an incomplete epoch, so
 `NotImplementedError` after a durable boundary is gone. Admission rejects:
 
-- **executor capability** — `combine`, non-root `setup.cwd`, and `loop` with a `flag`
-  predicate (representable, not yet executable);
+- **executor capability** — non-root `setup.cwd` and `loop` with a `flag` predicate
+  (representable, not yet executable);
 - **unknown rig names** — every rig-bearing node's `rig.name` must resolve in the registry;
 - **ctx node refs** — a `CtxRef(kind="node")` must name a node in the epoch tree;
 - **resume identity** — on an already-open epoch, the supplied tree must equal the
@@ -445,9 +444,10 @@ notes that are load-bearing:
   CLI on stdin from that file to dodge the kernel's `MAX_ARG_STRLEN` (~128 KB) wall on
   large prior-failure context. `ScriptRig` writes the prompt to
   `<log_dir>/<dispatch>/prompt.txt` and passes its path.
-- **Per-dispatch log dir** is `<log_dir>/<workdir.name>/`, populated with the captured
-  `agent.stdout.log` / `agent.stderr.log` (+ the prompt). Worktree names include epoch,
-  node, attempt, and a random suffix, so retries never share logs or paths.
+- **Per-dispatch log dir** starts at `<log_dir>/<workdir.name>/` and gains a numeric
+  suffix if that name already exists. It contains captured `agent.stdout.log` /
+  `agent.stderr.log` plus the prompt, so planner retries and worker attempts never
+  overwrite logs.
 - **`busy` is journalled as `ResultEvent(ok=False, outcome="busy")`** — distinct from a
   failure so a later ladder step can back off + re-enter. No backoff/retry policy is
   built in this hand.

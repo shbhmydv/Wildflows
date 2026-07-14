@@ -103,6 +103,13 @@ def test_load_refuses_unversioned_or_incompatible_journal(
         Journal.load(tmp_path)
 
 
+def test_load_refuses_non_object_record(tmp_path: Path) -> None:
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "events.ndjson").write_text("[]\n", encoding="utf-8")
+    with pytest.raises(IncompatibleJournalError, match="not a v1 event object"):
+        Journal.load(tmp_path)
+
+
 def test_load_refuses_gapped_sequence(tmp_path: Path) -> None:
     journal = Journal(tmp_path)
     journal.append(boundary())

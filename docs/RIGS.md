@@ -25,8 +25,8 @@ are inherited from the environment.
   `GRINDSTONE_PLANNER_EFFORT`.
 - **`worker-local.sh`** calls the OpenAI-compatible chat-completions endpoint
   `http://127.0.0.1:8080/v1/chat/completions` with `curl`. Overrides:
-  `WILDFLOWS_LOCAL_URL`, `WILDFLOWS_LOCAL_MODEL`, and optional inherited
-  `OPENAI_API_KEY`.
+  `WILDFLOWS_LOCAL_URL` and `WILDFLOWS_LOCAL_MODEL`. The default loopback endpoint
+  needs no credential, so no secret is placed in curl's process arguments.
 - **`worker-picodex.sh`** runs a senior agent inside the supplied worktree through
   `pi`; its system prompt requires relative writes and worktree-local commits. Overrides:
   `GRINDSTONE_SENIOR_PROVIDER`, `GRINDSTONE_SENIOR_MODEL`,
