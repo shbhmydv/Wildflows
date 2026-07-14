@@ -133,7 +133,9 @@ The hero is the live DF2 asset-quality swarm. The pair above is the tracked synt
 fixture: 20-way fan-out, a ghost queue, a parked ask, a failed gate, and depth-four
 drill-in.
 
-## Receipts and reference
+## Dogfood and reference
+
+The [design ledger](docs/DESIGN.md#evidence) records the owner-run results:
 
 - **DF1:** the resident-frame pivot fixed a real React Native clipping family in
   **20m40s**; the predecessor spent roughly five hours and did not close it.
@@ -143,7 +145,8 @@ drill-in.
 - [`docs/RIGS.md`](docs/RIGS.md) — YAML registry and process/environment contract
 - [`docs/DASHBOARD.md`](docs/DASHBOARD.md) — watchlists, deep links, fixture, and answer seam
 
-Develop with `python3 -m pytest -q`, `python3 -m mypy --strict wildflows tests`, and
-`bash -n rigs/*.sh`. Tests use fake agent binaries; they do not invoke models.
+Install `pip install -e '.[dev]'`, then develop with `python3 -m pytest -q`,
+`python3 -m mypy --strict wildflows tests`, and `bash -n rigs/*.sh`. Tests use fake
+agent binaries; they do not invoke models.
 
 MIT © 2026 Shubham Yadav. See [`LICENSE`](LICENSE).
