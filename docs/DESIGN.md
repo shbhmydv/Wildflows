@@ -1311,18 +1311,21 @@ than patching each row. Both are the transaction model of record — not a later
     land the ref move. This rule excludes an operator manually deleting/replacing Git's lock
     file concurrently with resume; manual lock surgery must occur only while the engine is
     stopped. Successful cleanup is named in the fallback boundary. Before journalling a
-    checked-out result→integration fallback, every receipted path must match either the
-    verified base or the interrupted candidate; a third state is preserved with a typed
-    transient refusal. Parent-bound, path-scoped Git reset/restore then returns those paths
-    to the base and removes only verified candidate additions, so a mid-checkout kill cannot
-    leave unjournalled candidate files behind and unrelated worktree state is untouched.
+    checked-out result→integration fallback, every receipted path's index and worktree state
+    must match either the verified base or the interrupted candidate; a third state is
+    preserved with a typed transient refusal. Parent-bound, path-scoped Git reset/restore
+    then returns those paths to the base and removes only verified candidate additions, so
+    a mid-checkout kill cannot leave unjournalled candidate files behind and unrelated
+    worktree state is untouched. The restored index, files, deletions, and containing
+    directories are fsynced before the fallback boundary.
 
 84. **Missing-claim restore has the same lifetime and residue boundary.** Its checked-out
     `read-tree --reset -u` now uses the parent-bound launcher already used by ref movers.
     A killed constructor therefore cannot leave a live orphan index writer. Resume applies
     rule 83 to any dead child's residue before retrying; a live/uncertain owner, failed
     index update, or unchanged claim after failed CAS is a typed transient retry rather
-    than a raw Git `RepositoryError`. A different live claim remains typed divergence.
+    than a raw Git `RepositoryError`. Restored tracked state and the CAS-updated ref are
+    fsynced before fallback publication. A different live claim remains typed divergence.
 
 85. **M2 residue rule.** Parent death fences engine-owned ref-moving/index-writing Git
     children but is not filesystem cleanup. Checked-out integration now has an explicit

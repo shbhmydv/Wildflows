@@ -926,13 +926,37 @@ def test_interrupted_integration_preserves_third_state_worktree_edit(
     git(repo, "commit", "-qm", "candidate")
     candidate = git(repo, "rev-parse", "HEAD")
     git(repo, "reset", "--hard", base)
-    (repo / "seed").write_text("operator", encoding="utf-8")
+    (repo / "seed").write_text("staged-operator", encoding="utf-8")
+    git(repo, "add", "seed")
+    (repo / "seed").write_text("candidate", encoding="utf-8")
     engine = Engine(tmp_path / "run", repo, registry())
 
     with pytest.raises(RepositoryTransientError, match="changed outside"):
         engine.repo.restore_interrupted_integration(base, candidate)
 
-    assert (repo / "seed").read_text(encoding="utf-8") == "operator"
+    assert (repo / "seed").read_text(encoding="utf-8") == "candidate"
+    assert git(repo, "show", ":seed") == "staged-operator"
+
+
+def test_interrupted_integration_preserves_mode_changed_candidate_addition(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    (repo / "added").write_text("candidate", encoding="utf-8")
+    git(repo, "add", "added")
+    git(repo, "commit", "-qm", "candidate addition")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    (repo / "added").write_text("candidate", encoding="utf-8")
+    (repo / "added").chmod(0o755)
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    with pytest.raises(RepositoryTransientError, match="changed outside"):
+        engine.repo.restore_interrupted_integration(base, candidate)
+
+    assert (repo / "added").exists()
+    assert os.access(repo / "added", os.X_OK)
 
 
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:

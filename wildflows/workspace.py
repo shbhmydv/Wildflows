@@ -217,15 +217,12 @@ class Repository:
     @staticmethod
     def _git_writer_is_live(uid: int) -> bool:
         procfs = Path("/proc")
-        if not procfs.is_dir():
-            return True
+        if not procfs.is_dir(): return True
         try:
             processes = list(procfs.iterdir())
         except OSError:
             return True
-        for process in processes:
-            if not process.name.isdigit():
-                continue
+        for process in (path for path in processes if path.name.isdigit()):
             try:
                 if process.stat().st_uid != uid:
                     continue
@@ -235,20 +232,20 @@ class Repository:
                 continue
             except (OSError, UnicodeError):
                 return True
-            live_git = command == "git" or command.startswith("git-")
-            if len(fields) > 2 and fields[2] != "Z" and live_git:
+            if len(fields) > 2 and fields[2] != "Z" and (command == "git" or command.startswith("git-")):
                 return True
         return False
     @staticmethod
-    def _sync_directory(path: Path) -> None:
+    def _sync_path(path: Path, *, directory: bool = False) -> None:
+        flags = os.O_RDONLY | (getattr(os, "O_DIRECTORY", 0) if directory else 0)
         try:
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            descriptor = os.open(path, flags)
             try:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
         except OSError as exc:
-            raise RepositoryTransientError(f"could not sync Git lock directory: {exc}") from exc
+            raise RepositoryTransientError(f"could not sync recovered path: {exc}") from exc
     def _lock_path(self, name: str) -> Path:
         raw = self.git(["rev-parse", "--git-path", name]).stdout.strip()
         return Path(raw) if Path(raw).is_absolute() else self.root / raw
@@ -257,7 +254,7 @@ class Repository:
             observed = lock.stat()
         except FileNotFoundError:
             if lock.parent.is_dir():
-                self._sync_directory(lock.parent)
+                self._sync_path(lock.parent, directory=True)
             return False
         except OSError as exc:
             raise RepositoryTransientError(f"could not inspect Git lock: {exc}") from exc
@@ -271,39 +268,46 @@ class Repository:
                 raise RepositoryTransientError("Git lock changed during recovery")
             lock.unlink()
         except FileNotFoundError:
-            self._sync_directory(lock.parent)
+            self._sync_path(lock.parent, directory=True)
             return False
         except OSError as exc:
             raise RepositoryTransientError(f"could not remove Git lock: {exc}") from exc
-        self._sync_directory(lock.parent)
+        self._sync_path(lock.parent, directory=True)
         return True
     def recover_interrupted_locks(self) -> bool:
-        """Remove ownerless Git locks only at a proven resume tear."""
         root_owned = self.root in self._branch_worktrees()
-        locks = (
-            (self._lock_path("index.lock"), True),
-            (self._lock_path("ORIG_HEAD.lock"), False),
-            (self._lock_path(f"{self.ref}.lock"), False),
-        )
+        locks = (("index.lock", True), ("ORIG_HEAD.lock", False), (f"{self.ref}.lock", False))
         cleaned = False
-        for lock, is_index in locks:
-            cleaned = self._recover_lock(lock, root_owned=root_owned, is_index=is_index) or cleaned
+        for name, is_index in locks:
+            cleaned = self._recover_lock(self._lock_path(name), root_owned=root_owned, is_index=is_index) or cleaned
         return cleaned
-    def _matches_resume_tree(self, candidate: str, path: str) -> bool:
+    def _matches_resume_tree(self, base: str, candidate: str, path: str) -> bool:
         literal = ["--literal-pathspecs"]
-        status = self.git([
-            *literal, "status", "--porcelain", "--untracked-files=all", "--", path
-        ]).stdout
+        status = self.git([*literal, "status", "--porcelain", "--untracked-files=all", "--", path]).stdout
         if not status:
             return True
-        diff = self.git([*literal, "diff", "--quiet", candidate, "--", path], check=False)
-        if diff.returncode == 0:
-            return True
-        if diff.returncode != 1 or not status.startswith("?? "):
-            return False
+        index_states = [self.git([
+            *literal, "diff", "--cached", "--quiet", tree, "--", path
+        ], check=False).returncode for tree in (base, candidate)]
+        if 0 not in index_states: return False
+        if not status.startswith("?? "):
+            worktrees = [self.git(
+                [*literal, "diff", "--quiet", tree, "--", path], check=False
+            ).returncode for tree in (base, candidate)]
+            return 0 in worktrees
         entry = self.git([*literal, "ls-tree", candidate, "--", path]).stdout.split()
+        target = self.root / path
+        if len(entry) < 3 or target.is_symlink() or not target.is_file():
+            return False
+        mode = "100755" if os.access(target, os.X_OK) else "100644"
         hashed = self.git(["hash-object", f"--path={path}", "--", path], check=False)
-        return len(entry) >= 3 and hashed.returncode == 0 and entry[2] == hashed.stdout.strip()
+        return entry[0] == mode and hashed.returncode == 0 and entry[2] == hashed.stdout.strip()
+    def _sync_checkout(self, paths: list[str]) -> None:
+        for target in [self._lock_path("index"), *(self.root / path for path in paths)]:
+            if target.is_file() and not target.is_symlink():
+                self._sync_path(target)
+            if target.parent.is_dir():
+                self._sync_path(target.parent, directory=True)
     def restore_interrupted_integration(self, base: str, candidate: str) -> bool:
         cleaned = self.recover_interrupted_locks()
         owners = self._branch_worktrees()
@@ -312,22 +316,17 @@ class Repository:
         if self.root not in owners:
             raise RepositoryTransientError("run branch acquired another worktree owner")
         paths = self.receipt(base, candidate).paths
-        if any(not self._matches_resume_tree(candidate, path) for path in paths):
+        if any(not self._matches_resume_tree(base, candidate, path) for path in paths):
             raise RepositoryTransientError("run worktree changed outside the interrupted integration")
         if not paths:
             return cleaned
-        reset = self._move_ref(
-            ["--literal-pathspecs", "reset", "-q", base, "--", *paths], cwd=self.root
-        )
-        if reset.returncode != 0:
-            raise RepositoryTransientError("could not restore interrupted integration index")
+        reset = self._move_ref(["--literal-pathspecs", "reset", "-q", base, "--", *paths], cwd=self.root)
+        if reset.returncode != 0: raise RepositoryTransientError("could not restore interrupted integration index")
         base_paths = [path for path in paths if self.git(
-            ["--literal-pathspecs", "ls-tree", base, "--", path]
-        ).stdout]
+            ["--literal-pathspecs", "ls-tree", base, "--", path]).stdout]
         if base_paths:
             restored = self._move_ref([
-                "--literal-pathspecs", "restore", f"--source={base}",
-                "--worktree", "--", *base_paths,
+                "--literal-pathspecs", "restore", f"--source={base}", "--worktree", "--", *base_paths
             ], cwd=self.root)
             if restored.returncode != 0:
                 raise RepositoryTransientError("could not restore interrupted integration tree")
@@ -339,11 +338,10 @@ class Repository:
                 except OSError as exc:
                     raise RepositoryTransientError(f"could not remove interrupted integration path: {exc}") from exc
         dirty = self.git([
-            "--literal-pathspecs", "status", "--porcelain", "--untracked-files=all",
-            "--", *paths,
+            "--literal-pathspecs", "status", "--porcelain", "--untracked-files=all", "--", *paths
         ]).stdout
-        if dirty:
-            raise RepositoryTransientError("run worktree remains dirty after integration recovery")
+        if dirty: raise RepositoryTransientError("run worktree remains dirty after integration recovery")
+        self._sync_checkout(paths)
         return cleaned
     def restore_missing_claim(self, missing: str, fallback: str) -> bool:
         owners = self._branch_worktrees()
@@ -357,12 +355,14 @@ class Repository:
             tree = self._move_ref(["read-tree", "--reset", "-u", fallback], cwd=self.root)
             if tree.returncode != 0:
                 detail = tree.stderr.strip() or tree.stdout.strip() or "index update refused"
-                raise RepositoryTransientError(
-                    f"could not restore checked-out run tree; retry: {detail}"
-                )
+                raise RepositoryTransientError(f"could not restore checked-out run tree; retry: {detail}")
+            self._sync_checkout(self._paths(["ls-files", "-z"], cwd=self.root))
         proc = self._move_ref(["update-ref", self.ref, fallback, missing], cwd=self.root)
         actual = self.branch_claim()
         if actual == fallback:
+            ref_path = self._lock_path(self.ref)
+            self._sync_path(ref_path)
+            self._sync_path(ref_path.parent, directory=True)
             return cleaned
         detail = proc.stderr.strip() or proc.stdout.strip() or "compare-and-swap refused"
         if actual == missing:
