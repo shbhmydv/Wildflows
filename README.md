@@ -1,89 +1,149 @@
-# wildflows
+# WILDFLOWS
 
-**Resident agent frames with deterministic, journalled hands.**
+**A durable call stack for resident agents: tool calls become banked work, branches stack with frames, and replay never pays twice.**
 
-Wildflows v2 is a standalone supervisor for long-running agent work. A run starts one
-root frame in an external Git worktree. That resident agent owns strategy and ordinary
-control flow; when it needs help it calls one of three authenticated engine tools:
+![Live DF2 asset-quality swarm in the WILDFLOWS dashboard](docs/images/df2-light.png)
 
-- `dispatch(tasks[], rig, parallel?, skills?)` pushes child frames and blocks until
-  their committed work is integrated into the caller's frame branch; `skills` is one
-  ordered skill-name list per task;
-- `gate(cmd)` runs a deterministic check in the caller's worktree and returns the exit
-  code plus complete stdout **and** stderr;
-- `ask(question)` parks the frame until its owner supplies an answer.
+## What is this?
 
-There is no planner/expression/epoch executor. Sequences, loops, and result synthesis
-are normal agent control flow. See [`docs/DESIGN.md` §12](docs/DESIGN.md) for the design
-of record.
+WILDFLOWS is a standalone supervisor for long-running agent work. A run is a call
+stack of resident agent **frames**: each frame keeps its context and works on its own
+Git branch and external worktree. When it makes a blocking tool call, that call *is the
+bank*—the caller stays alive while the engine does the durable work below it. There are
+only three engine tools:
 
-## Durability model
+- **`dispatch(tasks, rig, parallel?, skills?)`** pushes child frames, then returns their
+  reports and integrated commits;
+- **`gate(cmd)`** runs a deterministic check in the caller's worktree and returns the
+  exit code plus complete stdout and stderr;
+- **`ask(question)`** parks the frame until the owner answers.
 
-Every run has an incompatible v2 append-only journal at
-`<repo>/.wildflows/runs/<run-id>/events.ndjson`. Child branches start at their parent
-frame's branch, never at the run branch. Child commits integrate only upward; the run
-branch advances once, when the root frame unwinds. All frame worktrees live outside the
-target repository.
+Sequences, loops, synthesis, and retry policy remain ordinary agent control flow. The
+engine owns effects: admission, journals, worktrees, branch integration, and replay.
 
-Resume replays the frame stack from original prompts with one engine-generated digest
-of completed and pending calls. Calls are keyed by frame, logical call index, and
-canonical content hash. A completed call reissued with the same identity returns its
-journalled result without launching another agent or rerunning a gate. Only the
-frontier frame's uncommitted work is disposable.
+```mermaid
+flowchart TD
+  A["f0 · resident root"] -->|"dispatch blocks"| B["f0.c0.t0 · child"]
+  B -->|"dispatch blocks"| C["f0.c0.t0.c0.t0 · leaf"]
+  C -. "report + commits unwind" .-> B
+  B -. "report + commits unwind" .-> A
+```
 
-Dispatch admission is enforced before child effects: depth, breadth, subtree frame,
-spend/time, and rig-allowlist rails. Skills are prompt data and do not change admission.
-Repository Markdown skills in `.wildflows/skills/` shadow bundled stock skills. Every
-frame receives its assigned skill texts, job, the full skill manifest, then the engine
-tool preamble.
+A child starts from its caller's frame branch—not from the run branch. Child commits
+integrate upward on return; the run branch moves once, when `f0` unwinds. Parallel
+siblings share a starting tip and integrate only disjoint path ownership.
 
-The per-run MCP-compatible JSON-RPC endpoint binds an ephemeral `127.0.0.1` port and
-requires its random bearer token. Banked tool calls use HTTP/1.1 chunked whitespace
-heartbeats. A disconnected Pi shim retries the same hidden call identity, allowing the
-engine's durable single flight to return the original result without recomposed work.
+## Quickstart
 
-## Run
-
-Declare frame rigs in YAML (see [`docs/RIGS.md`](docs/RIGS.md)), then:
+WILDFLOWS requires Python 3.12+ and a clean Git target. The reference resident adapter
+uses an authenticated [`pi`](https://github.com/badlogic/pi-mono) installation.
 
 ```bash
+pip install -e .
+# Add the optional dashboard dependencies:
+pip install -e '.[dash]'
+
+cat > job.md <<'EOF'
+# Job
+Inspect the target, implement the requested change, delegate bounded work where useful,
+and verify the result with wildflows_gate. Commit useful work before every tool call.
+EOF
+
+cat > rigs.yaml <<'EOF'
+rigs:
+  senior:
+    kind: script
+    script: rigs/worker-picodex.sh
+    log_dir: /tmp/wildflows/senior
+    timeout_s: 1800
+  worker:
+    kind: script
+    script: rigs/worker-picodex.sh
+    log_dir: /tmp/wildflows/worker
+    timeout_s: 900
+EOF
+
 python3 -m wildflows run job.md \
-  --repo /path/to/target \
-  --rigs rigs.yaml \
-  --root-rig senior
+  --repo /path/to/clean-git-target --rigs rigs.yaml --root-rig senior
 ```
 
-Resume a stopped stack with the printed run id:
+The CLI prints the run id. Replay a stopped stack with the same job and registry:
 
 ```bash
-python3 -m wildflows resume job.md --repo /path/to/target \
-  --rigs rigs.yaml --root-rig senior --run-id <id>
+python3 -m wildflows resume job.md \
+  --repo /path/to/clean-git-target --rigs rigs.yaml --root-rig senior \
+  --run-id <id>
 ```
 
-A live parked ask can be answered by adding `--answer '...'`; the resident engine
-observes the durable answer file and resumes the blocked tool call.
+For a small two-leaf example, see [`examples/toy-run`](examples/toy-run/).
 
-The optional dashboard renders the live v2 frame call stack and journal. It watches
-multiple repositories on fixed port 8181; `--repo` is repeatable and `--watchlist`
-accepts a file with one repository path per line:
+![Small two-leaf WILDFLOWS run](docs/images/toy-light.png)
+
+## The journal is the stack
+
+Every effect is an fsynced v2 record at
+`<target>/.wildflows/runs/<run-id>/events.ndjson`. Frame ids are structural
+breadcrumbs. This is the opening of the committed dashboard fixture, rendered in the
+same breadcrumb style as the console:
+
+```text
+seq  frame / call                         event
+0    run                                  run_opened
+1    f0                                   frame_pushed
+2    f0 / call 0                          dispatch_called
+3    f0 › c0 › t0                         frame_pushed
+4    f0 › c0 › t0 / call 0                dispatch_called
+5    f0 › c0 › t0 › c0 › t0              frame_pushed
+```
+
+The source records are
+[`examples/dashboard-fixture/.wildflows/runs/frame-stack-demo/events.ndjson`](examples/dashboard-fixture/.wildflows/runs/frame-stack-demo/events.ndjson).
+On resume, frames restart from their original prompts plus a digest of completed and
+pending calls. A repeated call with the same frame, logical index, and canonical content
+hash returns its journalled result instead of launching or gating twice.
+
+## Skills are layered data
+
+A dispatch can assign one ordered skill-name list to each task. WILDFLOWS ships three
+Markdown bundles; target-local `.wildflows/skills/*.md` files add skills or shadow a
+bundled file with the same stem. Skills steer prompts—they do not grant capability or
+change admission.
+
+Every frame receives its assigned skill texts in order, then its job, the resolved skill
+manifest, and finally the engine tool/replay preamble. A skill starts with
+`# title — one-line description`; no plugin code or frontmatter is involved.
+
+## Dashboard
 
 ```bash
-python3 -m wildflows dash \
-  --repo /path/to/target \
-  --repo /path/to/another-target
+python3 -m wildflows dash --repo /path/to/clean-git-target
 # http://127.0.0.1:8181
 ```
 
-See [docs/DASHBOARD.md](docs/DASHBOARD.md) for deep links, the synthetic visual fixture,
-and the token-guarded owner-answer seam.
+Port **8181** is the default (`--port` overrides it). The local FastAPI/Uvicorn server
+tails complete journal records over SSE; the static console renders running leaves,
+banked callers, collapsed dispatches, queued fan-out, gates, failures, and parked asks.
+The only mutation is a token-guarded answer to a pending owner question.
 
-## Develop
+| Light | Dark |
+|---|---|
+| ![Synthetic frame stack in light mode](docs/images/synth-light.png) | ![Synthetic frame stack in dark mode](docs/images/synth-dark.png) |
 
-```bash
-pip install -e '.[dev]'
-python3 -m pytest -q
-python3 -m mypy --strict wildflows tests
-bash -n rigs/*.sh
-```
+The hero is the live DF2 asset-quality swarm. The pair above is the tracked synthetic
+fixture: 20-way fan-out, a ghost queue, a parked ask, a failed gate, and depth-four
+drill-in.
 
-Repository tests use fake agent binaries; they do not invoke real models.
+## Receipts and reference
+
+- **DF1:** the resident-frame pivot fixed a real React Native clipping family in
+  **20m40s**; the predecessor spent roughly five hours and did not close it.
+- **DF2:** the asset-quality swarm shown above is live dogfood of the parallel frame
+  path.
+- [`docs/DESIGN.md` §12](docs/DESIGN.md#12-v2--the-frame-architecture-call-stack-pivot-2026-07-14) — decision ledger and durability model
+- [`docs/RIGS.md`](docs/RIGS.md) — YAML registry and process/environment contract
+- [`docs/DASHBOARD.md`](docs/DASHBOARD.md) — watchlists, deep links, fixture, and answer seam
+
+Develop with `python3 -m pytest -q`, `python3 -m mypy --strict wildflows tests`, and
+`bash -n rigs/*.sh`. Tests use fake agent binaries; they do not invoke models.
+
+MIT © 2026 Shubham Yadav. See [`LICENSE`](LICENSE).

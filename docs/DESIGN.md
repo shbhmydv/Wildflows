@@ -1,8 +1,10 @@
-# wildflows — Design of Record (v1)
+# wildflows — Design ledger (v1 history; v2 current)
 
 Expanded from `newsys_design_skeleton.md` (2026-07-12). Every **SETTLED** decision
 (D1–D8) in that skeleton is law here and is preserved in spirit. Where the skeleton
-is silent, the minimal call is marked **(hand-1 call, review pending)**.
+is silent, the minimal call is marked **(hand-1 call, review pending)**. Sections 1–11
+retain the v1 decision history; §12 and its later hand entries describe the shipped v2
+frame architecture and supersede that execution model.
 
 > **Thesis.** The state machine is the hands, the model is the mind. The mind owns
 > STRATEGY — which shape, what verification, when to end. The hands own EFFECTS —
@@ -118,8 +120,8 @@ A journaled host mutation: `npm ci`, boot a dev server a loop keeps warm.
 ## 2. The expression model (data)
 
 An expression is a small **recursive Pydantic model** — a discriminated union on a
-`kind` field. This is the data the planner emits and the core walks. (Concrete types
-in `wildflows/expr.py`.)
+`kind` field. This is the data the planner emits and the core walks. (Historical v1
+concrete types lived in the now-removed `wildflows/expr.py`.)
 
 ```
 Expr = Do | Dispatch | Seq | Combine | Loop | Inplace | Ask | Setup
@@ -140,7 +142,9 @@ predicate (`cmd` whose exit-0 means done, or `flag` meaning "planner-judged last
 result ok"); `Edit(path, content)`.
 
 Every node carries a stable **`node_id`** (assigned by the core when the expression
-tree is admitted, deterministic pre-order path like `n0.1.2`). The cross-epoch join
+tree is admitted, deterministic pre-order path like `n0.1.2`). The referenced
+`wildflows/expr.py` was the historical v1 home and was removed by the v2 raze; shipped
+frame/tool request types live in `wildflows/frame.py`. The cross-epoch join
 key between the expression tree and the journal is **`(epoch, node_id)`**, NOT
 `node_id` alone: one epoch's `n0` must never inherit an earlier epoch's `n0` result, so
 replay scopes every folded fact by `(epoch, node_id)` (B3, hand-4). This is what makes
@@ -151,7 +155,7 @@ One expression tree = one **epoch** = one planner re-entry point + one durabilit
 point (§3). The tree is validated by Pydantic on admission; all eight kinds are
 executable except a `loop` with a planner-judged `flag` predicate.
 
-### Code homes (hand-6 authority split, from the bloat audit)
+### Code homes (historical v1 hand-6 authority split, from the bloat audit)
 
 The engine was split by **authority**, each home owning one thing so the planned
 scheduler / worktree / planner / dashboard steps each depend on one narrow seam:
@@ -397,13 +401,18 @@ filesystem/index mutation has no accepted effect.
 
 ---
 
-## 8. Rigs (the multi-harness seam)
+## 8. Rigs (the historical v1 multi-harness seam)
 
-A **rig** is a harness+model that executes a `do`. The seam is one method:
+A **rig** was a harness+model that executed a v1 `do`. Its seam was:
 
 ```
 Rig.run(prompt: str, workdir: Path) -> Result
 ```
+
+The shipped v2 protocol is
+`Rig.run(prompt: str, workdir: Path, runtime: FrameRuntime) -> FrameResult`; the runtime
+carries the MCP endpoint, per-frame token and id, generated Pi extension path, runtime
+directory, and next logical call index.
 
 prompt in, text/files out — exactly grindstone's shape-agnostic `request.sh` contract,
 which is why real rigs (`claude -p`, `pi`, local Qwen, `codex exec`) plug in with
@@ -425,8 +434,8 @@ a crash can leave an orphan writing only a never-reused attempt path.
 
 `ShellRig` proves the shell-out shape; the production seam is **`ScriptRig`**, which
 drives a configured executable through the exact contract grindstone's rigs already
-use, so a real script (`models/picodex/senior_request.sh`, `planner_request.sh`, the
-`codex`/`claude`/local-Qwen rigs) plugs in with no engine change:
+use. The shipped adapters are `rigs/worker-picodex.sh` and `rigs/worker-local.sh`;
+the v1 planner adapter named in early entries was removed by the v2 raze:
 
 ```
 <script> --worktree <dir> --prompt <file> --log-dir <dir> \
@@ -1447,19 +1456,21 @@ than patching each row. Both are the transaction model of record — not a later
 96. **Journal vocabulary v1.** Every record carries integer `version: 1`; load refuses
     missing or mismatched versions with `IncompatibleJournalError`. No migration path is
     inferred and the existing event kinds are the frozen v1 vocabulary.
-97. **Adapters remain scripts.** `rigs/` contains self-contained picodex planner/senior
-    and local OpenAI-compatible worker adapters. Prompt bodies cross into `pi`/`curl`
-    through stdin, process-group handles and Git ceilings match the ScriptRig boundary,
-    and nonzero quota signatures retain the existing `busy` classification. Model calls
-    are operator smoke tests; repository tests use fake transports on `PATH`.
+97. **Adapters remain scripts.** `rigs/` contained self-contained picodex
+    planner/senior and local OpenAI-compatible worker adapters at this v1 point. Prompt
+    bodies cross into `pi`/`curl` through stdin, process-group handles and Git ceilings
+    match the ScriptRig boundary, and nonzero quota signatures retain the existing
+    `busy` classification. Model calls are operator smoke tests; repository tests use
+    fake transports on `PATH`. Entry 113 supersedes the planner surface; the shipped v2
+    adapters are `worker-picodex.sh` and `worker-local.sh`.
 
 ---
 
 ## 12. v2 — the frame architecture (call-stack pivot, 2026-07-14)
 
 Owner-driven redesign settled live during DF1. Supersedes the epoch/expression
-execution model (§1–§4) as the target architecture; v1 remains the shipped
-baseline until v2 lands. The trigger: DF1 ran `loop(senior)` and the engine
+execution model (§1–§4) and is now the shipped architecture; the preceding v1 material
+remains as decision history. The trigger: DF1 ran `loop(senior)` and the engine
 decapitated a working senior between iterations — grindstone's cold-attempt
 model wearing a new name. The founding requirement was an always-alive,
 in-context senior; disk-journal "resume" of a mind is not resume (owner:
@@ -1479,8 +1490,8 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
 99. **Most v1 primitives dissolve into agent control flow.** `seq` = the
     caller makes calls in order; `loop` = the caller's own while(); `combine` =
     the parent reading child results in-context. The engine tool surface is
-    exactly three (+setup as a dispatch flag): **`dispatch(tasks[], rig,
-    parallel?)`** — push child frame(s), block, return result text;
+    exactly three: **`dispatch(tasks[], rig, parallel?, skills?)`** — push child
+    frame(s), block, return result text and integrated commits;
     **`gate(cmd)`** — run a deterministic check in the caller's worktree,
     return exit + full stdout AND stderr; **`ask(question)`** — park the frame
     for the owner. Loops-as-engine-control-flow (`loop(senior)`) are the named
@@ -1614,9 +1625,9 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
 113. **The v1 raze includes owner surfaces.** Planner decisions, expression
      models/admission/traversal, macros, planner adapter/docs, and epoch CLI
      flags are removed. `run` starts the root rig directly from `job.md`, and
-     `resume` replays that root stack. The dashboard backend is deliberately a
-     compiling v2 journal/status stub; a frame-stack UI is the next phase, as
-     allowed by §10/§12.
+     `resume` replays that root stack. The dashboard backend was deliberately a
+     compiling v2 journal/status stub at this hand; Hand-31 entries 122–127 supersede
+     that status with the shipped frame-stack UI.
 
 114. **The run capability is attenuated per active frame.** The endpoint owns a
      random run secret, but each frame attempt receives a separate random
@@ -1749,3 +1760,23 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      palette, and dispatch calls/returns carry explicit request/result margin refs.
      The tracked synthetic repository exercises failure, owner parking, a 20-slot
      fan-out, whole-call collapse, a two-stream failed gate, and depth four.
+
+### Hand-32 calls — ship surface and coherence
+
+128. **The public description starts at the shipped v2 frame model.** Sections 1–11
+     remain the immutable v1 decision history, while §12 is explicitly current. The
+     three-tool signature is `dispatch(tasks[], rig, parallel?, skills?)`, `gate(cmd)`,
+     and `ask(question)`; there is no setup flag or fourth tool. Historical source and
+     adapter names are labelled as removed rather than presented as current paths.
+
+129. **Operator and adapter docs describe defaults as defaults.** The dashboard is a
+     FastAPI/Uvicorn server with a framework-free static frontend; 8181 is its
+     overridable default, not a fixed port. The shipped rig protocol receives
+     `FrameRuntime`, and the reference script environment remains the five variables
+     documented in `docs/RIGS.md`.
+
+130. **Ship hygiene is deliberately narrow.** The package declares Python 3.12+, MIT
+     licensing, and its author in distribution metadata. The dead-code sweep removes
+     only imports and helpers with no repository caller; explicitly exported
+     compatibility spellings and protocol callbacks remain. There are no new design
+     open items from this pass.

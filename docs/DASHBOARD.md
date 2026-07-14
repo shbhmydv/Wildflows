@@ -1,7 +1,8 @@
 # Dashboard (v2 frame console)
 
-The optional dashboard is a framework-free, local operator console over v2
-`events.ndjson` journals. It discovers the call stack from frame and tool-call facts;
+The optional dashboard is a local FastAPI/Uvicorn operator console with a
+framework-free static frontend over v2 `events.ndjson` journals. It discovers the call
+stack from frame and tool-call facts;
 it does not forecast or write engine state. The canvas reads top-down: a frame card,
 then that frame's dispatch rows in call order, with parallel siblings across each row.
 Completed sibling rows collapse together, an in-flight caller is **banked**, and only a
@@ -16,7 +17,7 @@ python3 -m wildflows dash \
 ```
 
 `--repo` is repeatable. `--watchlist paths.txt` adds one repository path per nonblank,
-non-comment line and can be combined with `--repo`. `--port` overrides the fixed 8181
+non-comment line and can be combined with `--repo`. `--port` overrides the 8181
 default. The run picker and **LIVE NOW** rail qualify every run with its repository.
 Useful deep-link parameters are `?repo=<name>&run=<id-prefix>&theme=light|dark`; add
 `&frame=<full-frame-id>` to rebase the canvas at a deep frame.

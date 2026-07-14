@@ -5,9 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wildflows"
 version = "0.0.1"
-description = "Better dynamic workflows: multi-harness, long-running, worktrees, journalling. Open source agent workflows."
+description = "Durable call stacks for resident coding agents"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [{name = "Shubham Yadav"}]
+license = {file = "LICENSE"}
 keywords = ["agent workflows", "orchestrator", "llm", "worktrees", "journalling"]
 dependencies = ["pydantic>=2.0", "pyyaml>=6.0"]
 

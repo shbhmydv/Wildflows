@@ -7,6 +7,8 @@ build/
 dist/
 .venv/
 venv/
-# transient run state (dashboard/dogfood scratch)
+.pi/
+handoff.md
+# Transient run state; repository skill bundles under .wildflows/skills stay trackable.
 .wildflows/runs/
 /tmp-runs/
