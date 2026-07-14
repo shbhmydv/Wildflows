@@ -137,7 +137,7 @@ def test_fresh_load_fsyncs_complete_tail_after_failed_append_fsync_before_accept
             def fail_fsync(_fd: int) -> None:
                 raise OSError("injected file fsync failure")
 
-            injected.setattr(journal_module.os, "fsync", fail_fsync)
+            injected.setattr(os, "fsync", fail_fsync)
         else:
             def fail_directory(_path: Path) -> None:
                 raise OSError("injected first-file directory fsync failure")
@@ -153,7 +153,7 @@ def test_fresh_load_fsyncs_complete_tail_after_failed_append_fsync_before_accept
         synced_modes.append(os.fstat(fd).st_mode)
         real_fsync(fd)
 
-    monkeypatch.setattr(journal_module.os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "fsync", record_fsync)
     fresh = Journal.load(run_dir)
     assert fresh.projection.epoch_closed(0)
     assert any(stat.S_ISREG(mode) for mode in synced_modes)
@@ -172,7 +172,9 @@ def test_reaper_treats_esrch_between_proc_identity_and_getpgid_as_an_absent_or_r
     record.integrity = ws._record_integrity(record)
     path = ws._process_path(0, "n0", 0)
     ws._fsync_json(path, record)
-    monkeypatch.setattr(ws, "_proc_identity", lambda _pid: (100, "R", 4242))
+    monkeypatch.setattr(
+        ws, "_proc_identity", lambda pid: (100, "R", 4242) if pid == 4242 else None
+    )
 
     def gone(_pid: int) -> int:
         raise ProcessLookupError

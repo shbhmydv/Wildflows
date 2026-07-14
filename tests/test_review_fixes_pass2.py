@@ -351,17 +351,23 @@ def test_unknown_rig_rejected_at_admission(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- SF3
 
 def test_shell_rig_timeout_kills_background_process_group(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _git_init(workdir)
     pid_file = tmp_path / "pid"
     rig = ShellRig(
         template=f"sleep 30 & echo $! > {pid_file}; wait", timeout_s=0.4
     )
-    result = rig.run("go", tmp_path)
+    Engine(tmp_path / "run", workdir, RigRegistry({"shell": rig})).run_epoch(
+        Do(task="timeout", rig=RigRef(name="shell")), 0
+    )
+    result = replay(tmp_path / "run").results[(0, "n0")]
     assert result.ok is False
     assert "timeout" in result.text
     time.sleep(0.2)
     child = int(pid_file.read_text().strip())
     with pytest.raises(ProcessLookupError):
-        os.kill(child, 0)  # the backgrounded child was reaped with the group
+        os.kill(child, 0)  # the engine-owned supervisor reaped the whole group
 
 
 # --------------------------------------------------------------------------- SF4

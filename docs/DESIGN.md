@@ -1216,3 +1216,35 @@ than patching each row. Both are the transaction model of record — not a later
     typed `JournalExistsError` when `events.ndjson` is already nonempty. `Journal.load` is
     the sole continuation path: it classifies/repairs the physical tail, replays projection
     state, and returns the fresh append owner.
+
+### Hand-16 calls (from the pass-12 correctness review) — ONE PROCESS BARRIER
+
+73. **Unified process supervision (hand-16).** The predicate-only launcher/reaper is
+    deleted. Every built-in external workload command — rig command or predicate — uses
+    one workspace-owned `ProcessSupervisor` seam while `Rig.run(prompt, workdir)` remains
+    unchanged. A session-leader guardian first reports ready, then the parent atomically
+    publishes and fsyncs a signed `processes/` identity record containing
+    `(epoch, node, attempt, pid, pgid, /proc start-time)`; only then does the parent open
+    the effect gate. The guardian delivers one bounded framed result and remains alive
+    until the parent kills the group. A broken/partial result-pipe write makes the guardian
+    SIGKILL its own group rather than abandon descendants. Shell/Script rigs never create
+    an escaping group; their direct-child timeout is enclosed by the same outer barrier.
+    Deliberate `setsid` escape remains outside the declared process-group model.
+
+    Normal completion reaps before workspace verification/integration. Every
+    `recover_lease` starts with the same kill-only reaper, before capture, Git/disk
+    recovery, lease settlement, or redispatch. The reaper never touches Git or workspace
+    bytes. For every recorded state, including a vanished leader with surviving members,
+    it repeatedly enumerates `/proc`, selects non-zombie processes whose PGID equals the
+    record and whose start-time is at least the recorded launch start-time, SIGKILLs those
+    PIDs, and verifies that no eligible member remains before fsync-settling the record.
+    Leader `getpgid` ESRCH is an absent/recheck race, not a raw restart failure. This
+    supersedes decision 70's predicate-specific mechanism and makes the M2
+    `ProcessSupervisor` authority explicit while M1 execution remains serial.
+
+74. **Fresh-load durability adoption (hand-16).** `Journal.load` does not infer that a
+    newline-terminated tail was previously durable: it may be the complete page-cache
+    residue of a poisoned append whose file fsync or first-file directory fsync failed.
+    After parsing and any torn-tail truncation, a fresh owner unconditionally fsyncs every
+    accepted existing `events.ndjson` (including an empty file) and then its directory
+    before returning. A sync failure returns no owner and no accepted durability fact.

@@ -32,7 +32,7 @@ from wildflows.expr import CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Until
 from wildflows.journal import Journal
 from wildflows.projection import ExecutionOutcome, Floor, NodeKey, RunProjection, replay
 from wildflows.result import CommitReceipt, IntegrationReceipt, Result
-from wildflows.rig import RigRegistry
+from wildflows.rig import RigRegistry, process_launcher
 from wildflows.workspace import (
     CompletionRecorder,
     InplaceIntent,
@@ -391,7 +391,10 @@ class Engine:
             self._settle(key)
             return ExecutionOutcome(key=key)
         try:
-            result = self.registry.resolve(node.rig.name).run(prompt, self.workdir)
+            with process_launcher(
+                lambda operation, timeout: self.ws.run_process(lease, operation, timeout)
+            ):
+                result = self.registry.resolve(node.rig.name).run(prompt, self.workdir)
         except Exception as exc:  # a rig exception never escapes after `dispatched`
             self._finish_live_failure(
                 key, Result(text=f"rig raised: {exc}", outcome="failed")

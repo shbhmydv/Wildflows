@@ -9,8 +9,11 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import signal
 import subprocess
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -20,8 +23,33 @@ from wildflows.result import Outcome, Result
 # `from wildflows.rig import Result` keeps working for rig implementations.
 __all__ = [
     "Outcome", "Result", "DEFAULT_BUSY_PATTERNS", "Rig", "EchoRig", "ShellRig",
-    "ScriptRig", "RigRegistry",
+    "ScriptRig", "RigRegistry", "process_launcher",
 ]
+
+ProcessLauncher = Callable[[Callable[[], bytes], float], bytes]
+_PROCESS_LAUNCHER: ContextVar[ProcessLauncher | None] = ContextVar(
+    "wildflows_process_launcher", default=None
+)
+
+
+@contextmanager
+def process_launcher(launcher: ProcessLauncher) -> Iterator[None]:
+    """Bind the engine-owned process launcher without changing the ``Rig`` protocol."""
+    token = _PROCESS_LAUNCHER.set(launcher)
+    try:
+        yield
+    finally:
+        _PROCESS_LAUNCHER.reset(token)
+
+
+def _run_external(operation: Callable[[], Result], timeout_s: float) -> Result:
+    launcher = _PROCESS_LAUNCHER.get()
+    if launcher is None:  # direct library use; engine execution always binds a launcher
+        return operation()
+    raw = launcher(
+        lambda: operation().model_dump_json().encode("utf-8"), timeout_s + 1
+    )
+    return Result.model_validate_json(raw)
 
 # The rate/session-limit signatures the grindstone rigs surface on stderr (kept in
 # sync with models/picodex/{senior,planner}_request.sh + grindstone/ratelimit.py).
@@ -57,10 +85,9 @@ class ShellRig:
     This is the real plug-in path (e.g. template='claude -p {prompt}'); the command
     runs with cwd=workdir so a real rig writes its files inside the worktree.
 
-    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever. The
-    command runs in its OWN process group (`start_new_session=True`); on timeout the
-    core signals the whole GROUP (`killpg`), so background children the shell spawned
-    (`cmd & ...`) are reaped too, not orphaned. A timeout is
+    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever. During
+    engine execution the workspace-owned process launcher places this command in its
+    durably recorded group and reaps every descendant before returning. A timeout is
     returned as `outcome="failed"` with a `[timeout]` marker; any non-zero exit is
     likewise `outcome="failed"`.
     """
@@ -71,34 +98,31 @@ class ShellRig:
 
     def run(self, prompt: str, workdir: Path) -> Result:
         cmd = self.template.replace("{prompt}", shlex.quote(prompt))
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,
-            cwd=workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,  # own process group -> killpg reaps descendants
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=self.timeout_s)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            stdout, stderr = proc.communicate()
-            return Result(
-                text=f"[timeout] command exceeded {self.timeout_s}s\n{stderr}",
-                exit_code=None,
-                outcome="failed",
-            )
-        ok = proc.returncode == 0
-        return Result(
-            text=stdout if ok else stderr,
-            exit_code=proc.returncode,
-            outcome="ok" if ok else "failed",
-        )
+
+        def execute() -> Result:
+            # Regular capture files cannot be held pipe-open by a background descendant.
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as out, \
+                    tempfile.TemporaryFile(mode="w+", encoding="utf-8") as err:
+                try:
+                    proc = subprocess.run(
+                        cmd, shell=True, cwd=workdir, stdout=out, stderr=err,
+                        text=True, timeout=self.timeout_s,
+                    )
+                except subprocess.TimeoutExpired:
+                    out.seek(0); err.seek(0)
+                    return Result(
+                        text=f"[timeout] command exceeded {self.timeout_s}s\n{err.read()}",
+                        exit_code=None, outcome="failed",
+                    )
+                out.seek(0); err.seek(0)
+                stdout, stderr = out.read(), err.read()
+                ok = proc.returncode == 0
+                return Result(
+                    text=stdout if ok else stderr, exit_code=proc.returncode,
+                    outcome="ok" if ok else "failed",
+                )
+
+        return _run_external(execute, self.timeout_s)
 
 
 class ScriptRig:
@@ -165,41 +189,32 @@ class ScriptRig:
         ]
         proc_env = {**os.environ, **self.env}
 
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=workdir,
-                capture_output=True,
-                text=True,
-                env=proc_env,
-                timeout=self.timeout_s,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # Timeout is represented as a `failed` outcome with a "[timeout]" marker;
-            # a dedicated timeout outcome is not warranted (the caller treats it like
-            # any other non-busy failure). Reaping the process GROUP is ladder step 4.
-            out = exc.stdout or b""
-            err = exc.stderr or b""
-            stdout = out.decode() if isinstance(out, bytes) else out
-            stderr = err.decode() if isinstance(err, bytes) else err
-            (dispatch_dir / "agent.stdout.log").write_text(stdout, encoding="utf-8")
-            (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
-            return Result(
-                text=f"[timeout] script exceeded {self.timeout_s}s\n{stderr}",
-                exit_code=None,
-                outcome="failed",
-            )
+        def execute() -> Result:
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as out, \
+                    tempfile.TemporaryFile(mode="w+", encoding="utf-8") as err:
+                try:
+                    proc = subprocess.run(
+                        argv, cwd=workdir, stdout=out, stderr=err, text=True,
+                        env=proc_env, timeout=self.timeout_s,
+                    )
+                except subprocess.TimeoutExpired:
+                    out.seek(0); err.seek(0)
+                    stdout, stderr = out.read(), err.read()
+                    (dispatch_dir / "agent.stdout.log").write_text(stdout, encoding="utf-8")
+                    (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
+                    return Result(
+                        text=f"[timeout] script exceeded {self.timeout_s}s\n{stderr}",
+                        exit_code=None, outcome="failed",
+                    )
+                out.seek(0); err.seek(0)
+                stdout, stderr = out.read(), err.read()
+                (dispatch_dir / "agent.stdout.log").write_text(stdout, encoding="utf-8")
+                (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
+                outcome = self._classify(proc.returncode, stdout, stderr)
+                text = stdout if proc.returncode == 0 else (stderr or stdout)
+                return Result(text=text, exit_code=proc.returncode, outcome=outcome)
 
-        (dispatch_dir / "agent.stdout.log").write_text(proc.stdout, encoding="utf-8")
-        (dispatch_dir / "agent.stderr.log").write_text(proc.stderr, encoding="utf-8")
-
-        outcome = self._classify(proc.returncode, proc.stdout, proc.stderr)
-        text = proc.stdout if proc.returncode == 0 else (proc.stderr or proc.stdout)
-        return Result(
-            text=text,
-            exit_code=proc.returncode,
-            outcome=outcome,
-        )
+        return _run_external(execute, self.timeout_s)
 
 
 class RigRegistry:

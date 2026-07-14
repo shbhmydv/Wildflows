@@ -13,7 +13,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -141,13 +140,13 @@ class CompletionSettlement(BaseModel):
     integrity: str | None = None
 
 
-class PredicateProcessRecord(BaseModel):
+class ProcessRecord(BaseModel):
     epoch: int
     node_id: str
     attempt: int
     pid: int
     pgid: int
-    start_time: str
+    start_time: int
     integrity: str | None = None
 
 
@@ -562,7 +561,7 @@ class WorkspaceEffects:
         receipt and publishes the same deterministic disposition.
         """
         epoch, node_id = request.node_key
-        self.reap_predicate_process(epoch, node_id, request.attempt)
+        self.reap_process(epoch, node_id, request.attempt)
         receipt = self._load_recovery_record(epoch, node_id, request.attempt)
         settlement = self._load_completion_settlement(epoch, node_id, request.attempt)
         if settlement is not None and settlement.pre_head != request.expected_pre_head:
@@ -1976,131 +1975,226 @@ class WorkspaceEffects:
         except OSError:
             return None
 
-    def _predicate_process_path(self, epoch: int, node_id: str, attempt: int) -> Path:
-        return self._record_path("predicate-processes", epoch, node_id, attempt)
+    def _process_path(self, epoch: int, node_id: str, attempt: int) -> Path:
+        return self._record_path("processes", epoch, node_id, attempt)
 
     @staticmethod
-    def _proc_identity(pid: int) -> tuple[str, str] | None:
+    def _proc_identity(pid: int) -> tuple[int, str, int] | None:
         try:
             raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise WorkspaceFault(f"cannot inspect predicate process {pid}: {exc}") from exc
+            raise WorkspaceFault(f"cannot inspect process {pid}: {exc}") from exc
         _head, marker, tail = raw.rpartition(")")
         fields = tail.split()
         if not marker or len(fields) < 20:
-            raise WorkspaceFault(f"malformed process identity for predicate pid {pid}")
-        return fields[19], fields[0]
+            raise WorkspaceFault(f"malformed process identity for pid {pid}")
+        try:
+            return int(fields[19]), fields[0], int(fields[2])
+        except ValueError as exc:
+            raise WorkspaceFault(f"malformed process identity for pid {pid}") from exc
 
-    def _load_predicate_process(
-        self, epoch: int, node_id: str, attempt: int
-    ) -> PredicateProcessRecord | None:
-        path = self._predicate_process_path(epoch, node_id, attempt)
+    def _load_process(self, epoch: int, node_id: str, attempt: int) -> ProcessRecord | None:
+        path = self._process_path(epoch, node_id, attempt)
         if not os.path.lexists(path):
             return None
         try:
             if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
-                raise WorkspaceFault(f"predicate process record is not regular: {path}")
-            record = PredicateProcessRecord.model_validate_json(path.read_bytes())
+                raise WorkspaceFault(f"process record is not regular: {path}")
+            record = ProcessRecord.model_validate_json(path.read_bytes())
             self._verify_record_integrity(record, path)
             if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
-                raise WorkspaceFault(f"predicate process identity record mismatch: {path}")
+                raise WorkspaceFault(f"process record identity mismatch: {path}")
             return record
         except WorkspaceFault:
             raise
         except (OSError, ValidationError) as exc:
-            raise WorkspaceFault(f"predicate process record is corrupt: {path}: {exc}") from exc
+            raise WorkspaceFault(f"process record is corrupt: {path}: {exc}") from exc
 
-    def _settle_predicate_process(self, record: PredicateProcessRecord) -> None:
-        path = self._predicate_process_path(record.epoch, record.node_id, record.attempt)
+    def _group_processes(self, record: ProcessRecord) -> list[int]:
+        members: list[int] = []
+        try:
+            entries = list(Path("/proc").iterdir())
+        except OSError as exc:
+            raise WorkspaceFault(f"cannot enumerate process group {record.pgid}: {exc}") from exc
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            identity = self._proc_identity(int(entry.name))
+            if identity is not None and identity[1] != "Z" and (
+                identity[2] == record.pgid and identity[0] >= record.start_time
+            ):
+                members.append(int(entry.name))
+        return members
+
+    def _settle_process(self, record: ProcessRecord) -> None:
+        path = self._process_path(record.epoch, record.node_id, record.attempt)
         try:
             path.unlink(missing_ok=True)
             self._fsync_dir(path.parent)
         except OSError as exc:
-            raise WorkspaceFault(f"cannot settle predicate process record: {exc}") from exc
+            raise WorkspaceFault(f"cannot settle process record: {exc}") from exc
 
-    def reap_predicate_process(self, epoch: int, node_id: str, attempt: int) -> None:
-        """Identity-check then kill the isolated group; never mutate the workspace."""
-        record = self._load_predicate_process(epoch, node_id, attempt)
+    def reap_process(self, epoch: int, node_id: str, attempt: int) -> None:
+        """Kill only recorded-group members launched no earlier than its guardian."""
+        record = self._load_process(epoch, node_id, attempt)
         if record is None:
             return
-        identity = self._proc_identity(record.pid)
-        if identity is None:
+        leader = self._proc_identity(record.pid)
+        if leader is not None and leader == (record.start_time, leader[1], record.pgid):
             try:
-                os.killpg(record.pgid, 0)
-            except ProcessLookupError:
-                self._settle_predicate_process(record)
-                return
-            raise WorkspaceFault("predicate leader vanished while its process group survives")
-        if identity[0] != record.start_time or os.getpgid(record.pid) != record.pgid:
-            raise WorkspaceFault("predicate pid was recycled; refusing to kill it")
-        try:
-            os.killpg(record.pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+                os.getpgid(record.pid)
+            except ProcessLookupError:  # leader exited between /proc and getpgid
+                leader = None
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            current = self._proc_identity(record.pid)
-            if current is None or current[1] == "Z" or current[0] != record.start_time:
-                break
+            members = self._group_processes(record)
+            if not members:
+                self._settle_process(record)
+                return
+            for pid in members:
+                current = self._proc_identity(pid)
+                if current is None or current[1] == "Z" or not (
+                    current[2] == record.pgid and current[0] >= record.start_time
+                ):
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             time.sleep(0.01)
-        else:
-            raise WorkspaceFault("predicate process group did not exit after SIGKILL")
-        self._settle_predicate_process(record)
+        raise WorkspaceFault("recorded process group did not exit after SIGKILL")
+
+    @staticmethod
+    def _write_all(fd: int, data: bytes) -> None:
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                raise OSError("short process-result write")
+            data = data[written:]
+
+    @staticmethod
+    def _supervisor_child(
+        gate_r: int, ready_w: int, result_w: int, operation: Callable[[], bytes]
+    ) -> None:
+        try:
+            os.setsid()
+        except OSError:
+            os._exit(125)
+        try:
+            WorkspaceEffects._write_all(ready_w, b"1")
+            os.close(ready_w)
+            gate = os.read(gate_r, 1)
+            os.close(gate_r)
+            if not gate:
+                os._exit(125)
+            try:
+                payload, ok = operation(), b"1"
+            except BaseException as exc:
+                payload, ok = f"{type(exc).__name__}: {exc}".encode(
+                    "utf-8", errors="backslashreplace"
+                ), b"0"
+            frame = ok + len(payload).to_bytes(8, "big") + payload
+            WorkspaceEffects._write_all(result_w, frame)
+            os.close(result_w)
+        except BaseException:
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            finally:
+                os._exit(126)
+        while True:  # successful delivery keeps the group guardian alive until reap
+            signal.pause()
+
+    @staticmethod
+    def _read_exact(fd: int, size: int, deadline: float) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            ready, _writable, _exceptional = select.select([fd], [], [], max(0.0, remaining))
+            if not ready:
+                raise WorkspaceFault("supervised process timed out")
+            chunk = os.read(fd, size - len(data))
+            if not chunk:
+                raise WorkspaceFault("supervised process returned a truncated result")
+            data.extend(chunk)
+        return bytes(data)
+
+    def run_process(
+        self, lease: Lease, operation: Callable[[], bytes], timeout_s: float
+    ) -> bytes:
+        """Gate one process group behind a durable identity, then reap before return."""
+        gate_r, gate_w = os.pipe()
+        ready_r, ready_w = os.pipe()
+        result_r, result_w = os.pipe()
+        fds = (gate_r, gate_w, ready_r, ready_w, result_r, result_w)
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            for fd in fds:
+                os.close(fd)
+            raise WorkspaceFault(f"cannot launch process supervisor: {exc}") from exc
+        if pid == 0:
+            os.close(gate_w); os.close(ready_r); os.close(result_r)
+            self._supervisor_child(gate_r, ready_w, result_w, operation)
+            os._exit(127)
+        os.close(gate_r); os.close(ready_w); os.close(result_w)
+        epoch, node_id = lease.node_key
+        path = self._process_path(epoch, node_id, lease.attempt)
+        try:
+            deadline = time.monotonic() + timeout_s
+            self._read_exact(ready_r, 1, min(deadline, time.monotonic() + 5))
+            identity = self._proc_identity(pid)
+            if identity is None or identity[2] != pid:
+                raise WorkspaceFault("process supervisor exited before identity publication")
+            if os.path.lexists(path):
+                raise WorkspaceFault(f"active process record already exists: {path}")
+            record = ProcessRecord(
+                epoch=epoch, node_id=node_id, attempt=lease.attempt, pid=pid,
+                pgid=identity[2], start_time=identity[0],
+            )
+            record.integrity = self._record_integrity(record)
+            self._fsync_json(path, record)
+            self._write_all(gate_w, b"1")
+            header = self._read_exact(result_r, 9, deadline)
+            length = int.from_bytes(header[1:], "big")
+            if length > 64 * 1024 * 1024:
+                raise WorkspaceFault("supervised process result exceeds 64 MiB")
+            payload = self._read_exact(result_r, length, deadline)
+            ok = header[:1] == b"1"
+        finally:
+            for fd in (gate_w, ready_r, result_r):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if os.path.lexists(path):
+                self.reap_process(epoch, node_id, lease.attempt)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        if not ok:
+            raise WorkspaceFault(
+                "supervised operation failed: " + payload.decode("utf-8", errors="replace")
+            )
+        return payload
 
     def run_predicate(self, cmd: str, lease: Lease, timeout_s: float) -> bool:
-        """Run behind a recorded session-leader supervisor, then kill every descendant."""
-        gate_r, gate_w = os.pipe()
-        result_r, result_w = os.pipe()
-        supervisor = (
-            "import os,signal,subprocess,sys\n"
-            "g=int(sys.argv[2]);o=int(sys.argv[3]);b=os.read(g,1);os.close(g)\n"
-            "if not b: sys.exit(125)\n"
-            "p=subprocess.run(sys.argv[1],shell=True,stdin=subprocess.DEVNULL)\n"
-            "os.write(o,(str(p.returncode)+'\\n').encode());os.close(o);signal.pause()\n"
-        )
+        def execute() -> bytes:
+            proc = subprocess.run(cmd, shell=True, cwd=self.workdir, stdin=subprocess.DEVNULL)
+            return str(proc.returncode).encode("ascii")
+
+        raw = self.run_process(lease, execute, timeout_s)
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-c", supervisor, cmd, str(gate_r), str(result_w)],
-                cwd=self.workdir, pass_fds=(gate_r, result_w), start_new_session=True,
-            )
-        except OSError as exc:
-            for fd in (gate_r, gate_w, result_r, result_w):
-                os.close(fd)
-            raise WorkspaceFault(f"cannot launch predicate supervisor: {exc}") from exc
-        os.close(gate_r)
-        os.close(result_w)
-        identity = self._proc_identity(proc.pid)
-        if identity is None:
-            os.close(gate_w)
-            os.close(result_r)
-            proc.wait(timeout=5)
-            raise WorkspaceFault("predicate supervisor exited before identity publication")
-        epoch, node_id = lease.node_key
-        record = PredicateProcessRecord(
-            epoch=epoch, node_id=node_id, attempt=lease.attempt, pid=proc.pid,
-            pgid=os.getpgid(proc.pid), start_time=identity[0],
-        )
-        record.integrity = self._record_integrity(record)
-        try:
-            self._fsync_json(
-                self._predicate_process_path(epoch, node_id, lease.attempt), record
-            )
-            os.write(gate_w, b"1")
-            ready, _writable, _exceptional = select.select([result_r], [], [], timeout_s)
-            if not ready:
-                raise WorkspaceFault(f"predicate timed out after {timeout_s:g}s")
-            raw = os.read(result_r, 64)
-            try:
-                return int(raw.strip()) == 0
-            except ValueError as exc:
-                raise WorkspaceFault("predicate supervisor returned no exit status") from exc
-        finally:
-            os.close(gate_w)
-            os.close(result_r)
-            self.reap_predicate_process(epoch, node_id, lease.attempt)
-            proc.wait(timeout=5)
+            return int(raw) == 0
+        except ValueError as exc:
+            raise WorkspaceFault("predicate process returned no exit status") from exc
 
 
 class CompletionRecorder:
