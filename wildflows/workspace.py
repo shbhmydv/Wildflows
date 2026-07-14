@@ -157,7 +157,7 @@ class ProcessRecord(BaseModel):
 
 class GitRequest(BaseModel):
     args_b64: list[str]
-    env: dict[str, str] | None = None
+    index_wire: str | None = None
     input_b64: str | None = None
 
 class GitResponse(BaseModel):
@@ -1758,8 +1758,7 @@ class WorkspaceEffects:
     def _git_index(
         self, env: dict[str, str], *args: str
     ) -> subprocess.CompletedProcess[bytes]:
-        override = ({"GIT_INDEX_FILE": env["GIT_INDEX_FILE"]} if "GIT_INDEX_FILE" in env else None)
-        return self._run_git(args, override)
+        return self._run_git(args, env.get("GIT_INDEX_FILE"))
 
     # -- git plumbing --------------------------------------------------------
 
@@ -2152,26 +2151,16 @@ class WorkspaceEffects:
             signal.pause()
 
     @staticmethod
-    def _read_exact(fd: int, size: int, deadline: float) -> bytes:
+    def _read_exact(fd: int, size: int, deadline: float | None) -> bytes:
         data = bytearray()
         while len(data) < size:
-            remaining = deadline - time.monotonic()
-            ready, _writable, _exceptional = select.select([fd], [], [], max(0.0, remaining))
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            ready, _writable, _exceptional = select.select([fd], [], [], remaining)
             if not ready:
                 raise WorkspaceFault("supervised process timed out")
             chunk = os.read(fd, size - len(data))
             if not chunk:
                 raise WorkspaceFault("supervised process returned a truncated result")
-            data.extend(chunk)
-        return bytes(data)
-
-    @staticmethod
-    def _read_blocking(fd: int, size: int) -> bytes:
-        data = bytearray()
-        while len(data) < size:
-            chunk = os.read(fd, size - len(data))
-            if not chunk:
-                raise BrokenPipeError("process-scope control pipe closed")
             data.extend(chunk)
         return bytes(data)
 
@@ -2192,25 +2181,29 @@ class WorkspaceEffects:
                 pgid=identity[2], start_time=identity[0], kind="core",
             )
             while True:
-                size = int.from_bytes(self._read_blocking(request_r, 8), "big")
-                request = GitRequest.model_validate_json(self._read_blocking(request_r, size))
-                try:
-                    proc = subprocess.run(
-                        [b"git", *[base64.b64decode(arg) for arg in request.args_b64]],
-                        cwd=self.workdir, capture_output=True,
-                        input=(None if request.input_b64 is None else
-                               base64.b64decode(request.input_b64, validate=True)),
-                        env=(None if request.env is None else {**os.environ, **request.env}),
-                        timeout=290,
-                    )
-                    response = GitResponse(
-                        returncode=proc.returncode,
-                        stdout_b64=base64.b64encode(proc.stdout).decode("ascii"),
-                        stderr_b64=base64.b64encode(proc.stderr).decode("ascii"),
-                    )
-                except (OSError, ValueError, binascii.Error, subprocess.TimeoutExpired) as exc:
-                    response = GitResponse(returncode=126, error=f"{type(exc).__name__}: {exc}")
-                self._kill_group_members(group, exclude=os.getpid())
+                size = int.from_bytes(self._read_exact(request_r, 8, None), "big")
+                request = GitRequest.model_validate_json(self._read_exact(request_r, size, None))
+                with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+                    try:
+                        proc = subprocess.run(
+                            [b"git", *[base64.b64decode(arg) for arg in request.args_b64]],
+                            cwd=self.workdir, stdout=out, stderr=err,
+                            input=(None if request.input_b64 is None else
+                                   base64.b64decode(request.input_b64, validate=True)),
+                            env=(None if request.index_wire is None else {
+                                **os.environ, "GIT_INDEX_FILE": _fs_path(request.index_wire)}),
+                            timeout=290,
+                        )
+                        response = GitResponse(returncode=proc.returncode)
+                    except (OSError, ValueError, binascii.Error,
+                            subprocess.TimeoutExpired) as exc:
+                        response = GitResponse(
+                            returncode=126, error=f"{type(exc).__name__}: {exc}")
+                    self._kill_group_members(group, exclude=os.getpid())
+                    if response.error is None:
+                        out.seek(0); err.seek(0)
+                        response.stdout_b64 = base64.b64encode(out.read()).decode("ascii")
+                        response.stderr_b64 = base64.b64encode(err.read()).decode("ascii")
                 payload = response.model_dump_json().encode("utf-8")
                 self._write_all(result_w, len(payload).to_bytes(8, "big") + payload)
         except BaseException:
@@ -2274,7 +2267,7 @@ class WorkspaceEffects:
                 pass
 
     def _run_git(
-        self, args: tuple[str, ...], env: dict[str, str] | None = None,
+        self, args: tuple[str, ...], index_file: str | None = None,
         input_data: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         scope = self._core_scope
@@ -2283,8 +2276,9 @@ class WorkspaceEffects:
         request_fd, result_fd = scope
         request = GitRequest(
             args_b64=[base64.b64encode(os.fsencode(arg)).decode("ascii") for arg in args],
-            env=env, input_b64=(None if input_data is None else
-                               base64.b64encode(input_data).decode("ascii")),
+            index_wire=(None if index_file is None else _wire_path(os.fsencode(index_file))),
+            input_b64=(None if input_data is None else
+                       base64.b64encode(input_data).decode("ascii")),
         ).model_dump_json().encode("utf-8")
         self._write_all(request_fd, len(request).to_bytes(8, "big") + request)
         deadline = time.monotonic() + 300
