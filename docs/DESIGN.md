@@ -1209,7 +1209,8 @@ than patching each row. Both are the transaction model of record — not a later
 71. **Durable torn-tail repair (hand-15).** Any unterminated final journal record is uncertain
     and discarded, even when the available bytes happen to parse as valid JSON. Before a
     fresh append owner returns, `Journal.load` opens the file read/write, truncates to the
-    last newline-terminated record, and fsyncs the file. Malformed complete/middle records
+    last newline-terminated record, and fsyncs the file plus its containing directory.
+    Malformed complete/middle records
     still raise; append can no longer concatenate onto accepted torn bytes.
 72. **Create/load ownership split (hand-15).** `Journal(run_dir)` is creation-only and raises
     typed `JournalExistsError` when `events.ndjson` is already nonempty. `Journal.load` is

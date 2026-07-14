@@ -69,8 +69,6 @@ class LeaseRecord(BaseModel):
     attempt: int
     pre_head: str | None
     preexisting: list[str] = Field(default_factory=list)
-    # None is used only by the no-record journal fallback; persisted unsigned legacy
-    # records fail closed rather than guessing which empty directories pre-existed.
     preexisting_dirs: list[str] | None = None
     ts: float
     baseline_manifest: str | None = None
@@ -860,6 +858,10 @@ class WorkspaceEffects:
                         f"recovery postcondition failed: baseline directory differs: {rel}",
                         diff_path,
                     )
+        if rec.index_snapshot:
+            self._restore_index_snapshot(rec)
+            if self._index_bytes() != self._record_index_bytes(rec):
+                raise WorkspaceFault("recovery postcondition failed: index restore differed", diff_path)
 
     def _recovery_result(self, result: Result, diff_path: Path | None) -> Result:
         if diff_path is None:

@@ -57,6 +57,22 @@ def test_predicate_cannot_hide_tracked_mutation_with_index_flags(tmp_path: Path)
     assert not replay(run_dir).epoch_closed(0)
 
 
+def test_clean_predicate_restores_index_after_postcondition_git_reads(tmp_path: Path) -> None:
+    workdir = tmp_path / "work-touch"
+    _base_repo(workdir)
+    run_dir = tmp_path / "run-touch"
+    original_index = _index_path(workdir).read_bytes()
+    tree = Loop(
+        body=Inplace(edits=[]),
+        until=Until(kind="cmd", cmd="touch base.txt; true"),
+        cap=1,
+    )
+
+    Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
+    assert replay(run_dir).epoch_closed(0)
+    assert _index_path(workdir).read_bytes() == original_index
+
+
 def test_predicate_verification_compares_unfiltered_tracked_bytes(tmp_path: Path) -> None:
     workdir = tmp_path / "work-filter"
     _base_repo(workdir)
@@ -165,9 +181,17 @@ def test_partial_append_failure_fresh_load_repairs_tail_before_continuing(
     with pytest.raises(OSError, match="partial append"):
         journal.append(Boundary(run_id="run", epoch=0, node_id="n0", phase="closed"))
     monkeypatch.delattr(journal_module, "open")
+    directory_fsyncs: list[Path] = []
+    real_fsync_directory = journal_module._fsync_directory
 
+    def record_directory_fsync(path: Path) -> None:
+        directory_fsyncs.append(path)
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(journal_module, "_fsync_directory", record_directory_fsync)
     fresh = Journal.load(run_dir)
     assert [event.seq for event in fresh.events()] == [0]
+    assert directory_fsyncs == [run_dir]
     assert (run_dir / "events.ndjson").read_bytes().endswith(b"\n")
     assert fresh.append(
         Boundary(run_id="run", epoch=0, node_id="n0", phase="closed")

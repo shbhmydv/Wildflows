@@ -207,4 +207,5 @@ class Journal:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            _fsync_directory(j.run_dir)
         return j
