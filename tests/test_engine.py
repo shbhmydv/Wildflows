@@ -1,4 +1,4 @@
-"""End-to-end: the mind-steers loop over a do/inplace tree, journalled + replayable."""
+"""Execution scenarios for disposable node worktrees and loop/sequence shapes."""
 from __future__ import annotations
 
 import subprocess
@@ -7,172 +7,185 @@ from pathlib import Path
 import pytest
 
 from wildflows.admission import AdmissionError
-from wildflows.engine import Engine, replay
-from wildflows.expr import Ask, Do, Edit, Inplace, Loop, RigRef, Seq, Until
-from wildflows.rig import EchoRig, RigRegistry, ShellRig
+from wildflows.engine import Engine, NodeExecutionError, PredicateEvaluationError, replay
+from wildflows.expr import Ask, CtxRef, Do, Edit, Inplace, Loop, RigRef, Seq, Until
+from wildflows.result import Result
+from wildflows.rig import EchoRig, Rig, RigRegistry, ShellRig
 
 
-def _git_init(workdir: Path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
-    subprocess.run(["git", "config", "user.email", "t@t"], cwd=workdir, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=workdir, check=True)
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    process = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=check
+    )
+    return process.stdout.strip()
 
 
-def _engine(tmp_path: Path) -> Engine:
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    _git_init(workdir)
+def init_repo(path: Path) -> str:
+    path.mkdir()
+    git(path, "init", "-q", "-b", "run")
+    git(path, "config", "user.email", "test@wildflows.invalid")
+    git(path, "config", "user.name", "Wildflows Test")
+    (path / "seed").write_text("seed", encoding="utf-8")
+    git(path, "add", "seed")
+    git(path, "commit", "-qm", "seed")
+    return git(path, "rev-parse", "HEAD")
+
+
+def registry(**rigs: Rig) -> RigRegistry:
+    return RigRegistry({"echo": EchoRig(), **rigs})
+
+
+def engine(tmp_path: Path, rigs: RigRegistry | None = None) -> Engine:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    return Engine(tmp_path / "run-state", repo, rigs or registry())
+
+
+def test_inplace_and_do_integrate_on_run_branch(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
+    tree = Seq(
+        children=[
+            Inplace(edits=[Edit(path="hello.txt", content="hello")]),
+            Do(
+                task="read it",
+                rig=RigRef(name="echo"),
+                ctx=[CtxRef(kind="file", ref="hello.txt")],
+            ),
+        ]
+    )
+    eng.run_epoch(tree, 0)
+
+    assert (eng.workdir / "hello.txt").read_text(encoding="utf-8") == "hello"
+    assert replay(eng.run_dir).epoch_closed(0)
+    events = eng.journal.events()
+    integrated = [event for event in events if event.kind == "integrated"]
+    assert len(integrated) == 1
+    assert integrated[0].paths == ["hello.txt"]
+    assert list((eng.run_dir / "artifacts").rglob("*.json"))
+    assert not any((eng.run_dir / "worktrees").iterdir())
+
+
+def test_do_commits_rig_changes_and_preserves_rig_artifacts(tmp_path: Path) -> None:
+    writer = ShellRig("printf changed > agent.txt", 5)
+    eng = engine(tmp_path, registry(writer=writer))
+    eng.run_epoch(Do(task="write", rig=RigRef(name="writer")), 0)
+
+    assert git(eng.workdir, "show", f"{eng.run_branch}:agent.txt") == "changed"
+    receipt = replay(eng.run_dir).receipts[(0, "n0")]
+    assert receipt.paths == ["agent.txt"]
+
+
+def test_failed_rig_leaves_branch_untouched_and_epoch_open(tmp_path: Path) -> None:
+    failing = ShellRig("printf leak > leaked; exit 7", 5)
+    eng = engine(tmp_path, registry(fail=failing))
+    before = git(eng.workdir, "rev-parse", "HEAD")
+
+    with pytest.raises(NodeExecutionError):
+        eng.run_epoch(Do(task="fail", rig=RigRef(name="fail")), 0)
+
+    assert git(eng.workdir, "rev-parse", "HEAD") == before
+    assert not (eng.workdir / "leaked").exists()
+    state = replay(eng.run_dir)
+    assert not state.epoch_closed(0)
+    assert state.results[(0, "n0")].outcome == "failed"
+
+
+def test_resume_retries_failure_in_a_new_worktree(tmp_path: Path) -> None:
+    class FlakyRig:
+        def __init__(self) -> None:
+            self.paths: list[Path] = []
+
+        def run(self, prompt: str, workdir: Path) -> Result:
+            self.paths.append(workdir)
+            if len(self.paths) == 1:
+                (workdir / "bad").write_text("discard", encoding="utf-8")
+                return Result(text="try again", outcome="failed")
+            (workdir / "good").write_text("land", encoding="utf-8")
+            return Result(text="done")
+
+    flaky = FlakyRig()
+    eng = engine(tmp_path, registry(flaky=flaky))
+    tree = Do(task="eventually", rig=RigRef(name="flaky"))
+    with pytest.raises(NodeExecutionError):
+        eng.run_epoch(tree, 0)
+    Engine(eng.run_dir, eng.workdir, registry(flaky=flaky)).run_epoch(tree, 0)
+
+    assert len(flaky.paths) == 2
+    assert flaky.paths[0] != flaky.paths[1]
+    assert not (eng.workdir / "bad").exists()
+    assert (eng.workdir / "good").read_text(encoding="utf-8") == "land"
+
+
+def test_inplace_symlink_escape_fails_without_undo(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("owner", encoding="utf-8")
+    (eng.workdir / "escape").symlink_to(outside)
+    git(eng.workdir, "add", "escape")
+    git(eng.workdir, "commit", "-qm", "add symlink")
+    # The operator commit predates the epoch, so use a fresh run-state at its new tip.
+    eng = Engine(tmp_path / "run-two", eng.workdir, registry())
+
+    with pytest.raises(NodeExecutionError, match="symlink"):
+        eng.run_epoch(Inplace(edits=[Edit(path="escape", content="bad")]), 0)
+    assert outside.read_text(encoding="utf-8") == "owner"
+
+
+def test_predicate_mutation_is_discarded(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
+    loop = Loop(
+        body=Inplace(edits=[Edit(path="body", content="ok")]),
+        until=Until(kind="cmd", cmd="printf junk > predicate-junk; exit 0"),
+        cap=2,
+    )
+    eng.run_epoch(loop, 0)
+
+    assert (eng.workdir / "body").read_text(encoding="utf-8") == "ok"
+    assert not (eng.workdir / "predicate-junk").exists()
+    assert replay(eng.run_dir).loop_iterations[(0, "n0")] == 1
+
+
+def test_predicate_timeout_leaves_epoch_open(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
+    loop = Loop(
+        body=Inplace(edits=[]),
+        until=Until(kind="cmd", cmd="sleep 5", timeout_s=0.05),
+        cap=1,
+    )
+    with pytest.raises(PredicateEvaluationError, match="timed out"):
+        eng.run_epoch(loop, 0)
+    assert not replay(eng.run_dir).epoch_closed(0)
+
+
+def test_loop_cap_and_nested_floor_resume(tmp_path: Path) -> None:
     counter = ShellRig(
-        "c=$(cat counter 2>/dev/null || echo 0); c=$((c+1)); echo $c > counter", 30
+        "n=$(cat count 2>/dev/null || echo 0); n=$((n+1)); echo $n > count", 5
     )
-    reg = RigRegistry({"echo": EchoRig(), "counter": counter})
-    return Engine(run_dir=tmp_path / "run", workdir=workdir, registry=reg)
-
-
-def test_inplace_then_do_end_to_end(tmp_path: Path) -> None:
-    eng = _engine(tmp_path)
-    tree = Seq(
-        children=[
-            Inplace(edits=[Edit(path="hello.txt", content="hi from planner")]),
-            Do(task="summarize hello.txt", rig=RigRef(name="echo")),
-        ]
+    eng = engine(tmp_path, registry(counter=counter))
+    inner = Loop(
+        body=Do(task="tick", rig=RigRef(name="counter")),
+        until=Until(kind="cmd", cmd='test "$(cat count)" -ge 2'),
+        cap=3,
     )
-    eng.run_epoch(tree, epoch=0)
-
-    # inplace effect landed and was committed by the core
-    assert (eng.workdir / "hello.txt").read_text() == "hi from planner"
-    log = subprocess.run(
-        ["git", "log", "--oneline"], cwd=eng.workdir, capture_output=True, text=True
-    ).stdout
-    assert log.strip()  # at least one commit exists
-
-    # every primitive execution is journalled: boundary(open/close), dispatched, result, integrated
-    kinds = [e.kind for e in eng.journal.events()]
-    assert kinds[0] == "boundary"
-    assert kinds[-1] == "boundary"
-    assert "dispatched" in kinds
-    assert "result" in kinds
-    assert "integrated" in kinds  # inplace commit
-
-
-def test_replay_reconstructs_state_from_ndjson_alone(tmp_path: Path) -> None:
-    eng = _engine(tmp_path)
-    tree = Seq(
-        children=[
-            Inplace(edits=[Edit(path="a.txt", content="x")]),
-            Do(task="t", rig=RigRef(name="echo")),
-        ]
+    outer = Loop(
+        body=inner,
+        until=Until(kind="cmd", cmd="false"),
+        cap=2,
     )
-    eng.run_epoch(tree, epoch=0)
-    run_dir = eng.run_dir
+    eng.run_epoch(outer, 0)
 
-    # reconstruct purely from disk
-    state = replay(run_dir)
-    assert state.epoch_closed(0)
-    # inplace node integrated; do node has a result
-    inplace_id = "n0.0"
-    do_id = "n0.1"
-    assert (0, inplace_id) in state.integrated
-    assert (0, do_id) in state.results
-    assert state.results[(0, do_id)].ok is True
-    assert "t" in state.results[(0, do_id)].text
+    assert (eng.workdir / "count").read_text(encoding="utf-8").strip() == "3"
+    outer_results = [
+        event
+        for event in eng.journal.events()
+        if event.kind == "result" and event.node_id == "n0"
+    ]
+    assert outer_results[-1].outcome == "failed"
+    assert "hit cap 2" in (outer_results[-1].loop_status or "")
 
 
-def test_unexecutable_primitive_rejected_at_admission(tmp_path: Path) -> None:
-    # A representable-but-not-executable kind is rejected BEFORE any epoch opens (item 5),
-    # not with a NotImplementedError after a durable boundary.
-    eng = _engine(tmp_path)
+def test_admission_rejects_before_boundary(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
     with pytest.raises(AdmissionError):
-        eng.run_epoch(Ask(question="which?"), epoch=0)
-    assert not (eng.run_dir / "events.ndjson").exists()  # no incomplete epoch was opened
-
-
-def test_inplace_rejects_sibling_prefix_escape(tmp_path: Path) -> None:
-    # A pure string-prefix check would ACCEPT '../work-evil/f' because its resolved
-    # path shares the '/.../work' textual prefix. is_relative_to must reject it.
-    eng = _engine(tmp_path)
-    sibling = eng.workdir.parent / "work-evil"
-    sibling.mkdir()
-    with pytest.raises(ValueError, match="escapes workdir"):
-        eng.run_epoch(Inplace(edits=[Edit(path="../work-evil/f", content="x")]), epoch=0)
-    assert not (sibling / "f").exists()  # nothing was written outside the workdir
-
-
-def _counter_loop_body() -> Seq:
-    return Seq(
-        children=[
-            Inplace(edits=[Edit(path="marker.txt", content="body ran")]),
-            Do(task="tick", rig=RigRef(name="counter")),
-        ]
-    )
-
-
-# The body owns the counter effect; the predicate is a read-only, idempotent check.
-_CONVERGE_AT_3 = 'test "$(cat counter)" -ge 3'
-
-
-def test_loop_converges_and_journals_iterations(tmp_path: Path) -> None:
-    eng = _engine(tmp_path)
-    loop = Loop(body=_counter_loop_body(), until=Until(kind="cmd", cmd=_CONVERGE_AT_3), cap=10)
-    eng.run_epoch(loop, epoch=0)
-
-    iters = [e for e in eng.journal.events() if e.kind == "loop_iter"]
-    assert len(iters) == 3  # converged on the 3rd
-    assert iters[-1].converged is True
-    result = [e for e in eng.journal.events() if e.kind == "result" and e.node_id == "n0"]
-    assert result[-1].ok is True
-    # SF6: convergence/cap status is in loop_status; text/files carry the body artifact.
-    assert "converged after 3" in (result[-1].loop_status or "")
-    assert "converged" not in result[-1].text  # the artifact, not the prose
-    # body effect landed + was committed each iteration
-    assert (eng.workdir / "marker.txt").read_text() == "body ran"
-    state = replay(eng.run_dir)
-    assert state.loop_iterations[(0, "n0")] == 3
-    assert state.loop_last_commit[(0, "n0")] is not None
-
-
-def test_loop_cap_exhaustion_is_result_not_crash(tmp_path: Path) -> None:
-    eng = _engine(tmp_path)
-    # `false` never converges -> loop runs exactly cap iterations, ok=False, no raise.
-    loop = Loop(body=_counter_loop_body(), until=Until(kind="cmd", cmd="false"), cap=3)
-    eng.run_epoch(loop, epoch=0)
-
-    iters = [e for e in eng.journal.events() if e.kind == "loop_iter"]
-    assert len(iters) == 3
-    assert all(e.converged is False for e in iters)
-    result = [e for e in eng.journal.events() if e.kind == "result" and e.node_id == "n0"]
-    assert result[-1].ok is False
-    assert "hit cap 3" in (result[-1].loop_status or "")
-    kinds = [e.kind for e in eng.journal.events()]
-    assert kinds[-1] == "boundary"  # epoch still closes cleanly
-
-
-def test_loop_flag_predicate_rejected_at_admission(tmp_path: Path) -> None:
-    eng = _engine(tmp_path)
-    loop = Loop(body=_counter_loop_body(), until=Until(kind="flag"), cap=3)
-    with pytest.raises(AdmissionError):  # flag predicate not executable yet (item 5)
-        eng.run_epoch(loop, epoch=0)
-
-
-def test_replay_folds_mid_loop_journal(tmp_path: Path) -> None:
-    eng = _engine(tmp_path)
-    loop = Loop(body=_counter_loop_body(), until=Until(kind="cmd", cmd=_CONVERGE_AT_3), cap=10)
-    eng.run_epoch(loop, epoch=0)
-
-    # Truncate the ndjson after the 2nd loop_iter (simulate a kill mid-loop).
-    path = eng.run_dir / "events.ndjson"
-    lines = path.read_text().splitlines()
-    seen = 0
-    cut = len(lines)
-    for i, ln in enumerate(lines):
-        if '"kind":"loop_iter"' in ln.replace(" ", ""):
-            seen += 1
-            if seen == 2:
-                cut = i + 1
-                break
-    path.write_text("\n".join(lines[:cut]) + "\n")
-
-    state = replay(eng.run_dir)
-    assert state.loop_iterations[(0, "n0")] == 2  # iterations-completed == k
-    assert state.loop_last_commit[(0, "n0")] is not None
-    assert not state.epoch_closed(0)  # kill happened before the boundary closed
+        eng.run_epoch(Ask(question="not executable"), 0)
+    assert not (eng.run_dir / "events.ndjson").exists()

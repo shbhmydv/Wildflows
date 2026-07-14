@@ -1,6 +1,0 @@
-{"seq":0,"ts":1783956976.1845422,"run_id":"s5","epoch":0,"node_id":"n0","kind":"boundary","phase":"opened","expr":{"kind":"seq","node_id":"n0","children":[{"kind":"do","node_id":"n0.0","task":"fail","rig":{"name":"fail","params":{}},"ctx":[]},{"kind":"do","node_id":"n0.1","task":"ok","rig":{"name":"echo","params":{}},"ctx":[]}]},"rails":null,"reason":null}
-{"seq":1,"ts":1783956976.1858692,"run_id":"s5","epoch":0,"node_id":"n0.0","kind":"dispatched","rig":"fail","task":"fail","cmd":null,"workdir":"/tmp/tmpzafj1snu/s5-work"}
-{"seq":2,"ts":1783956976.1901116,"run_id":"s5","epoch":0,"node_id":"n0.0","kind":"result","ok":false,"text":"\n[dirty working-tree diff captured: /tmp/tmpzafj1snu/s5/failed-diffs/e0-n0.0.diff]","files":[],"exit_code":3,"loop_status":null,"outcome":"failed"}
-{"seq":3,"ts":1783956976.191251,"run_id":"s5","epoch":0,"node_id":"n0.1","kind":"dispatched","rig":"echo","task":"ok","cmd":null,"workdir":"/tmp/tmpzafj1snu/s5-work"}
-{"seq":4,"ts":1783956976.1934514,"run_id":"s5","epoch":0,"node_id":"n0.1","kind":"result","ok":true,"text":"echo: ok","files":[],"exit_code":0,"loop_status":null,"outcome":"ok"}
-{"seq":5,"ts":1783956976.1939344,"run_id":"s5","epoch":0,"node_id":"n0","kind":"boundary","phase":"closed","expr":null,"rails":null,"reason":"done"}

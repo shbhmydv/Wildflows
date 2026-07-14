@@ -1,6 +1,7 @@
 """Rig seam: one method run(prompt, workdir) -> Result; two implementations."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from wildflows.rig import EchoRig, RigRegistry, Result, ShellRig
@@ -39,6 +40,15 @@ def test_shell_rig_timeout_is_reaped_and_journalled(tmp_path: Path) -> None:
     assert r.ok is False
     assert r.outcome == "failed"
     assert "[timeout]" in r.text
+
+
+def test_timeout_kills_background_process_group(tmp_path: Path) -> None:
+    rig = ShellRig(
+        template="(sleep 0.15; printf late > late)& sleep 5", timeout_s=0.05
+    )
+    assert rig.run("x", tmp_path).outcome == "failed"
+    time.sleep(0.25)
+    assert not (tmp_path / "late").exists()
 
 
 def test_registry_resolves_by_name(tmp_path: Path) -> None:
