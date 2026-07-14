@@ -1288,3 +1288,36 @@ than patching each row. Both are the transaction model of record — not a later
     if another worktree owns the run branch, integration refuses with the existing typed
     integration/node failure and leaves both the ref and owner worktree untouched. An
     unowned named branch continues to use compare-and-swap `update-ref`.
+
+### Hand-21 calls — ownerless index-lock recovery
+
+83. **Resume-proven, live-owner-safe index-lock cleanup.** Checked-out integration keeps
+    `merge --ff-only`; changing the supplied worktree into an anchor would break the M1
+    contract that its checked-out run branch and files advance together. The engine may
+    remove that worktree's `index.lock` only while resolving one of two journal-proven
+    interrupted index-write windows: an effectful result is durable at the exact base but
+    its integration did not land, or a missing current claim is being restored to its
+    verified predecessor. The run branch must still be owned by the supplied worktree,
+    the lock must belong to the engine's uid, `/proc` must show neither a live same-uid Git
+    process nor any process with that exact lock inode open, and the pathname must still
+    name the observed inode immediately before unlink. Otherwise recovery leaves the lock
+    untouched and raises typed `RepositoryTransientError`. A new Git writer cannot acquire
+    an already-existing lock; an existing live operator is caught by its Git process even
+    in Git's close-before-rename interval, while open-descriptor matching also catches a
+    blocked writer or descendant. Successful cleanup is named in the fallback boundary.
+
+84. **Missing-claim restore has the same lifetime and residue boundary.** Its checked-out
+    `read-tree --reset -u` now uses the parent-bound launcher already used by ref movers.
+    A killed constructor therefore cannot leave a live orphan index writer. Resume applies
+    rule 83 to any dead child's residue before retrying; a live/uncertain owner, failed
+    index update, or unchanged claim after failed CAS is a typed transient retry rather
+    than a raw Git `RepositoryError`. A different live claim remains typed divergence.
+
+85. **M2 residue rule.** Parent death fences engine-owned ref-moving/index-writing Git
+    children but is not filesystem cleanup. Checked-out integration now has an explicit
+    crash-residue story: exact journal evidence authorizes only ownerless-lock removal;
+    every live or uncertain lock is preserved for retry. Disposable attempt-worktree locks
+    remain harmless because paths are never reused. This adds no lease, intent, quarantine,
+    process record, or new integration transaction, and does not close hand-20's documented
+    worktree-ownership scan-to-ref-move TOCTOU; M2 still needs explicit coordination before
+    concurrent integration or operator-facing worktrees.
