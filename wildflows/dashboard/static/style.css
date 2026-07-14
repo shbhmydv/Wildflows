@@ -114,6 +114,7 @@ dialog label { display: block; margin: 12px 0; color: #aab4c5; font-size: 11px; 
 dialog label small { color: var(--muted); }
 dialog input { width: 100%; margin-top: 5px; padding: 10px; }
 .form-row { display: grid; grid-template-columns: 1fr 100px; gap: 10px; }
+.form-row.equal { grid-template-columns: 1fr 1fr; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .toast { position: fixed; z-index: 30; right: 22px; bottom: 22px; max-width: 420px; padding: 11px 15px; border: 1px solid #426b62; border-radius: 9px; background: #14251f; box-shadow: 0 12px 40px #0008; opacity: 0; transform: translateY(10px); pointer-events: none; transition: .2s; font-size: 12px; }
 .toast.bad { border-color: #7d3442; background: #29171c; }

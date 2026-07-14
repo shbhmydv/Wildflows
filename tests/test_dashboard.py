@@ -21,6 +21,8 @@ from wildflows.dashboard.app import Dashboard, _tail_events, create_app
 from wildflows.events import Asked
 from wildflows.journal import Journal
 from wildflows.planner import AwaitingOwner
+from wildflows.projection import NodeProjection
+from wildflows.result import Result
 from wildflows.rigconfig import load_rigs
 from wildflows.run import Run
 
@@ -158,6 +160,15 @@ def test_list_detail_and_node_projection_from_real_completed_run(
     artifact = client.get(node["artifacts"][0]["url"])
     assert artifact.status_code == 200
     assert artifact.json()["text"].strip() == "worker result text"
+    assert client.get("/").status_code == 200
+
+
+def test_new_dispatch_overrides_an_older_integrated_result_state() -> None:
+    node = NodeProjection(
+        result=Result(text="old"), result_seq=3, receipt_required=False,
+        last_dispatch_seq=4,
+    )
+    assert Dashboard._node_state(node) == "running"
 
 
 def test_sse_tailer_sees_an_event_appended_after_subscription(
@@ -204,6 +215,11 @@ def test_file_containment_rejects_dotdot_and_symlink_escape(
     link.symlink_to(outside)
     client = TestClient(create_app(repo, TOKEN))
     assert client.get("/api/runs/completed-run/files/artifacts/escape").status_code == 404
+    svg = run_dir / "artifacts" / "active.svg"
+    svg.write_text("<svg xmlns='http://www.w3.org/2000/svg'><script/></svg>", encoding="utf-8")
+    response = client.get("/api/runs/completed-run/files/artifacts/active.svg")
+    assert response.status_code == 200
+    assert response.headers["content-security-policy"].startswith("sandbox;")
 
 
 def test_mutating_controls_reject_missing_and_bad_tokens(
@@ -302,12 +318,15 @@ const tree = buildTree(expr,{"n0.0":{state:"integrated"},"n0.1":{state:"parked-a
 if (tree.state !== "parked-ask" || tree.children[0].label !== "done") process.exit(2);
 console.log(JSON.stringify(tree));
 '''
+    root = Path(__file__).resolve().parents[1]
+    syntax = subprocess.run(
+        [node, "--check", "wildflows/dashboard/static/app.js"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    assert syntax.returncode == 0, syntax.stderr
     result = subprocess.run(
         [node, "--input-type=module", "-e", script],
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True,
-        text=True,
-        check=False,
+        cwd=root, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["children"][1]["state"] == "parked-ask"

@@ -117,7 +117,6 @@ class Run:
             return int(tail.split()[19])
         except (OSError, UnicodeError, IndexError, ValueError):
             return None
-
     def _publish_active(self) -> None:
         generation = uuid4().hex
         pid = os.getpid()
@@ -132,7 +131,6 @@ class Run:
         }
         _atomic_write(self._meta_path, json.dumps(data, sort_keys=True).encode("utf-8"))
         self._active_generation = generation
-
     def _clear_active(self) -> None:
         generation = self._active_generation
         if generation is None or not self._meta_path.exists():
@@ -141,11 +139,8 @@ class Run:
         active = data.get("active")
         if isinstance(active, dict) and active.get("generation") == generation:
             data.pop("active")
-            _atomic_write(
-                self._meta_path, json.dumps(data, sort_keys=True).encode("utf-8")
-            )
+            _atomic_write(self._meta_path, json.dumps(data, sort_keys=True).encode("utf-8"))
         self._active_generation = None
-
     @contextmanager
     def _lifecycle_guard(self, *, publish_active: bool = False) -> Iterator[None]:
         descriptor = os.open(self.run_dir / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)

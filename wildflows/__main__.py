@@ -1,14 +1,10 @@
 """Thin command line entry point for planner-driven runs."""
 from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
-
 from wildflows.rigconfig import load_rigs
 from wildflows.run import Run
-
-
 def _save_operator_config(
     run: Run,
     rigs: Path,
@@ -26,8 +22,6 @@ def _save_operator_config(
         "run_branch": run_branch,
     }, sort_keys=True), encoding="utf-8")
     temporary.replace(directory / "config.json")
-
-
 def _common(parser: argparse.ArgumentParser, *, resume: bool) -> None:
     parser.add_argument("job", type=Path)
     parser.add_argument("--repo", type=Path, required=True)
@@ -36,8 +30,6 @@ def _common(parser: argparse.ArgumentParser, *, resume: bool) -> None:
     parser.add_argument("--run-id", required=resume)
     parser.add_argument("--run-branch")
     parser.add_argument("--max-workers", type=int, default=1)
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 -m wildflows")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -52,8 +44,6 @@ def _parser() -> argparse.ArgumentParser:
     dash.add_argument("--repo", type=Path, required=True)
     dash.add_argument("--port", type=int, default=8765)
     return parser
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "dash":
@@ -92,7 +82,5 @@ def main(argv: list[str] | None = None) -> int:
         completed = run.run()
     print(json.dumps({"summary": completed.summary, "epochs": completed.epochs}))
     return 0
-
-
 if __name__ == "__main__":
     raise SystemExit(main())

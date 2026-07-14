@@ -81,7 +81,7 @@ function render(resetEvents = true) {
   $("#run-state").className = `status-${run.state}`;
   $("#epoch-count").textContent = run.epoch == null ? "—" : `${run.epoch + 1} / ${run.epoch_count}`;
   $("#rails").textContent = railsLabel(run.rails);
-  $("#kill-button").disabled = !run.active;
+  $("#kill-button").disabled = !run.killable;
   $("#resume-button").disabled = run.active || run.state === "completed";
   renderTree();
   renderInspector();
@@ -267,7 +267,7 @@ $("#launch-form").addEventListener("submit", async event => {
   if (event.submitter?.value === "cancel") return;
   event.preventDefault();
   const form = new FormData(event.target);
-  const body = Object.fromEntries(form.entries()); body.max_workers = Number(body.max_workers); if (!body.run_id) delete body.run_id;
+  const body = Object.fromEntries(form.entries()); body.max_workers = Number(body.max_workers); if (!body.run_id) delete body.run_id; if (!body.run_branch) delete body.run_branch;
   const data = await mutate("/api/runs", body, "Run launched"); $("#launch-dialog").close(); await loadRuns(data.run_id);
 });
 $("#resume-button").addEventListener("click", () => { if (requireToken()) mutate(`/api/runs/${encodeURIComponent(state.run.run_id)}/resume`, {}, "Resume launched"); });

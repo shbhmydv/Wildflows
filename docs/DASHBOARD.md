@@ -29,7 +29,7 @@ browser retains it only in the current tab's `sessionStorage`.
   `--answer-node` to that same resume command. The engine remains the sole writer of
   the resulting `answered` event.
 - **Kill expression** terminates the active dashboard-managed runner and its observed
-  descendant process groups. It is available only when `run.lock` is held and
+  descendant processes through identity-checked Linux pidfds. It is available only when `run.lock` is held and
   `run.json.active` identifies a live process whose PID, PGID, session, and Linux
   process start tick still match. The dashboard refuses stale records and runners
   that were not launched in their own process group. Kill writes no synthetic event:

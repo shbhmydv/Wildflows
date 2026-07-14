@@ -1,6 +1,5 @@
 """FastAPI dashboard: read-only journal projection plus CLI-backed controls."""
 from __future__ import annotations
-
 import asyncio
 import fcntl
 import json
@@ -15,42 +14,31 @@ import threading
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO, Iterator, cast
 from urllib.parse import quote
 from uuid import uuid4
-
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-
 from wildflows.events import Event, parse_event
 from wildflows.projection import NodeProjection, RunProjection
-
 Json = dict[str, Any]
 _PUBLIC_ROOTS = frozenset({"artifacts", "decisions", "handoffs"})
-
-
 class ResumeRequest(BaseModel):
     rigs: str | None = None
     planner_rig: str | None = None
     max_workers: int | None = Field(default=None, ge=1)
     retry_setups: bool = False
-
-
 class AnswerRequest(ResumeRequest):
     answer: str = Field(min_length=1)
     node_id: str | None = None
-
-
 class LaunchRequest(ResumeRequest):
     job: str
     planner_rig: str = "planner"
     max_workers: int = Field(default=1, ge=1)
     run_id: str | None = None
     run_branch: str | None = None
-
-
 @dataclass
 class ManagedAction:
     action_id: str
@@ -59,14 +47,11 @@ class ManagedAction:
     log_path: Path
     process: subprocess.Popen[bytes]
     started_at: float
-
-
 class ActionManager:
     def __init__(self, repo: Path) -> None:
         self.repo = repo
         self._actions: dict[str, ManagedAction] = {}
         self._lock = threading.Lock()
-
     def spawn(self, command: list[str], run_id: str, kind: str) -> ManagedAction:
         action_id = uuid4().hex
         directory = self.repo / ".wildflows" / "runs" / run_id / "control" / "actions"
@@ -89,8 +74,8 @@ class ActionManager:
         )
         with self._lock:
             self._actions[action_id] = action
+        threading.Thread(target=process.wait, daemon=True).start()
         return action
-
     def status(self, action_id: str) -> Json:
         with self._lock:
             action = self._actions.get(action_id)
@@ -110,8 +95,6 @@ class ActionManager:
             "started_at": action.started_at,
             "log": log,
         }
-
-
 class Dashboard:
     def __init__(self, repo: Path) -> None:
         process = subprocess.run(
@@ -124,7 +107,6 @@ class Dashboard:
         self.repo = Path(process.stdout.strip()).resolve()
         self.runs_dir = self.repo / ".wildflows" / "runs"
         self.actions = ActionManager(self.repo)
-
     def run_dir(self, run_id: str, *, must_exist: bool = True) -> Path:
         if not run_id or run_id in (".", "..") or Path(run_id).name != run_id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown run")
@@ -133,7 +115,6 @@ class Dashboard:
         if not candidate.is_relative_to(root) or (must_exist and not candidate.is_dir()):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown run")
         return candidate
-
     @staticmethod
     def snapshot(run_dir: Path) -> tuple[RunProjection, list[Event]]:
         projection = RunProjection()
@@ -163,7 +144,6 @@ class Dashboard:
             projection.apply(event)
             events.append(event)
         return projection, events
-
     @staticmethod
     def _read_json(path: Path) -> Json:
         try:
@@ -171,7 +151,6 @@ class Dashboard:
             return value if isinstance(value, dict) else {}
         except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
-
     @staticmethod
     def _process_row(pid: int) -> tuple[int, int, int, int] | None:
         try:
@@ -180,7 +159,6 @@ class Dashboard:
             return int(fields[1]), int(fields[2]), int(fields[3]), int(fields[19])
         except (OSError, UnicodeError, IndexError, ValueError):
             return None
-
     @classmethod
     def _active_live(cls, active: object) -> bool:
         if not isinstance(active, dict):
@@ -190,7 +168,18 @@ class Dashboard:
             return False
         row = cls._process_row(pid)
         return row is not None and row[3] == start
-
+    @classmethod
+    def _kill_identity(cls, active: object) -> tuple[int, int] | None:
+        if not isinstance(active, dict):
+            return None
+        values = tuple(active.get(key) for key in ("pid", "pgid", "sid", "process_start"))
+        if not all(isinstance(value, int) for value in values):
+            return None
+        pid, pgid, sid, started = cast(tuple[int, int, int, int], values)
+        row = cls._process_row(pid)
+        if row is None or row[3] != started or row[1] != pgid or row[2] != sid:
+            return None
+        return (pid, started) if pid == pgid == sid else None
     @staticmethod
     def _expr_nodes(expr: object) -> Iterator[Json]:
         if not isinstance(expr, dict):
@@ -209,11 +198,12 @@ class Dashboard:
         if isinstance(children, list):
             for child in children:
                 yield from Dashboard._expr_nodes(child)
-
     @staticmethod
     def _node_state(node: NodeProjection) -> str:
         if node.question is not None and node.asked_seq > node.answered_seq:
             return "parked-ask"
+        if node.last_dispatch_seq > node.result_seq:
+            return "running"
         if node.result is not None:
             if not node.result.ok:
                 return "failed"
@@ -223,7 +213,6 @@ class Dashboard:
         if node.last_dispatch_seq >= 0:
             return "running"
         return "pending"
-
     def _file_info(self, run_id: str, run_dir: Path, relative: str) -> Json | None:
         try:
             path = self.public_file(run_dir, relative)
@@ -237,7 +226,6 @@ class Dashboard:
             "size": path.stat().st_size,
             "url": f"/api/runs/{quote(run_id)}/files/{quote(relative)}",
         }
-
     def _public_files(self, run_id: str, run_dir: Path) -> list[Json]:
         found: list[Json] = []
         for root_name in sorted(_PUBLIC_ROOTS):
@@ -258,7 +246,6 @@ class Dashboard:
                 if item is not None:
                     found.append(item)
         return found
-
     def detail(self, run_id: str) -> Json:
         run_dir = self.run_dir(run_id)
         projection, events = self.snapshot(run_dir)
@@ -336,6 +323,7 @@ class Dashboard:
             "started_at": meta.get("started_at"),
             "completed": completed or None,
             "active": active,
+            "killable": self._kill_identity(active_value) is not None,
             "epoch": latest_id,
             "epoch_count": len(projection.epochs),
             "closed_epochs": sum(item.phase == "closed" for item in projection.epochs.values()),
@@ -359,7 +347,6 @@ class Dashboard:
                 for event in events
             ],
         }
-
     def list_runs(self) -> list[Json]:
         if not self.runs_dir.is_dir():
             return []
@@ -377,7 +364,6 @@ class Dashboard:
                 for key in ("run_id", "state", "started_at", "epoch_count", "rationale")
             })
         return values
-
     @staticmethod
     def public_file(run_dir: Path, relative: str) -> Path:
         candidate_rel = Path(relative)
@@ -393,17 +379,14 @@ class Dashboard:
         if not candidate.is_relative_to(root) or not candidate.is_file():
             raise HTTPException(status.HTTP_404_NOT_FOUND, "file is not public")
         return candidate
-
     def operator_path(self, value: str, what: str) -> Path:
         path = Path(value)
         candidate = (self.repo / path).resolve() if not path.is_absolute() else path.resolve()
         if not candidate.is_file():
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{what} is not a file")
         return candidate
-
     def _config(self, run_dir: Path) -> Json:
         return self._read_json(run_dir / "control" / "config.json")
-
     def resume_command(self, run_id: str, body: ResumeRequest) -> list[str]:
         run_dir = self.run_dir(run_id)
         config = self._config(run_dir)
@@ -434,7 +417,6 @@ class Dashboard:
         if body.retry_setups:
             command.append("--retry-setups")
         return command
-
     def launch(self, body: LaunchRequest) -> ManagedAction:
         job = self.operator_path(body.job, "job")
         rigs_value = body.rigs or str(job.parent / "rigs.yaml")
@@ -459,7 +441,6 @@ class Dashboard:
         if body.run_branch:
             command.extend(["--run-branch", body.run_branch])
         return self.actions.spawn(command, run_id, "launch")
-
     @staticmethod
     def _lock_held(path: Path) -> bool:
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -472,87 +453,66 @@ class Dashboard:
             return False
         finally:
             os.close(descriptor)
-
     @classmethod
-    def _descendant_groups(cls, root_pid: int) -> tuple[dict[int, int], set[int]]:
+    def _descendant_identities(cls, root_pid: int) -> dict[int, int]:
         rows: dict[int, tuple[int, int, int, int]] = {}
-        proc = Path("/proc")
         try:
-            entries = list(proc.iterdir())
+            entries = list(Path("/proc").iterdir())
         except OSError:
             entries = []
         for entry in entries:
-            if entry.name.isdigit():
-                row = cls._process_row(int(entry.name))
-                if row is not None:
-                    rows[int(entry.name)] = row
+            if entry.name.isdigit() and (row := cls._process_row(int(entry.name))) is not None:
+                rows[int(entry.name)] = row
         members = {root_pid}
-        changed = True
-        while changed:
-            before = len(members)
-            members.update(pid for pid, row in rows.items() if row[0] in members)
-            changed = len(members) != before
-        identities = {pid: rows[pid][3] for pid in members if pid in rows}
-        return identities, {rows[pid][1] for pid in members if pid in rows}
-
+        while True:
+            added = {pid for pid, row in rows.items() if row[0] in members} - members
+            if not added:
+                break
+            members.update(added)
+        return {pid: rows[pid][3] for pid in members if pid in rows}
+    @classmethod
+    def _signal_identity(cls, pid: int, started: int, which: signal.Signals) -> bool:
+        row = cls._process_row(pid)
+        if row is None or row[3] != started:
+            return False
+        try:
+            descriptor = os.pidfd_open(pid)
+        except (AttributeError, OSError):
+            return False
+        try:
+            row = cls._process_row(pid)
+            if row is None or row[3] != started:
+                return False
+            signal.pidfd_send_signal(descriptor, which)
+            return True
+        except ProcessLookupError:
+            return False
+        finally:
+            os.close(descriptor)
     def kill(self, run_id: str) -> Json:
         run_dir = self.run_dir(run_id)
         if not self._lock_held(run_dir / "run.lock"):
             raise HTTPException(status.HTTP_409_CONFLICT, "run has no active lock holder")
-        meta = self._read_json(run_dir / "run.json")
-        active = meta.get("active")
-        if not isinstance(active, dict):
-            raise HTTPException(status.HTTP_409_CONFLICT, "run has no active process record")
-        pid, pgid, sid, started = (
-            active.get("pid"), active.get("pgid"), active.get("sid"),
-            active.get("process_start"),
-        )
-        if not all(isinstance(value, int) for value in (pid, pgid, sid, started)):
-            raise HTTPException(status.HTTP_409_CONFLICT, "active process record is incomplete")
-        assert isinstance(pid, int) and isinstance(pgid, int)
-        assert isinstance(sid, int) and isinstance(started, int)
-        row = self._process_row(pid)
-        if row is None or row[3] != started or row[1] != pgid or row[2] != sid:
-            raise HTTPException(status.HTTP_409_CONFLICT, "active process record is stale")
-        if pid != pgid or pid != sid:
+        identity = self._kill_identity(self._read_json(run_dir / "run.json").get("active"))
+        if identity is None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                "runner is not a dashboard-managed process group; refusing broad signal",
+                "active process is stale or not a dashboard-managed session",
             )
-        members, groups = self._descendant_groups(pid)
-        groups.discard(os.getpgrp())
-        ordered = [group for group in groups if group != pgid] + [pgid]
-        for group in ordered:
-            try:
-                os.killpg(group, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        pid, started = identity
+        members = self._descendant_identities(pid)
+        ordered = [item for item in members.items() if item[0] != pid] + [(pid, started)]
+        for member, generation in ordered:
+            self._signal_identity(member, generation, signal.SIGTERM)
         deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            if not any(
-                (current := self._process_row(member)) is not None
-                and current[3] == start
-                for member, start in members.items()
-            ):
-                break
+        while time.monotonic() < deadline and any(
+            (row := self._process_row(member)) is not None and row[3] == generation
+            for member, generation in members.items()
+        ):
             time.sleep(0.025)
-        for group in ordered:
-            group_live = any(
-                (current := self._process_row(member)) is not None
-                and current[1] == group and current[3] == start
-                for member, start in members.items()
-            )
-            if group_live:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        return {
-            "run_id": run_id, "killed": True, "pid": pid,
-            "processes": sorted(members),
-        }
-
-
+        for member, generation in ordered:
+            self._signal_identity(member, generation, signal.SIGKILL)
+        return {"run_id": run_id, "killed": True, "pid": pid, "processes": sorted(members)}
 async def _tail_events(
     request: Request, path: Path, after: int
 ) -> AsyncGenerator[str, None]:
@@ -589,8 +549,6 @@ async def _tail_events(
             yield ": heartbeat\n\n"
             heartbeat = time.monotonic()
         await asyncio.sleep(0.2)
-
-
 def create_app(repo: Path, token: str | None = None) -> FastAPI:
     dashboard = Dashboard(repo)
     control_token = token or secrets.token_urlsafe(24)
@@ -599,24 +557,19 @@ def create_app(repo: Path, token: str | None = None) -> FastAPI:
     app.state.dashboard = dashboard
     app.state.control_token = control_token
     app.mount("/static", StaticFiles(directory=static), name="static")
-
     def authorize(x_wildflows_token: str | None = Header(default=None)) -> None:
         supplied = x_wildflows_token or ""
         if not secrets.compare_digest(supplied, control_token):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid control token")
-
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(static / "index.html")
-
     @app.get("/api/runs")
     def runs() -> Json:
         return {"runs": dashboard.list_runs()}
-
     @app.get("/api/runs/{run_id}")
     def run_detail(run_id: str) -> Json:
         return dashboard.detail(run_id)
-
     @app.get("/api/runs/{run_id}/events")
     def journal_events(
         request: Request,
@@ -635,34 +588,31 @@ def create_app(repo: Path, token: str | None = None) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
     @app.get("/api/runs/{run_id}/files/{relative:path}")
     def file(run_id: str, relative: str) -> FileResponse:
         run_dir = dashboard.run_dir(run_id)
         path = dashboard.public_file(run_dir, relative)
-        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        headers = {"X-Content-Type-Options": "nosniff"}
-        if mime == "text/html":
-            headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        headers = {
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": (
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+            ),
+        }
         return FileResponse(
             path, filename=None, content_disposition_type="inline", headers=headers
         )
-
     @app.get("/api/actions/{action_id}")
     def action_status(action_id: str) -> Json:
         return dashboard.actions.status(action_id)
-
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     def launch(body: LaunchRequest, _: None = Depends(authorize)) -> Json:
         action = dashboard.launch(body)
         return {"run_id": action.run_id, "action_id": action.action_id}
-
     @app.post("/api/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED)
     def resume(run_id: str, body: ResumeRequest, _: None = Depends(authorize)) -> Json:
         command = dashboard.resume_command(run_id, body)
         action = dashboard.actions.spawn(command, run_id, "resume")
         return {"run_id": run_id, "action_id": action.action_id}
-
     @app.post("/api/runs/{run_id}/answer", status_code=status.HTTP_202_ACCEPTED)
     def answer(run_id: str, body: AnswerRequest, _: None = Depends(authorize)) -> Json:
         command = dashboard.resume_command(run_id, body)
@@ -671,14 +621,10 @@ def create_app(repo: Path, token: str | None = None) -> FastAPI:
             command.extend(["--answer-node", body.node_id])
         action = dashboard.actions.spawn(command, run_id, "answer")
         return {"run_id": run_id, "action_id": action.action_id}
-
     @app.post("/api/runs/{run_id}/kill")
     def kill(run_id: str, _: None = Depends(authorize)) -> Json:
         return dashboard.kill(run_id)
-
     return app
-
-
 def serve(repo: Path, port: int = 8765) -> None:
     try:
         import uvicorn
