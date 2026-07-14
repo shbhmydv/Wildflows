@@ -16,6 +16,12 @@ class ExecutionOutcome:
         if self.children:
             return self.children[-1].result_key()
         return self.key
+    def result_keys(self) -> tuple[NodeKey, ...]:
+        if self.children:
+            return tuple(
+                key for child in self.children for key in child.result_keys()
+            )
+        return () if self.key is None else (self.key,)
 @dataclass
 class LoopIterRecord:
     seq: int

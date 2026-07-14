@@ -10,7 +10,9 @@ from wildflows.admission import admit_epoch
 from wildflows.events import (
     Answered, Asked, Boundary, Dispatched, Integrated, LoopIter, ResultEvent,
 )
-from wildflows.expr import Ask, CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Setup, Until
+from wildflows.expr import (
+    Ask, Combine, CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Setup, Until,
+)
 from wildflows.journal import Journal
 from wildflows.planner import (
     AwaitingOwner, OwnerQuestion, RailStop, Rails, SetupResumeRequired,
@@ -32,6 +34,7 @@ __all__ = [
     "RailStop",
     "SetupResumeRequired",
     "NodeExecutionError",
+    "CombineDependencyError",
     "SiblingOwnershipError",
     "PredicateEvaluationError",
     "ResumeVerificationError",
@@ -42,6 +45,8 @@ __all__ = [
 ]
 class NodeExecutionError(RuntimeError):
     """A node failed; its worktree was abandoned and the epoch remains open."""
+class CombineDependencyError(NodeExecutionError):
+    """A combine input did not produce a successful durable result."""
 class SiblingOwnershipError(NodeExecutionError):
     """A later concurrent sibling touched a path already owned by a landed sibling."""
 class PredicateEvaluationError(RuntimeError):
@@ -428,7 +433,7 @@ class Engine:
     def _exec(self, node: Expr, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         self._check_deadline()
         key = (epoch, node.node_id)
-        if isinstance(node, (Do, Inplace, Ask, Setup)) and self._proj.resume_action(
+        if isinstance(node, (Do, Combine, Inplace, Ask, Setup)) and self._proj.resume_action(
             key, floor
         ) == "done":
             return ExecutionOutcome(key=key)
@@ -442,6 +447,8 @@ class Engine:
             return self._exec_children(node.children, epoch, floor)
         if isinstance(node, Loop):
             return self._exec_loop(node, epoch, floor)
+        if isinstance(node, Combine):
+            return self._exec_combine(node, epoch, floor)
         if isinstance(node, Do):
             return self._exec_do(node, epoch)
         if isinstance(node, Inplace):
@@ -472,6 +479,8 @@ class Engine:
             except (NodeExecutionError, PredicateEvaluationError) as exc:
                 outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
                 failures.append(exc)
+        if len(failures) == 1:
+            raise failures[0]
         if failures:
             raise NodeExecutionError("; ".join(str(exc) for exc in failures))
         if questions:
@@ -626,6 +635,24 @@ class Engine:
             files=paths if receipt.commits else [],
         )
         return _Candidate(result, candidate, receipt)
+    def _exec_combine(
+        self, node: Combine, epoch: int, floor: Floor
+    ) -> ExecutionOutcome:
+        try:
+            inputs = self._exec_children(node.inputs, epoch, floor)
+        except (NodeExecutionError, PredicateEvaluationError) as exc:
+            raise CombineDependencyError(f"combine input failed: {exc}") from exc
+        refs: list[CtxRef] = []
+        for key in inputs.result_keys():
+            result = self._proj.result(key)
+            if result is None or not result.ok:
+                raise CombineDependencyError(
+                    f"combine input {key[1]!r} has no successful result"
+                )
+            refs.append(CtxRef(kind="node", ref=key[1]))
+        return self._exec_do(Do(
+            node_id=node.node_id, task=node.task, rig=node.rig, ctx=refs
+        ), epoch)
     def _exec_do(self, node: Do, epoch: int) -> ExecutionOutcome:
         return self._exec_leaf(node, epoch)
     def _exec_inplace(self, node: Inplace, epoch: int) -> ExecutionOutcome:
@@ -979,9 +1006,23 @@ class Engine:
             if content is None:
                 return None
             return f"## Context: file {ref.ref}\n{content}"
-        text = self._proj.result_text((epoch, ref.ref))
-        if text is None:
+        state = self._proj.node((epoch, ref.ref))
+        result = state.result
+        if result is None:
             return None
-        return f"## Context: node {ref.ref}\n{text}"
+        artifact_path: str | None = None
+        if state.artifact is not None:
+            candidate = (self.run_dir / state.artifact).resolve(strict=False)
+            if candidate.is_relative_to(self.run_dir.resolve(strict=False)):
+                artifact_path = str(candidate)
+        digest: dict[str, object] = {
+            "node_id": ref.ref,
+            "outcome": result.outcome,
+            "text": result.text,
+            "paths": result.files,
+            "artifact": state.artifact,
+            "artifact_path": artifact_path,
+        }
+        return f"## Context: node {ref.ref}\n{json.dumps(digest, ensure_ascii=False)}"
     def _commit_message(self, kind: str, key: NodeKey) -> str:
         return f"wildflows {kind} {key[1]} (run {self.run_id}, epoch {key[0]})"

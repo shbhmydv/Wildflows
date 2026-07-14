@@ -5,7 +5,7 @@ import pytest
 
 from wildflows.admission import AdmissionError, admit_epoch
 from wildflows.events import Boundary
-from wildflows.expr import CtxRef, Dispatch, Do, Edit, Expr, Inplace, RigRef, Seq
+from wildflows.expr import Combine, CtxRef, Dispatch, Do, Edit, Expr, Inplace, RigRef, Seq
 from wildflows.projection import RunProjection
 from wildflows.rig import EchoRig, RigRegistry
 
@@ -26,6 +26,8 @@ def test_admission_dealiases_reused_python_nodes() -> None:
 def test_unknown_rig_is_rejected() -> None:
     with pytest.raises(AdmissionError, match="unknown rig"):
         admit(Do(task="x", rig=RigRef(name="missing")))
+    with pytest.raises(AdmissionError, match="unknown rig"):
+        admit(Combine(task="judge", rig=RigRef(name="missing"), inputs=[]))
 
 
 def test_ctx_must_reference_upstream_resultful_seq_sibling() -> None:

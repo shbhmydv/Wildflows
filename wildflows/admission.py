@@ -48,9 +48,7 @@ def _walk(expr: Expr) -> Iterator[Expr]:
 
 
 def _check_capability(node: Expr) -> None:
-    # Combine and planner-judged loop flags remain outside the M4 execution core.
-    if isinstance(node, Combine):
-        raise AdmissionError("combine is not executable in the M4 core")
+    # Planner-judged loop flags remain outside the execution core.
     if isinstance(node, Setup) and node.cwd not in (None, "", "."):
         raise AdmissionError("setup always runs at the repository root")
     if isinstance(node, Loop):
@@ -66,13 +64,13 @@ def _check_capability(node: Expr) -> None:
 
 
 def _has_executable_leaf(node: Expr) -> bool:
-    if isinstance(node, (Do, Inplace, Ask, Setup)):
+    if isinstance(node, (Do, Combine, Inplace, Ask, Setup)):
         return True
     return any(_has_executable_leaf(c) for c in children_of(node))
 
 
 # Executable leaves and loops produce durable results; composites are structural.
-_RESULTFUL = (Do, Inplace, Ask, Setup, Loop)
+_RESULTFUL = (Do, Combine, Inplace, Ask, Setup, Loop)
 
 
 def _is_result_total(node: Expr) -> bool:
@@ -135,9 +133,9 @@ def admit_epoch(
     for node in order:
         _check_capability(node)
         _check_result_total(node)
+        if isinstance(node, (Do, Combine)) and node.rig.name not in registry:
+            raise AdmissionError(f"unknown rig: {node.rig.name!r}")
         if isinstance(node, Do):
-            if node.rig.name not in registry:
-                raise AdmissionError(f"unknown rig: {node.rig.name!r}")
             for ref in node.ctx:
                 if ref.kind == "node":
                     _check_upstream_ctx_ref(node, ref.ref, node_ids, position, paths)
