@@ -1,12 +1,8 @@
-"""The one live fold of the append-only journal.
-Running and resumed engines use the same ``RunProjection.apply`` path.  State is keyed
-by ``(epoch, node_id)`` and loop floors scope repeated node ids to one iteration.
-"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from wildflows.events import Boundary, Dispatched, Event, Integrated, LoopIter, ResultEvent
-from wildflows.result import IntegrationReceipt, Result
+from wildflows.result import CommitReceipt, IntegrationReceipt, Result
 NodeKey = tuple[int, str]
 Floor = int | None
 @dataclass(frozen=True)
@@ -35,6 +31,7 @@ class NodeProjection:
     receipt_required: bool = False
     receipt: IntegrationReceipt | None = None
     integrated_seq: int = -1
+    loop_status: str | None = None
     loop_iterations: int = 0
     loop_last_commit: str | None = None
     loop_last_iter_seq: int = -1
@@ -59,6 +56,7 @@ class RunProjection:
         self.epochs: dict[int, EpochProjection] = {}
         self._results_by_seq: dict[int, Result] = {}
         self._last_result_seq = -1
+        self._integrations: dict[int, tuple[NodeKey, list[CommitReceipt]]] = {}
     def apply(self, event: Event) -> None:
         if isinstance(event, Boundary):
             epoch = self.epochs.setdefault(event.epoch, EpochProjection())
@@ -86,13 +84,16 @@ class RunProjection:
             node.result_seq = event.seq
             node.result_post_head = event.post_head
             node.receipt_required = event.receipt_required
+            node.loop_status = event.loop_status
             self._results_by_seq[event.seq] = node.result
             self._last_result_seq = event.seq
+            if event.fallback_for is not None:
+                old = self._integrations.pop(event.fallback_for, None)
+                if old is not None:
+                    self._rebuild_receipt(old[0])
         elif isinstance(event, Integrated):
-            if node.receipt is None:
-                node.receipt = IntegrationReceipt()
-            node.receipt.extend(event.commits)
-            node.integrated_seq = event.seq
+            self._integrations[event.seq] = (key, list(event.commits))
+            self._rebuild_receipt(key)
         elif isinstance(event, LoopIter):
             node.loop_iterations = event.iteration + 1
             node.loop_last_commit = event.commit
@@ -110,6 +111,18 @@ class RunProjection:
                     body=node.loop_last_body,
                 )
             )
+    def _rebuild_receipt(self, key: NodeKey) -> None:
+        contributions = [
+            (seq, commits) for seq, (owner, commits) in self._integrations.items()
+            if owner == key
+        ]
+        node = self.nodes[key]
+        node.receipt = IntegrationReceipt()
+        for _, commits in sorted(contributions):
+            node.receipt.extend(commits)
+        node.integrated_seq = max((seq for seq, _ in contributions), default=-1)
+        if not node.receipt.commits:
+            node.receipt = None
     def resume_action(self, key: NodeKey, floor: Floor) -> str:
         """Return ``run`` or ``done`` for one leaf in the requested loop scope."""
         node = self.nodes.get(key)
@@ -130,6 +143,11 @@ class RunProjection:
         if floor is None:
             return 0, None, False, None
         node = self.nodes.get(key)
+        if (
+            node is not None and node.result is not None and not node.result.ok
+            and node.loop_status is None and node.result_seq > node.loop_last_iter_seq
+        ):
+            return 0, floor, False, None
         records = [] if node is None else [item for item in node.loop_iters if item.seq > floor]
         if not records:
             return 0, floor, False, None

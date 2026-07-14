@@ -90,6 +90,20 @@ def test_failed_rig_leaves_branch_untouched_and_epoch_open(tmp_path: Path) -> No
     assert state.results[(0, "n0")].outcome == "failed"
 
 
+def test_seq_runs_later_child_but_keeps_epoch_open_on_failure(tmp_path: Path) -> None:
+    failing = ShellRig("exit 9", 5)
+    writer = ShellRig("printf kept > later", 5)
+    eng = engine(tmp_path, registry(fail=failing, writer=writer))
+    tree = Seq(children=[
+        Do(task="fail", rig=RigRef(name="fail")),
+        Do(task="continue", rig=RigRef(name="writer")),
+    ])
+    with pytest.raises(NodeExecutionError):
+        eng.run_epoch(tree, 0)
+    assert git(eng.workdir, "show", "HEAD:later") == "kept"
+    assert not replay(eng.run_dir).epoch_closed(0)
+
+
 def test_resume_retries_failure_in_a_new_worktree(tmp_path: Path) -> None:
     class FlakyRig:
         def __init__(self) -> None:
@@ -182,6 +196,17 @@ def test_loop_cap_and_nested_floor_resume(tmp_path: Path) -> None:
     ]
     assert outer_results[-1].outcome == "failed"
     assert "hit cap 2" in (outer_results[-1].loop_status or "")
+
+
+def test_shell_timeout_is_durable_retryable_node_failure(tmp_path: Path) -> None:
+    eng = engine(tmp_path, registry(slow=ShellRig("sleep 5", 0.05)))
+    before = git(eng.workdir, "rev-parse", "HEAD")
+    with pytest.raises(NodeExecutionError, match="timeout"):
+        eng.run_epoch(Do(task="slow", rig=RigRef(name="slow")), 0)
+    assert git(eng.workdir, "rev-parse", "HEAD") == before
+    state = replay(eng.run_dir)
+    assert state.results[(0, "n0")].outcome == "failed"
+    assert not state.epoch_closed(0)
 
 
 def test_admission_rejects_before_boundary(tmp_path: Path) -> None:

@@ -15,7 +15,8 @@ from wildflows.engine import (
     ResumeVerificationError,
 )
 from wildflows.events import Event, Integrated
-from wildflows.expr import Do, RigRef
+from wildflows.expr import Do, Edit, Inplace, Loop, RigRef, Seq, Until
+from wildflows.projection import ExecutionOutcome
 from wildflows.result import Result
 
 
@@ -195,6 +196,159 @@ def test_unverifiable_live_receipt_refuses_instead_of_guessing(tmp_path: Path) -
     )
 
     with pytest.raises(ResumeVerificationError, match="effect is live"):
+        Engine(eng.run_dir, eng.workdir, registry(count=rig))
+
+
+def test_operator_commit_between_siblings_is_refused_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = CountingRig()
+    eng, _ = setup(tmp_path, rig)
+    tree = Seq(children=[
+        Do(task="first", rig=RigRef(name="count")),
+        Do(task="second", rig=RigRef(name="count")),
+    ])
+    execute = eng._exec_do
+
+    def move_after_first(node: Do, epoch: int) -> ExecutionOutcome:
+        outcome = execute(node, epoch)
+        if node.node_id == "n0.0":
+            (eng.workdir / "operator").write_text("mine", encoding="utf-8")
+            git(eng.workdir, "add", "operator")
+            git(eng.workdir, "commit", "-qm", "operator between nodes")
+        return outcome
+
+    monkeypatch.setattr(eng, "_exec_do", move_after_first)
+    with pytest.raises(BranchDivergedError, match="operator commits"):
+        eng.run_epoch(tree, 0)
+    dispatched = [event for event in eng.journal.events() if event.kind == "dispatched"]
+    assert [event.node_id for event in dispatched] == ["n0.0"]
+
+
+def test_invalid_non_tail_receipt_reruns_the_whole_unverified_tail(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    run_dir = tmp_path / "run"
+    tree = Seq(children=[
+        Inplace(edits=[Edit(path="a", content="a")]),
+        Inplace(edits=[Edit(path="b", content="b")]),
+    ])
+    eng = Engine(run_dir, repo, registry())
+    eng.run_epoch(tree, 0)
+    path = run_dir / "events.ndjson"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    first = next(record for record in records if record["kind"] == "integrated")
+    first["commits"][-1]["sha"] = "f" * 40
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    git(repo, "reset", "--hard", base)
+
+    resumed = Engine(run_dir, repo, registry())
+    resumed.run_epoch(tree, 0)
+    state = resumed.journal.projection
+    assert (repo / "a").read_text(encoding="utf-8") == "a"
+    assert (repo / "b").read_text(encoding="utf-8") == "b"
+    assert "f" * 40 not in state.receipts[(0, "n0.0")].shas
+
+
+def test_invalid_loop_body_receipt_does_not_reuse_old_loop_result(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    run_dir = tmp_path / "run"
+    tree = Loop(
+        body=Inplace(edits=[Edit(path="looped", content="yes")]),
+        until=Until(kind="cmd", cmd="true"), cap=1,
+    )
+    eng = Engine(run_dir, repo, registry())
+    eng.run_epoch(tree, 0)
+    path = run_dir / "events.ndjson"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    receipt = next(record for record in records if record["kind"] == "integrated")
+    receipt["commits"][-1]["sha"] = "f" * 40
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    git(repo, "reset", "--hard", base)
+
+    resumed = Engine(run_dir, repo, registry())
+    resumed.run_epoch(tree, 0)
+    assert (repo / "looped").read_text(encoding="utf-8") == "yes"
+    loop_results = [
+        event for event in resumed.journal.events()
+        if event.kind == "result" and event.node_id == "n0" and event.loop_status
+    ]
+    assert len(loop_results) == 2
+
+
+def test_nested_loop_partial_iteration_uses_resume_floor(tmp_path: Path) -> None:
+    class CrashThird:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, prompt: str, workdir: Path) -> Result:
+            self.calls += 1
+            if self.calls == 3:
+                raise SystemExit("partial outer iteration")
+            path = workdir / "count"
+            number = int(path.read_text(encoding="utf-8")) if path.exists() else 0
+            path.write_text(str(number + 1), encoding="utf-8")
+            return Result(text=str(number + 1))
+
+    rig = CrashThird()
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    run_dir = tmp_path / "run"
+    inner = Loop(
+        body=Do(task="tick", rig=RigRef(name="counter")),
+        until=Until(kind="cmd", cmd='test "$(cat count)" -ge 2'), cap=3,
+    )
+    tree = Loop(body=inner, until=Until(kind="cmd", cmd="false"), cap=2)
+    eng = Engine(run_dir, repo, registry(counter=rig))
+    with pytest.raises(SystemExit):
+        eng.run_epoch(tree, 0)
+    Engine(run_dir, repo, registry(counter=rig)).run_epoch(tree, 0)
+
+    assert rig.calls == 4
+    assert (repo / "count").read_text(encoding="utf-8") == "3"
+
+
+def test_multi_commit_rig_receipt_records_every_commit(tmp_path: Path) -> None:
+    class MultiCommitRig:
+        def run(self, prompt: str, workdir: Path) -> Result:
+            for name in ("one", "two"):
+                (workdir / name).write_text(name, encoding="utf-8")
+                git(workdir, "add", name)
+                git(workdir, "commit", "-qm", name)
+            return Result(text="two commits")
+
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    eng = Engine(tmp_path / "run", repo, registry(multi=MultiCommitRig()))
+    eng.run_epoch(Do(task="multi", rig=RigRef(name="multi")), 0)
+    receipt = eng.journal.projection.receipts[(0, "n0")]
+    assert len(receipt.commits) == 2
+    assert [commit.paths for commit in receipt.commits] == [["one"], ["two"]]
+
+
+def test_operator_third_tip_in_result_integration_window_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = CountingRig()
+    eng, tree = setup(tmp_path, rig)
+
+    def crash(base_commit: str, candidate: str) -> None:
+        raise SystemExit("before fast-forward")
+
+    monkeypatch.setattr(eng.repo, "integrate", crash)
+    with pytest.raises(SystemExit):
+        eng.run_epoch(tree, 0)
+    (eng.workdir / "operator").write_text("mine", encoding="utf-8")
+    git(eng.workdir, "add", "operator")
+    git(eng.workdir, "commit", "-qm", "operator in crash window")
+    with pytest.raises(BranchDivergedError, match="incomplete attempt"):
         Engine(eng.run_dir, eng.workdir, registry(count=rig))
 
 

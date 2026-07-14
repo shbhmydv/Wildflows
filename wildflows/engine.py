@@ -1,9 +1,3 @@
-"""Serial workflow execution on fresh per-node Git worktrees.
-The run branch is the only accepted state.  A node works on a detached worktree at the
-branch tip, journals its result, then fast-forwards the verified commit range and
-journals the receipt.  Failure discards the worktree; resume verifies the append-only
-claims and reruns incomplete work from the exact last known branch tip.
-"""
 from __future__ import annotations
 import json
 import os
@@ -95,7 +89,6 @@ class Engine:
                 reason="done",
             )
         )
-    # -- journal / branch verification -------------------------------------
     def _verify_resume_claims(self) -> None:
         while self._verify_once():
             pass
@@ -142,15 +135,21 @@ class Engine:
             result = results.get(key)
             base = dispatch.pre_head if dispatch is not None else None
             if (
-                expected is None
-                or dispatch is None
-                or base is None
-                or base != expected
-                or result is None
+                expected is None or dispatch is None or base is None or result is None
                 or not (dispatch.seq < result.seq < event.seq)
             ):
                 raise ResumeVerificationError(
                     f"integrated claim at seq {event.seq} has no contiguous attempt provenance"
+                )
+            if base != expected:
+                if invalidated and min(invalidated) < event.seq and self.repo.branch_tip() == expected:
+                    self._journal_fallback(
+                        key, f"resume fallback: receipt seq {event.seq} depends on an "
+                        "invalidated claim", expected, fallback_for=event.seq,
+                    )
+                    return True
+                raise ResumeVerificationError(
+                    f"integrated claim at seq {event.seq} does not follow the verified tip"
                 )
             try:
                 self.repo.verify_receipt(base, event.commits)
@@ -240,6 +239,18 @@ class Engine:
             key, Result(text=text, outcome="failed"), post_head=tip,
             fallback_for=fallback_for,
         )
+        if fallback_for is not None:
+            loop_ids = {
+                event.node_id for event in self.journal.events()
+                if isinstance(event, LoopIter) and event.epoch == key[0]
+                and event.seq >= fallback_for
+            }
+            for loop_id in sorted(loop_ids):
+                self._append_result(
+                    (key[0], loop_id),
+                    Result(text="resume fallback: loop tail invalidated", outcome="failed"),
+                    post_head=tip,
+                )
         if self._proj.epoch_closed(key[0]):
             epoch = self._proj.epochs[key[0]]
             self.journal.append(Boundary(
@@ -247,20 +258,12 @@ class Engine:
                 expr=epoch.expr, run_branch=self.repo.ref, base_commit=tip,
                 reason="resume fallback",
             ))
-    # -- expression traversal ----------------------------------------------
     def _exec(self, node: Expr, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if isinstance(node, (Do, Inplace)) and self._proj.resume_action(key, floor) == "done":
             return ExecutionOutcome(key=key)
-        if isinstance(node, Seq):
-            return ExecutionOutcome(
-                children=tuple(self._exec(child, epoch, floor) for child in node.children)
-            )
-        if isinstance(node, Dispatch):
-            # Unordered by contract; serial execution is still the current scheduler.
-            return ExecutionOutcome(
-                children=tuple(self._exec(child, epoch, floor) for child in node.children)
-            )
+        if isinstance(node, (Seq, Dispatch)):
+            return self._exec_children(node.children, epoch, floor)
         if isinstance(node, Loop):
             return self._exec_loop(node, epoch, floor)
         if isinstance(node, Do):
@@ -268,8 +271,23 @@ class Engine:
         if isinstance(node, Inplace):
             return self._exec_inplace(node, epoch)
         return ExecutionOutcome(key=key)
+    def _exec_children(
+        self, children: list[Expr], epoch: int, floor: Floor
+    ) -> ExecutionOutcome:
+        outcomes: list[ExecutionOutcome] = []
+        failures: list[NodeExecutionError] = []
+        for child in children:
+            try:
+                outcomes.append(self._exec(child, epoch, floor))
+            except NodeExecutionError as exc:
+                outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
+                failures.append(exc)
+        if failures:
+            raise NodeExecutionError("; ".join(str(exc) for exc in failures))
+        return ExecutionOutcome(children=tuple(outcomes))
     def _exec_do(self, node: Do, epoch: int) -> ExecutionOutcome:
         key = (epoch, node.node_id)
+        self._verify_resume_claims()
         base = self.repo.branch_tip()
         attempt = self._proj.node(key).dispatch_count
         worktree = self.repo.create_worktree(epoch, node.node_id, attempt, base)
@@ -306,6 +324,7 @@ class Engine:
             self.repo.remove_worktree(worktree)
     def _exec_inplace(self, node: Inplace, epoch: int) -> ExecutionOutcome:
         key = (epoch, node.node_id)
+        self._verify_resume_claims()
         base = self.repo.branch_tip()
         attempt = self._proj.node(key).dispatch_count
         worktree = self.repo.create_worktree(epoch, node.node_id, attempt, base)
@@ -377,11 +396,13 @@ class Engine:
             )
             raise NodeExecutionError(str(exc)) from exc
         self._append_integrated(key, receipt)
-    # -- loops and predicates ----------------------------------------------
     def _exec_loop(self, node: Loop, epoch: int, floor: Floor) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         state = self._proj.node(key)
-        if floor is not None and state.result is not None and state.result_seq > floor:
+        if (
+            floor is not None and state.result is not None and state.result_seq > floor
+            and state.loop_status is not None
+        ):
             return ExecutionOutcome(key=key)
         resume_from, partial_floor, last_converged, last_body = self._proj.loop_resume(
             key, floor
@@ -448,6 +469,7 @@ class Engine:
         return until.cmd
     def _exec_predicate(self, node: Loop, epoch: int) -> bool:
         key = (epoch, f"{node.node_id}.until")
+        self._verify_resume_claims()
         base = self.repo.branch_tip()
         attempt = self._proj.node(key).dispatch_count
         worktree = self.repo.create_worktree(epoch, key[1], attempt, base)
@@ -483,8 +505,6 @@ class Engine:
             text = evaluation.stdout if evaluation.returncode == 0 else (
                 evaluation.stderr or evaluation.stdout
             )
-            # Nonzero means "not yet", not an execution failure.  Any worktree mutation
-            # is discarded with the evaluation worktree.
             self._append_result(
                 key,
                 Result(text=text, exit_code=evaluation.returncode),
@@ -493,7 +513,6 @@ class Engine:
             return evaluation.returncode == 0
         finally:
             self.repo.remove_worktree(worktree)
-    # -- results, artifacts, failures, context ------------------------------
     def _append_result(
         self,
         key: NodeKey,
@@ -535,7 +554,9 @@ class Engine:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"result-{self.journal.n_events}.json"
         temporary = path.with_suffix(".tmp")
-        payload = json.dumps(result.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+        payload = json.dumps(
+            result.model_dump(mode="json", exclude_computed_fields=True), sort_keys=True
+        ).encode("utf-8")
         with open(temporary, "wb") as stream:
             stream.write(payload)
             stream.flush()

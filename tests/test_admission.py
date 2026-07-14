@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from wildflows.admission import AdmissionError, admit_epoch
+from wildflows.events import Boundary
 from wildflows.expr import CtxRef, Dispatch, Do, Edit, Expr, Inplace, RigRef, Seq
 from wildflows.projection import RunProjection
 from wildflows.rig import EchoRig, RigRegistry
@@ -55,6 +56,18 @@ def test_ctx_cannot_cross_dispatch_siblings() -> None:
     )
     with pytest.raises(AdmissionError, match="crosses a Dispatch"):
         admit(tree)
+
+
+def test_open_epoch_rejects_changed_resume_tree() -> None:
+    projection = RunProjection()
+    registry = RigRegistry({"echo": EchoRig()})
+    original = admit_epoch(Do(task="original", rig=RigRef(name="echo")), 0, projection, registry)
+    projection.apply(Boundary(
+        seq=0, run_id="run", epoch=0, node_id="n0", phase="opened",
+        expr=original.model_dump(),
+    ))
+    with pytest.raises(AdmissionError, match="differs"):
+        admit_epoch(Do(task="changed", rig=RigRef(name="echo")), 0, projection, registry)
 
 
 def test_composite_last_child_must_produce_result() -> None:

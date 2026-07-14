@@ -1,8 +1,3 @@
-"""The single journal event vocabulary.
-Events describe workflow facts, not workspace rollback transactions.  ``pre_head`` and
-``post_head`` are the two cheap provenance anchors needed to reconcile the one crash
-window around a run-branch fast-forward.
-"""
 from __future__ import annotations
 import time
 from typing import Annotated, Any, Literal, Union
@@ -19,8 +14,6 @@ class Boundary(_Header):
     phase: Literal["opened", "closed"]
     expr: dict[str, Any] | None = None
     reason: str | None = None
-    # New runs pin both facts on every opened epoch.  Defaults retain replay support for
-    # complete pre-worktree journals; an old open run is not executable by this engine.
     run_branch: str | None = None
     base_commit: str | None = None
 class Dispatched(_Header):
@@ -38,10 +31,7 @@ class ResultEvent(_Header):
     post_head: str | None = None
     loop_status: str | None = None
     outcome: Literal["ok", "failed", "busy"] = "ok"
-    # True when post_head differs from the attempt base, including an empty commit.
     receipt_required: bool = False
-    # A failed ResultEvent can invalidate one unverifiable Integrated claim while keeping
-    # the event vocabulary append-only.  The node is then rerun from the prior verified tip.
     fallback_for: int | None = None
     @model_validator(mode="before")
     @classmethod

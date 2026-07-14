@@ -1,9 +1,3 @@
-"""Small Git authority for disposable node worktrees.
-A node starts from the current run-branch tip in a fresh detached worktree.  The
-node may damage that worktree freely: only a verified descendant commit range is
-fast-forwarded onto the run branch.  Failed and interrupted attempts are abandoned;
-there is no workspace rollback transaction.
-"""
 from __future__ import annotations
 import os
 import re
@@ -35,8 +29,6 @@ class Repository:
             raise ValueError("run_dir must be outside the target repository worktree")
         self.worktrees_dir = self.run_dir / "worktrees"
         self.ref = self._resolve_branch(run_branch)
-        # A detached worktree needs a real base object.  Keeping this precondition
-        # explicit is simpler than manufacturing a hidden bootstrap commit.
         self.branch_tip()
     @staticmethod
     def _run(
@@ -85,8 +77,6 @@ class Repository:
         self.git(["worktree", "add", "--detach", str(path), base])
         return NodeWorktree(path=path, base_commit=base)
     def remove_worktree(self, worktree: NodeWorktree) -> None:
-        # Cleanup is deliberately best-effort.  A surviving process can only mutate this
-        # never-reused path, and a stale registration/path is garbage rather than run-state.
         self.git(["worktree", "remove", "--force", str(worktree.path)], check=False)
     def ensure_tip(self, expected: str) -> None:
         actual = self.branch_tip()

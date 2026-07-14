@@ -1,7 +1,3 @@
-"""Fsynced append-only journal and its one live projection.
-Creation and continuation are deliberately separate.  A failed append poisons its
-owner; only a fresh load may classify and durably repair a torn final record.
-"""
 from __future__ import annotations
 import json
 import os
@@ -48,7 +44,7 @@ class Journal:
             )
         seq = self._events[-1].seq + 1 if self._events else 0
         assigned = event.model_copy(update={"seq": seq})
-        line = assigned.model_dump_json() + "\n"
+        line = assigned.model_dump_json(exclude_computed_fields=True) + "\n"
         new_journal = not self.path.exists()
         try:
             with open(self.path, "a", encoding="utf-8") as stream:

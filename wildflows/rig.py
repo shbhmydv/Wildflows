@@ -1,8 +1,3 @@
-"""The multi-harness seam: ``Rig.run(prompt, workdir) -> Result``.
-External commands use a small in-process process-group barrier.  Timeout kills the
-whole group; there are no durable process records or restart reaper because every
-attempt path is disposable and never reused.
-"""
 from __future__ import annotations
 import os
 import re
@@ -60,7 +55,6 @@ def _capture(
     shell: bool,
     env: dict[str, str] | None = None,
 ) -> ExternalResult:
-    # Real files cannot be held pipe-open by a background descendant.
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
         out_file: TextIO = stdout
@@ -82,9 +76,6 @@ def _capture(
             timed_out = True
             returncode = None
         finally:
-            # Also quiesce ordinary background children before the core inspects commits.
-            # A deliberate setsid escape remains possible but can only write the abandoned
-            # attempt path after this call returns.
             _kill_group(process)
         stdout.seek(0)
         stderr.seek(0)
