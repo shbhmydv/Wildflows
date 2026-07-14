@@ -71,6 +71,7 @@ class Run:
             self.run_dir, self.workdir, registry,
             run_branch=run_branch, max_workers=max_workers,
         )
+        self._active_generation: str | None = None
         with self._lifecycle_guard(): self._load_or_create_meta()
         durable = [value.rails for value in self.engine.journal.projection.epochs.values()
                    if value.rails is not None]
@@ -108,12 +109,55 @@ class Run:
     ) -> RunCompleted:
         return self._drive(answer, answer_file, answer_node, retry_setups)
     resume = run
+    @staticmethod
+    def _process_start(pid: int) -> int | None:
+        """Return Linux's non-recycled process generation, when available."""
+        try:
+            tail = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1]
+            return int(tail.split()[19])
+        except (OSError, UnicodeError, IndexError, ValueError):
+            return None
+
+    def _publish_active(self) -> None:
+        generation = uuid4().hex
+        pid = os.getpid()
+        data = json.loads(self._meta_path.read_text(encoding="utf-8"))
+        data["active"] = {
+            "generation": generation,
+            "pid": pid,
+            "pgid": os.getpgid(pid),
+            "sid": os.getsid(pid),
+            "process_start": self._process_start(pid),
+            "started_at": time.time(),
+        }
+        _atomic_write(self._meta_path, json.dumps(data, sort_keys=True).encode("utf-8"))
+        self._active_generation = generation
+
+    def _clear_active(self) -> None:
+        generation = self._active_generation
+        if generation is None or not self._meta_path.exists():
+            return
+        data = json.loads(self._meta_path.read_text(encoding="utf-8"))
+        active = data.get("active")
+        if isinstance(active, dict) and active.get("generation") == generation:
+            data.pop("active")
+            _atomic_write(
+                self._meta_path, json.dumps(data, sort_keys=True).encode("utf-8")
+            )
+        self._active_generation = None
+
     @contextmanager
-    def _lifecycle_guard(self) -> Iterator[None]:
+    def _lifecycle_guard(self, *, publish_active: bool = False) -> Iterator[None]:
         descriptor = os.open(self.run_dir / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
+            if publish_active:
+                self._publish_active()
+            try:
+                yield
+            finally:
+                if publish_active:
+                    self._clear_active()
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
@@ -124,7 +168,7 @@ class Run:
         answer_node: str | None,
         retry_setups: bool,
     ) -> RunCompleted:
-        with self._lifecycle_guard():
+        with self._lifecycle_guard(publish_active=True):
             return self._drive_locked(answer, answer_file, answer_node, retry_setups)
     def _drive_locked(
         self,
