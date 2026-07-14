@@ -99,6 +99,7 @@ class Engine:
         dispatches: dict[NodeKey, Dispatched] = {}
         results: dict[NodeKey, ResultEvent] = {}
         integrated_after: dict[NodeKey, int] = {}
+        prefix_dependents: dict[str, tuple[int, int]] = {}
         expected: str | None = None
         for event in events:
             if isinstance(event, Boundary) and event.phase == "opened":
@@ -119,6 +120,8 @@ class Engine:
                 continue
             if isinstance(event, Dispatched):
                 dispatches[(event.epoch, event.node_id)] = event
+                if expected is not None:
+                    prefix_dependents.setdefault(expected, (event.epoch, event.seq))
                 continue
             if isinstance(event, ResultEvent):
                 results[(event.epoch, event.node_id)] = event
@@ -144,12 +147,11 @@ class Engine:
                 not result.ok or not result.receipt_required
                 or result.post_head != event.commit
             ):
-                if self.repo.branch_tip() == expected:
-                    self._journal_fallback(
-                        key[0], dispatch.seq,
-                        f"resume fallback: integrated seq {event.seq} contradicts its result",
-                        expected,
-                    )
+                if self._fallback_failed_claim(
+                    key[0], dispatch.seq,
+                    f"resume fallback: integrated seq {event.seq} contradicts its result",
+                    expected, event.commit, prefix_dependents,
+                ):
                     return True
                 raise ResumeVerificationError(
                     f"integrated claim at seq {event.seq} contradicts its result certificate"
@@ -157,12 +159,11 @@ class Engine:
             try:
                 self.repo.verify_receipt(base, event.commits)
             except RepositoryError as exc:
-                if self.repo.branch_tip() == expected:
-                    self._journal_fallback(
-                        key[0], dispatch.seq,
-                        f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
-                        expected,
-                    )
+                if self._fallback_failed_claim(
+                    key[0], dispatch.seq,
+                    f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
+                    expected, event.commit, prefix_dependents,
+                ):
                     return True
                 raise ResumeVerificationError(
                     f"receipt at seq {event.seq} is unverifiable and its effect is live: {exc}"
@@ -171,7 +172,7 @@ class Engine:
             integrated_after[key] = event.seq
         if expected is None:
             raise ResumeVerificationError("journal has no worktree-model opened boundary")
-        live = self.repo.branch_tip()
+        live = self.repo.branch_claim()
         outstanding = [
             (key, result)
             for key, result in results.items()
@@ -196,6 +197,14 @@ class Engine:
                     return True
                 raise BranchDivergedError("run branch does not match an incomplete claim")
             if live == candidate:
+                if not self.repo.commit_exists(candidate):
+                    assert dispatch is not None
+                    if self._fallback_failed_claim(
+                        key[0], dispatch.seq,
+                        "resume fallback: incomplete integration candidate is missing",
+                        expected, candidate, prefix_dependents,
+                    ):
+                        return True
                 try:
                     receipt = self.repo.receipt(base, candidate)
                 except RepositoryError as exc:
@@ -214,11 +223,19 @@ class Engine:
                     expected,
                 )
                 return True
+            if self._fallback_known_prefix(prefix_dependents, live):
+                return True
             raise BranchDivergedError(
                 f"run branch moved outside incomplete attempt: expected {expected} "
                 f"or {candidate}, found {live}"
             )
+        if not self.repo.commit_exists(live):
+            raise BranchDivergedError(
+                f"run branch {self.repo.branch!r} has unknown or missing tip {live}"
+            )
         if live != expected:
+            if self._fallback_known_prefix(prefix_dependents, live):
+                return True
             raise BranchDivergedError(
                 f"run branch {self.repo.branch!r} has operator commits: "
                 f"journal expects {expected}, found {live}"
@@ -238,6 +255,36 @@ class Engine:
             )
             return True
         return False
+    def _fallback_failed_claim(
+        self,
+        epoch_id: int,
+        start: int,
+        text: str,
+        expected: str,
+        claimed: str,
+        prefix_dependents: dict[str, tuple[int, int]],
+    ) -> bool:
+        live = self.repo.branch_claim()
+        if live == expected:
+            reason = text
+        elif live == claimed and not self.repo.commit_exists(claimed):
+            self.repo.restore_missing_claim(claimed, expected)
+            reason = f"resume fallback: missing current claimed commit {claimed}"
+        else:
+            return self._fallback_known_prefix(prefix_dependents, live)
+        self._journal_fallback(epoch_id, start, reason, expected)
+        return True
+    def _fallback_known_prefix(
+        self, prefix_dependents: dict[str, tuple[int, int]], live: str
+    ) -> bool:
+        dependent = prefix_dependents.get(live)
+        if dependent is None or not self.repo.commit_exists(live):
+            return False
+        epoch_id, start = dependent
+        self._journal_fallback(
+            epoch_id, start, "resume fallback: exact verified prefix rewind", live
+        )
+        return True
     def _journal_fallback(self, epoch_id: int, start: int, text: str, tip: str) -> None:
         epoch = self._proj.epochs[epoch_id]
         self.journal.append(Boundary(

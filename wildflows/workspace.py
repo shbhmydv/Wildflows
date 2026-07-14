@@ -1,11 +1,31 @@
 from __future__ import annotations
+import ctypes
 import os
 import re
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 from wildflows.result import CommitReceipt, IntegrationReceipt
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_PRCTL = _LIBC.prctl
+_PRCTL.argtypes = [
+    ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+]
+_PRCTL.restype = ctypes.c_int
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent(parent_pid: int) -> None:
+    if _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        os._exit(127)
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+        os._exit(127)
+
+
 class RepositoryError(RuntimeError):
     """A repository or plain Git operation failed."""
 class BranchDivergedError(RepositoryError):
@@ -29,14 +49,20 @@ class Repository:
             raise ValueError("run_dir must be outside the target repository worktree")
         self.worktrees_dir = self.run_dir / "worktrees"
         self.ref = self._resolve_branch(run_branch)
-        self.branch_tip()
     @staticmethod
     def _run(
-        argv: list[str], *, cwd: Path, check: bool = True
+        argv: list[str], *, cwd: Path, check: bool = True,
+        parent_lifetime: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        parent_pid = os.getpid()
+        preexec_fn = (
+            (lambda: _die_with_parent(parent_pid)) if parent_lifetime else None
+        )
         try:
-            proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
-        except OSError as exc:
+            proc = subprocess.run(
+                argv, cwd=cwd, capture_output=True, text=True, preexec_fn=preexec_fn
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
             raise RepositoryError(f"could not launch {' '.join(argv)!r}: {exc}") from exc
         if check and proc.returncode != 0:
             detail = proc.stderr.strip() or proc.stdout.strip()
@@ -57,17 +83,24 @@ class Repository:
         short = ref.removeprefix("refs/heads/")
         if not short or self.git(["check-ref-format", "--branch", short], check=False).returncode:
             raise RepositoryError(f"invalid run branch: {requested!r}")
-        if self.git(["show-ref", "--verify", "--quiet", ref], check=False).returncode:
+        if self.git(["rev-parse", "--verify", ref], check=False).returncode:
             raise RepositoryError(f"run branch does not exist: {short!r}")
         return ref
     @property
     def branch(self) -> str:
         return self.ref.removeprefix("refs/heads/")
-    def branch_tip(self) -> str:
-        proc = self.git(["rev-parse", "--verify", f"{self.ref}^{{commit}}"], check=False)
+    def branch_claim(self) -> str:
+        proc = self.git(["rev-parse", "--verify", self.ref], check=False)
         if proc.returncode != 0:
-            raise BranchDivergedError(f"run branch {self.branch!r} has no commit tip")
+            raise BranchDivergedError(f"run branch {self.branch!r} has no claimed tip")
         return proc.stdout.strip()
+    def commit_exists(self, commit: str) -> bool:
+        return self.git(["cat-file", "-e", f"{commit}^{{commit}}"], check=False).returncode == 0
+    def branch_tip(self) -> str:
+        claim = self.branch_claim()
+        if not self.commit_exists(claim):
+            raise BranchDivergedError(f"run branch {self.branch!r} has no commit tip")
+        return claim
     def head(self, worktree: Path) -> str:
         return self.git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree).stdout.strip()
     def create_worktree(self, epoch: int, node_id: str, attempt: int, base: str) -> NodeWorktree:
@@ -152,12 +185,41 @@ class Repository:
         if not commits:
             raise RepositoryError("an integrated claim has no commits")
         for commit in commits:
-            if self.git(["cat-file", "-e", f"{commit.sha}^{{commit}}"], check=False).returncode:
+            if not self.commit_exists(commit.sha):
                 raise RepositoryError(f"receipt commit does not exist: {commit.sha}")
         actual = self.receipt(base, commits[-1].sha)
         if actual.model_dump() != IntegrationReceipt(commits=commits).model_dump():
             raise RepositoryError("receipt commit range or changed paths do not match Git")
         return actual
+    def _branch_worktrees(self) -> list[Path]:
+        fields = self.git(["worktree", "list", "--porcelain", "-z"]).stdout.split("\0")
+        owners: list[Path] = []
+        worktree: Path | None = None
+        for field in fields:
+            if field.startswith("worktree "):
+                worktree = Path(field.removeprefix("worktree ")).resolve()
+            elif field == f"branch {self.ref}" and worktree is not None:
+                owners.append(worktree)
+            elif not field:
+                worktree = None
+        return owners
+    def _move_ref(self, args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+        return self._run(
+            ["git", *args], cwd=cwd, check=False, parent_lifetime=True
+        )
+    def restore_missing_claim(self, missing: str, fallback: str) -> None:
+        owners = self._branch_worktrees()
+        other = [owner for owner in owners if owner != self.root]
+        if other:
+            raise IntegrationError(
+                f"run branch {self.branch!r} is checked out in linked worktree {other[0]}"
+            )
+        if self.root in owners:
+            self.git(["read-tree", "--reset", "-u", fallback])
+        proc = self._move_ref(["update-ref", self.ref, fallback, missing], cwd=self.root)
+        if proc.returncode != 0 or self.branch_claim() != fallback:
+            detail = proc.stderr.strip() or proc.stdout.strip() or "compare-and-swap refused"
+            raise BranchDivergedError(f"could not restore missing run-branch claim: {detail}")
     def integrate(self, base: str, candidate: str) -> None:
         """Fast-forward the run branch, or leave it exactly at ``base``."""
         self.ensure_tip(base)
@@ -165,11 +227,20 @@ class Repository:
             return
         if self.git(["merge-base", "--is-ancestor", base, candidate], check=False).returncode:
             raise IntegrationError("candidate is not a fast-forward of the run branch")
-        checked_out = self.git(["symbolic-ref", "--quiet", "HEAD"], check=False)
-        if checked_out.returncode == 0 and checked_out.stdout.strip() == self.ref:
-            proc = self.git(["merge", "--ff-only", "--no-edit", candidate], check=False)
+        owners = self._branch_worktrees()
+        other = [owner for owner in owners if owner != self.root]
+        if other:
+            raise IntegrationError(
+                f"run branch {self.branch!r} is checked out in linked worktree {other[0]}"
+            )
+        if self.root in owners:
+            proc = self._move_ref(
+                ["merge", "--ff-only", "--no-edit", candidate], cwd=self.root
+            )
         else:
-            proc = self.git(["update-ref", self.ref, candidate, base], check=False)
+            proc = self._move_ref(
+                ["update-ref", self.ref, candidate, base], cwd=self.root
+            )
         actual = self.branch_tip()
         if actual == candidate:
             return

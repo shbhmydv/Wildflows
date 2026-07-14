@@ -1263,3 +1263,28 @@ than patching each row. Both are the transaction model of record — not a later
     loop caps/floors/nesting, retry in a new path, orphan-write harmlessness, exact
     run-branch ownership, Script/Shell busy+timeout contracts, and result artifacts remain
     executable regressions.
+
+### Hand-20 calls — prefix rewind and integration lifetime
+
+82. **Known-prefix fallback, parent-bound ref movers, and linked-worktree refusal.** Resume
+    retains every verified integration tip and the first dispatch that depends on it. A
+    live ref at one of those exact earlier tips appends the existing tail-invalidating
+    fallback boundary and reruns only that suffix. A ref still naming the journal's current
+    claim after that commit object disappears is read as a raw claim, restored by a
+    compare-and-swap to the preceding verified tip (also restoring the checked-out tree),
+    and takes the same fallback. An unknown descendant, side commit, or unknown missing
+    claim remains a typed `BranchDivergedError`; operator history is never reset.
+
+    On Linux, only Git subprocesses that can move the run ref (`merge --ff-only` and
+    `update-ref`) arm `PR_SET_PDEATHSIG=SIGKILL` and immediately verify their post-fork
+    parent PID before exec. Thus a killed engine cannot leave its integration command to
+    land after a replacement engine durably invalidates that attempt. A CAS-only change
+    cannot fence the checked-out merge and does not fence an old CAS when fallback leaves
+    the ref at the same base; parent-bound lifetime is the smaller complete mechanism. No
+    process records, reaper, guardian, intent, lease, or supervision scope returns.
+
+    Before integration selects either backend, `git worktree list --porcelain -z` finds
+    every linked-worktree owner. The supplied worktree may receive the checked-out merge;
+    if another worktree owns the run branch, integration refuses with the existing typed
+    integration/node failure and leaves both the ref and owner worktree untouched. An
+    unowned named branch continues to use compare-and-swap `update-ref`.
