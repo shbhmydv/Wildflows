@@ -63,7 +63,17 @@ class RigsFile(BaseModel):
 
 
 def load_rigs(path: Path) -> RigRegistry:
-    """Parse + validate a rigs.yaml and build the RigRegistry it declares."""
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    """Parse a rigs.yaml; relative script/log paths are relative to that file."""
+    config_path = Path(path).resolve()
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     parsed = RigsFile.model_validate(data)
-    return RigRegistry({name: cfg.build() for name, cfg in parsed.rigs.items()})
+    built: dict[str, Rig] = {}
+    for name, config in parsed.rigs.items():
+        if isinstance(config, ScriptRigConfig):
+            base = config_path.parent
+            config = config.model_copy(update={
+                "script": (base / config.script).resolve(),
+                "log_dir": (base / config.log_dir).resolve(),
+            })
+        built[name] = config.build()
+    return RigRegistry(built)

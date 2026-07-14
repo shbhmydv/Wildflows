@@ -1,4 +1,4 @@
-# Planner rig contract (M4)
+# Planner rig contract (v1)
 
 The planner is not a privileged engine plug-in. `Run` resolves one named rig from the
 same `RigRegistry` used by `do`, builds a prompt, and calls:
@@ -7,8 +7,9 @@ same `RigRegistry` used by `do`, builds a prompt, and calls:
 planner.run(prompt, repository_root) -> Result
 ```
 
-A non-`ok` result or malformed output raises retryable `PlannerFailure`. M5 will add the
-real picodex planner script and a live smoke test; M4 deliberately ships no model script.
+A non-`ok` result or malformed output raises retryable `PlannerFailure`. The bundled
+[`planner-picodex.sh`](../rigs/planner-picodex.sh) is the real `pi` adapter; model calls
+remain operator-run, while tests put a fake `pi` on `PATH`.
 
 ## Script process contract
 
@@ -22,9 +23,10 @@ prompt-file contract:
 ```
 
 The script must print exactly one UTF-8 JSON decision to stdout on success and exit 0.
-There is no markdown-fence cleanup and no `decision.json` fallback. A picodex adapter
-that internally writes a decision file must print that file unchanged before exiting.
-The planner should not mutate the repository; effects belong in its emitted expression.
+Fence/noise cleanup belongs inside an adapter, never the core. The bundled picodex
+adapter asks the model for one fenced object, strips surrounding noise, validates that
+object, and prints compact unfenced JSON. Invalid extraction exits nonzero. The planner
+should not mutate the repository; effects belong in its emitted expression.
 
 Every invocation's stdout is atomically retained byte-for-byte under
 `.wildflows/runs/<run-id>/decisions/` before JSON parsing. The prompt names the run

@@ -2,9 +2,8 @@
 
 One expression tree = one epoch. `node_id` is the join key between the tree and the
 journal (assigned on admission by `assign_node_ids`); resume = replay the log against
-the tree by node_id. `do`, `inplace`, `ask`, repository-root `setup`, `seq`,
-`dispatch`, and command `loop` are executable; `combine` and planner-judged `loop`
-flags remain representable but rejected by admission.
+the tree by node_id. Every kind is executable except planner-judged `loop` flags,
+which remain representable but are rejected by admission.
 
 Pydantic proves wire shape and the LOCAL invariants here (lexical path guards, positive
 loop cap, unique inplace paths); whole-tree checks (capability, rig names, node refs)

@@ -47,6 +47,21 @@ def test_load_rigs_round_trip(tmp_path: Path) -> None:
     assert registry.resolve("fast").run("hi", tmp_path).ok is True
 
 
+def test_relative_script_paths_resolve_from_rigs_file(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    cfg = config_dir / "rigs.yaml"
+    cfg.write_text(
+        "rigs:\n  worker:\n    kind: script\n    script: ../worker.sh\n"
+        "    log_dir: logs\n",
+        encoding="utf-8",
+    )
+    worker = load_rigs(cfg).resolve("worker")
+    assert isinstance(worker, ScriptRig)
+    assert worker.script == tmp_path / "worker.sh"
+    assert worker.log_dir == config_dir / "logs"
+
+
 def test_load_rigs_rejects_unknown_kind(tmp_path: Path) -> None:
     cfg = tmp_path / "rigs.yaml"
     cfg.write_text("rigs:\n  weird:\n    kind: telepathy\n", encoding="utf-8")

@@ -62,8 +62,9 @@ ordering combinator that `dispatch` deliberately is *not*. A loop `body` is typi
 A `do()` whose input is *other results* (collect, judge-panel synthesis, merge).
 - **Inputs:** the upstream `results`, a `task` describing the synthesis, a `rig`.
 - **Output:** one `Result`.
-- **Failure modes:** as `do`. `combine` reads its inputs from the journal/artifacts,
-  so a resumed `combine` re-reads durable upstream results, never live memory.
+- **Failure modes:** as `do`; an input without a successful durable result raises typed
+  `CombineDependencyError` before the combiner starts. `combine` reads inputs from the
+  journal/artifacts, so resume reuses durable upstream results, never live memory.
 
 ### `loop(expr, until, cap)`
 Repeat a sub-expression until a condition holds or a cap is hit. The body **may** hold
@@ -210,8 +211,8 @@ close-out, no cadence. ~90% of runs are 1–2 epochs.
 ### The single event vocabulary (SETTLED invariant 2)
 Every primitive execution is **one event** in **one** vocabulary. Resume replays this
 log against the expression tree; there is no per-shape resume code. The concrete event
-types (in `wildflows/events.py`), each a Pydantic model sharing a header
-`(seq, ts, run_id, epoch, node_id, kind)`:
+types (in `wildflows/events.py`), each a Pydantic model sharing a v1 header
+`(version, seq, ts, run_id, epoch, node_id, kind)`:
 
 | event        | emitted when                              | key fields |
 |--------------|-------------------------------------------|------------|
@@ -351,12 +352,11 @@ A failed append poisons that owner; only `Journal.load` may adopt a complete res
 repair a torn one, and load fsyncs the accepted file and directory before returning.
 `Journal(run_dir)` is creation-only for a nonempty file; `Journal.load` is continuation.
 
-Pre-worktree complete journals remain parseable through the existing `Result.outcome`
-and single-commit `Integrated` compatibility readers, but an open old epoch has no
-run-ref/base claim and is not executable by this engine. The old lease, intent,
-recovery, settlement, process, and capture files are not read. Parallel dispatch has one
-central append owner: worker threads return candidates only; the coordinator alone
-appends results, moves the ref, and appends integration facts.
+Every record carries integer `version: 1`; the first record fixes the stream version.
+`Journal.load` raises typed `IncompatibleJournalError` for an unversioned or non-v1
+stream. There is no migration machinery. Parallel dispatch has one central append
+owner: worker threads return candidates only; the coordinator alone appends results,
+moves the ref, and appends integration facts.
 
 ---
 
@@ -407,13 +407,13 @@ Rig.run(prompt: str, workdir: Path) -> Result
 ```
 
 prompt in, text/files out — exactly grindstone's shape-agnostic `request.sh` contract,
-which is why real rigs (`claude -p`, `pi`, local Qwen, `codex exec`) plug in later with
-no engine change. The PoC ships three:
+which is why real rigs (`claude -p`, `pi`, local Qwen, `codex exec`) plug in with
+no engine change. The core ships three Python rig types:
 - **`EchoRig`** — deterministic, returns a canned/derived result; the test substrate.
 - **`ShellRig`** — shells out to an arbitrary command template (e.g.
-  `claude -p {prompt}` run in `{workdir}`), capturing stdout/exit as the result. This
-  is the real plug-in path; **real rigs are NOT integrated now** (no network, no model
-  calls in this build).
+  `claude -p {prompt}` run in `{workdir}`), capturing stdout/exit as the result.
+- **`ScriptRig`** — invokes the process contract below. Bundled `pi`/picodex and local
+  OpenAI-compatible adapters live in `rigs/`; model calls remain operator-run.
 
 A `RigRef(name, params)` in an expression names which rig and its config; the core
 resolves it through a **rig registry** at execution time. Rigs may write or commit only
@@ -451,10 +451,10 @@ notes that are load-bearing:
 - **`busy` is journalled as `ResultEvent(ok=False, outcome="busy")`** — distinct from a
   failure so a later ladder step can back off + re-enter. No backoff/retry policy is
   built in this hand.
-- Real scripts live OUTSIDE this repo; `examples/rigs.yaml` ships the `script` rig
-  commented out. Rigs are declared in an owner-facing **`rigs.yaml`** (YAML by policy),
-  a Pydantic discriminated union (`echo|shell|script`) loaded by
-  `load_rigs(path) -> RigRegistry` — unknown kinds are rejected at load.
+- Bundled scripts live in `rigs/` and are documented in `docs/RIGS.md`. Rigs are
+  declared in owner-facing **`rigs.yaml`** (YAML by policy), a Pydantic discriminated
+  union (`echo|shell|script`) loaded by `load_rigs(path) -> RigRegistry`; unknown kinds
+  are rejected and relative script/log paths resolve from the YAML file.
 
 ---
 
@@ -1434,3 +1434,21 @@ than patching each row. Both are the transaction model of record — not a later
 94. **Macros remain data.** Builtin and run-adjacent JSON macros expose only name,
     description, and source path to the prompt. Placeholder substitution/expansion is not
     core behavior: the planner reads a fitting template and emits normal expression JSON.
+
+### Hand-24 calls — executable combine, journal v1, and real adapters
+
+95. **Combine is result-fed Do.** The engine executes `inputs`, flattens their durable
+    result keys in declaration order, requires each result to be successful, then builds
+    an internal `Do` at the Combine node id. Its prompt appends full result text, artifact
+    metadata, the run-relative artifact link, and its contained absolute path. The ordinary
+    dispatched/result/integrated transaction and projection own completion and resume;
+    there is no Combine event or state machine. A failed dependency raises typed
+    `CombineDependencyError` before the combiner starts.
+96. **Journal vocabulary v1.** Every record carries integer `version: 1`; load refuses
+    missing or mismatched versions with `IncompatibleJournalError`. No migration path is
+    inferred and the existing event kinds are the frozen v1 vocabulary.
+97. **Adapters remain scripts.** `rigs/` contains self-contained picodex planner/senior
+    and local OpenAI-compatible worker adapters. Prompt bodies cross into `pi`/`curl`
+    through stdin, process-group handles and Git ceilings match the ScriptRig boundary,
+    and nonzero quota signatures retain the existing `busy` classification. Model calls
+    are operator smoke tests; repository tests use fake transports on `PATH`.
