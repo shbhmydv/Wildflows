@@ -140,6 +140,20 @@ class Engine:
                 raise ResumeVerificationError(
                     f"integrated claim at seq {event.seq} does not follow the verified tip"
                 )
+            if (
+                not result.ok or not result.receipt_required
+                or result.post_head != event.commit
+            ):
+                if self.repo.branch_tip() == expected:
+                    self._journal_fallback(
+                        key[0], dispatch.seq,
+                        f"resume fallback: integrated seq {event.seq} contradicts its result",
+                        expected,
+                    )
+                    return True
+                raise ResumeVerificationError(
+                    f"integrated claim at seq {event.seq} contradicts its result certificate"
+                )
             try:
                 self.repo.verify_receipt(base, event.commits)
             except RepositoryError as exc:

@@ -442,6 +442,30 @@ def test_invalid_receipt_truncates_later_epoch_claims(tmp_path: Path) -> None:
     assert (repo / "b").read_text(encoding="utf-8") == "b"
 
 
+@pytest.mark.parametrize("change", ["post_head", "outcome"])
+def test_integrated_claim_must_match_successful_result_certificate(
+    tmp_path: Path, change: str
+) -> None:
+    rig = CountingRig()
+    eng, tree = setup(tmp_path, rig)
+    base = git(eng.workdir, "rev-parse", "HEAD")
+    eng.run_epoch(tree, 0)
+    path = eng.run_dir / "events.ndjson"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    result = next(record for record in records if record["kind"] == "result")
+    if change == "post_head":
+        result["post_head"] = base
+    else:
+        result["outcome"] = "failed"
+        result["receipt_required"] = False
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(ResumeVerificationError, match="contradicts"):
+        Engine(eng.run_dir, eng.workdir, registry(count=rig))
+
+
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     init_repo(repo)
