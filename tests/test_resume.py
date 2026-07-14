@@ -716,6 +716,57 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
     assert not (repo / ".git" / "index.lock").exists()
 
 
+def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    git(repo, "config", "filter.slow.clean", "cat")
+    git(repo, "config", "filter.slow.smudge", "cat")
+    git(repo, "config", "filter.slow.required", "true")
+    (repo / ".gitattributes").write_text("target filter=slow\n", encoding="utf-8")
+    (repo / "target").write_text("base", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "target")
+    git(repo, "commit", "-qm", "filtered base")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / "target").write_text("operator", encoding="utf-8")
+    git(repo, "add", "target")
+    git(repo, "commit", "-qm", "operator candidate")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+
+    started = tmp_path / "operator-filter-started"
+    filter_script = tmp_path / "slow-operator-smudge.sh"
+    filter_script.write_text(
+        "#!/bin/sh\n"
+        f"printf started > {shlex.quote(str(started))}\n"
+        "sleep 1\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    filter_script.chmod(0o755)
+    git(repo, "config", "filter.slow.smudge", shlex.quote(str(filter_script)))
+    engine = Engine(tmp_path / "run", repo, registry())
+    writer = subprocess.Popen(
+        ["git", "read-tree", "--reset", "-u", candidate], cwd=repo
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            assert writer.poll() is None, "operator Git exited before its filter blocked"
+            time.sleep(0.01)
+        assert started.exists(), "operator smudge filter did not start"
+
+        with pytest.raises(RepositoryTransientError, match="live writer"):
+            engine.repo.recover_interrupted_index_lock()
+        assert writer.poll() is None
+        assert (repo / ".git" / "index.lock").exists()
+    finally:
+        writer.wait(timeout=5)
+
+    assert not (repo / ".git" / "index.lock").exists()
+
+
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     init_repo(repo)

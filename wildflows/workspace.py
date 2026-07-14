@@ -33,6 +33,8 @@ def _die_with_parent(parent_pid: int) -> None:
 
 class RepositoryError(RuntimeError):
     """A repository or plain Git operation failed."""
+class RepositoryTransientError(RepositoryError):
+    """A concurrent or interrupted repository writer requires a retry."""
 class BranchDivergedError(RepositoryError):
     """The run branch no longer has the exact journalled tip."""
 class IntegrationError(RepositoryError):
@@ -212,19 +214,83 @@ class Repository:
         return self._run(
             ["git", *args], cwd=cwd, check=False, parent_lifetime=True
         )
-    def restore_missing_claim(self, missing: str, fallback: str) -> None:
+    @staticmethod
+    def _lock_has_owner(device: int, inode: int, uid: int) -> bool:
+        procfs = Path("/proc")
+        if not procfs.is_dir():
+            return True
+        for process in procfs.iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                if process.stat().st_uid != uid:
+                    continue
+                fields = (process / "stat").read_text(encoding="utf-8").split()
+                command = (process / "comm").read_text(encoding="utf-8").strip()
+                if len(fields) > 2 and fields[2] != "Z" and command.startswith("git"):
+                    return True
+                descriptors = list((process / "fd").iterdir())
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            for descriptor in descriptors:
+                try:
+                    opened = descriptor.stat()
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                if (opened.st_dev, opened.st_ino) == (device, inode):
+                    return True
+        return False
+    def recover_interrupted_index_lock(self) -> bool:
+        """Remove only an ownerless root index lock at a proven resume tear."""
+        if self.root not in self._branch_worktrees():
+            return False
+        raw = self.git(["rev-parse", "--git-path", "index.lock"]).stdout.strip()
+        lock = Path(raw) if Path(raw).is_absolute() else self.root / raw
+        try:
+            observed = lock.stat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RepositoryTransientError(f"could not inspect run index lock: {exc}") from exc
+        if observed.st_uid != os.geteuid() or self._lock_has_owner(
+            observed.st_dev, observed.st_ino, observed.st_uid
+        ):
+            raise RepositoryTransientError("run worktree index is owned by a live writer")
+        try:
+            current = lock.stat()
+            if (current.st_dev, current.st_ino) != (observed.st_dev, observed.st_ino):
+                raise RepositoryTransientError("run worktree index lock changed during recovery")
+            lock.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RepositoryTransientError(f"could not remove run index lock: {exc}") from exc
+        return True
+    def restore_missing_claim(self, missing: str, fallback: str) -> bool:
         owners = self._branch_worktrees()
         other = [owner for owner in owners if owner != self.root]
         if other:
             raise IntegrationError(
                 f"run branch {self.branch!r} is checked out in linked worktree {other[0]}"
             )
+        cleaned = self.recover_interrupted_index_lock()
         if self.root in owners:
-            self.git(["read-tree", "--reset", "-u", fallback])
+            tree = self._move_ref(["read-tree", "--reset", "-u", fallback], cwd=self.root)
+            if tree.returncode != 0:
+                detail = tree.stderr.strip() or tree.stdout.strip() or "index update refused"
+                raise RepositoryTransientError(
+                    f"could not restore checked-out run tree; retry: {detail}"
+                )
         proc = self._move_ref(["update-ref", self.ref, fallback, missing], cwd=self.root)
-        if proc.returncode != 0 or self.branch_claim() != fallback:
-            detail = proc.stderr.strip() or proc.stdout.strip() or "compare-and-swap refused"
-            raise BranchDivergedError(f"could not restore missing run-branch claim: {detail}")
+        actual = self.branch_claim()
+        if actual == fallback:
+            return cleaned
+        detail = proc.stderr.strip() or proc.stdout.strip() or "compare-and-swap refused"
+        if actual == missing:
+            raise RepositoryTransientError(
+                f"could not restore missing run-branch claim; retry: {detail}"
+            )
+        raise BranchDivergedError(f"could not restore missing run-branch claim: {detail}")
     def integrate(self, base: str, candidate: str) -> None:
         """Fast-forward the run branch, or leave it exactly at ``base``."""
         self.ensure_tip(base)

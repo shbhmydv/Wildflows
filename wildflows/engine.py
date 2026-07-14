@@ -16,6 +16,7 @@ from wildflows.workspace import (
     NodeWorktree,
     Repository,
     RepositoryError,
+    RepositoryTransientError,
 )
 __all__ = [
     "Engine",
@@ -23,6 +24,7 @@ __all__ = [
     "PredicateEvaluationError",
     "ResumeVerificationError",
     "BranchDivergedError",
+    "RepositoryTransientError",
     "replay",
     "RunProjection",
 ]
@@ -217,11 +219,11 @@ class Engine:
                 return True
             if live == expected:
                 assert dispatch is not None
-                self._journal_fallback(
-                    key[0], dispatch.seq,
-                    "resume fallback: result was journalled but its commits did not land",
-                    expected,
-                )
+                cleaned = self.repo.recover_interrupted_index_lock()
+                reason = "resume fallback: result was journalled but its commits did not land"
+                if cleaned:
+                    reason += "; removed ownerless interrupted index lock"
+                self._journal_fallback(key[0], dispatch.seq, reason, expected)
                 return True
             if self._fallback_known_prefix(prefix_dependents, live):
                 return True
@@ -268,8 +270,10 @@ class Engine:
         if live == expected:
             reason = text
         elif live == claimed and not self.repo.commit_exists(claimed):
-            self.repo.restore_missing_claim(claimed, expected)
+            cleaned = self.repo.restore_missing_claim(claimed, expected)
             reason = f"resume fallback: missing current claimed commit {claimed}"
+            if cleaned:
+                reason += "; removed ownerless interrupted index lock"
         else:
             return self._fallback_known_prefix(prefix_dependents, live)
         self._journal_fallback(epoch_id, start, reason, expected)
