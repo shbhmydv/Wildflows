@@ -1,1028 +1,785 @@
+"""Standalone v2 frame supervisor and the three engine tool implementations."""
 from __future__ import annotations
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+
 import json
 import os
-from pathlib import Path
+import threading
 import time
-from typing import NoReturn
-from wildflows.admission import admit_epoch
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from wildflows.admission import AdmissionError, AdmissionPolicy, admit_dispatch
 from wildflows.events import (
-    Answered, Asked, Boundary, Dispatched, Integrated, LoopIter, ResultEvent,
+    Answered,
+    Asked,
+    DispatchCalled,
+    DispatchReturned,
+    FrameExited,
+    FrameIntegrated,
+    FrameIntegrating,
+    FramePopped,
+    FramePushed,
+    GateCalled,
+    GateReturned,
+    RunFinished,
+    RunOpened,
 )
-from wildflows.expr import (
-    Ask, Combine, CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Setup, Until,
+from wildflows.frame import (
+    AskRequest,
+    AskResult,
+    ChildResult,
+    DispatchRequest,
+    DispatchResult,
+    FrameOutcome,
+    FrameResult,
+    FrameRuntime,
+    GateRequest,
+    GateResult,
+    ToolName,
+    ToolRequest,
+    ToolResponse,
+    call_hash,
 )
 from wildflows.journal import Journal
-from wildflows.planner import (
-    AwaitingOwner, OwnerQuestion, RailStop, Rails, SetupResumeRequired,
-)
-from wildflows.projection import ExecutionOutcome, Floor, NodeKey, RunProjection, replay
-from wildflows.result import IntegrationReceipt, Result
+from wildflows.mcp import MCPServer
+from wildflows.projection import FrameProjection, RunProjection
+from wildflows.result import CommitReceipt
 from wildflows.rig import RigRegistry, run_shell
+from wildflows.shim import write_pi_shim
 from wildflows.workspace import (
-    BranchDivergedError,
+    FrameWorktree,
     IntegrationError,
-    NodeWorktree,
     Repository,
     RepositoryError,
-    RepositoryTransientError,
 )
-__all__ = [
-    "Engine",
-    "AwaitingOwner",
-    "RailStop",
-    "SetupResumeRequired",
-    "NodeExecutionError",
-    "CombineDependencyError",
-    "SiblingOwnershipError",
-    "PredicateEvaluationError",
-    "ResumeVerificationError",
-    "BranchDivergedError",
-    "RepositoryTransientError",
-    "replay",
-    "RunProjection",
-]
-class NodeExecutionError(RuntimeError):
-    """A node failed; its worktree was abandoned and the epoch remains open."""
-class CombineDependencyError(NodeExecutionError):
-    """A combine input did not produce a successful durable result."""
-class SiblingOwnershipError(NodeExecutionError):
-    """A later concurrent sibling touched a path already owned by a landed sibling."""
-class PredicateEvaluationError(RuntimeError):
-    """A command predicate timed out or could not be evaluated."""
-class ResumeVerificationError(RuntimeError):
-    """Journalled Git claims cannot be reconciled with the run branch."""
-@dataclass(frozen=True)
-class _Attempt:
-    node: Do | Inplace
-    key: NodeKey
-    base: str
-    worktree: NodeWorktree
-    prompt: str | None = None
-@dataclass(frozen=True)
-class _Candidate:
-    result: Result
-    commit: str
-    receipt: IntegrationReceipt
+
+
+class CallConflictError(RuntimeError):
+    """A frame reused a logical call index for different content."""
+
+
+class FrameNotActiveError(RuntimeError):
+    """A token-authenticated request did not name a live caller frame."""
+
+
 class Engine:
+    """One run's append owner, MCP service, frame stack, and serialized integrator."""
+
+    ROOT_FRAME_ID = "f0"
+
     def __init__(
         self,
         run_dir: Path,
         workdir: Path,
         registry: RigRegistry,
+        *,
+        run_id: str,
+        root_rig: str,
+        root_prompt: str,
         run_branch: str | None = None,
-        max_workers: int = 1,
+        policy: AdmissionPolicy | None = None,
+        worktrees_root: Path | None = None,
     ) -> None:
-        self.run_dir = Path(run_dir)
-        self.repo = Repository(workdir, self.run_dir, run_branch)
+        self.run_dir = Path(run_dir).resolve()
         self.registry = registry
-        if max_workers < 1:
-            raise ValueError("max_workers must be at least 1")
-        self.max_workers = max_workers
-        self.run_id = self.run_dir.name
-        self._deadline_at: float | None = None
-        self._active_rails = Rails()
-        self._active_epoch = 0
-        self._retry_setups = False
-        with self.repo.integration_guard():
-            self.journal = Journal.load(self.run_dir)
-            for epoch in self.journal.projection.epochs.values():
-                if epoch.run_branch is not None and epoch.run_branch != self.repo.ref:
-                    raise ResumeVerificationError(
-                        f"journal belongs to {epoch.run_branch!r}, not {self.repo.ref!r}"
-                    )
-            self._verify_resume_claims()
-    @property
-    def workdir(self) -> Path:
-        return self.repo.root
-    @property
-    def run_branch(self) -> str:
-        return self.repo.branch
-    @property
-    def _proj(self) -> RunProjection:
-        return self.journal.projection
-    def refresh(self) -> None:
-        """Adopt durable state after another serialized Run owner completed."""
-        with self.repo.integration_guard():
-            self.journal = Journal.load(self.run_dir)
-            self._verify_resume_claims()
-    def run_epoch(
-        self,
-        tree: Expr,
-        epoch: int,
-        *,
-        rails: Rails | None = None,
-        rationale: str | None = None,
-        deadline_at: float | None = None,
-        retry_setups: bool = False,
-    ) -> None:
-        self._deadline_at = deadline_at
-        self._retry_setups = retry_setups
-        self._active_rails = rails or Rails()
-        self._active_epoch = epoch
-        try:
-            with self.repo.integration_guard():
-                fresh = Journal.load(self.run_dir)
-                if fresh.events() != self.journal.events():
-                    self.journal = fresh
-                self._run_epoch(tree, epoch, rationale)
-        finally:
-            self._deadline_at = None
-            self._retry_setups = False
-    def answer(self, answer: str, *, epoch: int | None = None, node_id: str | None = None) -> None:
-        """Durably answer one currently pending Ask; the answer is its projected result."""
-        with self.repo.integration_guard():
-            self.journal = Journal.load(self.run_dir)
-            pending = [
-                item for item in self._proj.pending_questions()
-                if (epoch is None or item.epoch == epoch)
-                and (node_id is None or item.node_id == node_id)
-            ]
-            if len(pending) != 1:
-                raise ValueError(
-                    f"answer must select exactly one pending Ask (matched {len(pending)})"
-                )
-            question = pending[0]
-            self.journal.append(Answered(
-                run_id=self.run_id,
-                epoch=question.epoch,
-                node_id=question.node_id,
-                answer=answer,
-                ok=True,
-            ))
-    def _run_epoch(self, tree: Expr, epoch: int, rationale: str | None) -> None:
-        self._verify_resume_claims()
-        tree = admit_epoch(tree, epoch, self._proj, self.registry)
-        if self._proj.epoch_closed(epoch):
-            return
-        if not self._proj.epoch_opened(epoch):
-            base = self.repo.branch_tip()
-            self.journal.append(
-                Boundary(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=tree.node_id,
-                    phase="opened",
-                    expr=tree.model_dump(),
-                    run_branch=self.repo.ref,
-                    base_commit=base,
-                    rails=self._active_rails,
-                    rationale=rationale,
-                )
+        self.run_id = run_id
+        self._active: dict[str, FrameWorktree] = {}
+        self._active_lock = threading.RLock()
+        self._integration_lock = threading.RLock()
+        self._answer_condition = threading.Condition(threading.RLock())
+        journal_path = self.run_dir / "events.ndjson"
+        continuing = journal_path.exists() and journal_path.stat().st_size > 0
+        self.journal = Journal.load(self.run_dir) if continuing else Journal(self.run_dir)
+        opened = self.journal.projection.opened
+        if continuing:
+            if opened is None:
+                raise RuntimeError("v2 journal has no run_opened event")
+            if opened.run_id != run_id:
+                raise ValueError("run id differs from durable run")
+            if opened.root_prompt != root_prompt:
+                raise ValueError("resumed job spec differs from durable root prompt")
+            if opened.root_rig != root_rig:
+                raise ValueError("resumed root rig differs from durable run")
+            durable_worktrees = Path(opened.worktrees_root)
+            if worktrees_root is not None and Path(worktrees_root).resolve() != durable_worktrees:
+                raise ValueError("resumed worktrees root differs from durable run")
+            self.policy = opened.policy
+            self.repository = Repository(
+                workdir,
+                self.run_dir,
+                run_id,
+                run_branch=opened.run_branch,
+                worktrees_root=durable_worktrees,
             )
-        self._exec(tree, epoch)
-        self._verify_resume_claims()
-        self.journal.append(
-            Boundary(
-                run_id=self.run_id,
-                epoch=epoch,
-                node_id=tree.node_id,
-                phase="closed",
-                reason="done",
-            )
-        )
-    def _verify_resume_claims(self) -> None:
-        while self._verify_once():
-            pass
-    def _verify_once(self) -> bool:
-        events = self._proj.effective_events
-        if not events:
-            return False
-        dispatches: dict[NodeKey, Dispatched] = {}
-        results: dict[NodeKey, ResultEvent] = {}
-        integrated_after: dict[NodeKey, int] = {}
-        prefix_dependents: dict[str, tuple[int, int]] = {}
-        host_dispatches: set[NodeKey] = set()
-        verified_tips: set[str] = set()
-        expected: str | None = None
-        for event in events:
-            if isinstance(event, Boundary) and event.phase == "opened":
-                if event.run_branch is None or event.base_commit is None:
-                    raise ResumeVerificationError(
-                        "open epoch predates the worktree model and cannot be resumed"
-                    )
-                if event.run_branch != self.repo.ref:
-                    raise ResumeVerificationError(
-                        f"epoch names run branch {event.run_branch!r}, not {self.repo.ref!r}"
-                    )
-                if expected is None:
-                    expected = event.base_commit
-                    verified_tips.add(expected)
-                elif event.base_commit != expected:
-                    raise ResumeVerificationError(
-                        "epoch base does not match the preceding verified journal tip"
-                    )
-                continue
-            if isinstance(event, Dispatched):
-                key = (event.epoch, event.node_id)
-                dispatches[key] = event
-                if event.host:
-                    host_dispatches.add(key)
-                elif expected is not None:
-                    prefix_dependents.setdefault(expected, (event.epoch, event.seq))
-                continue
-            if isinstance(event, ResultEvent):
-                key = (event.epoch, event.node_id)
-                results[key] = event
-                dispatch = dispatches.get(key)
-                if (
-                    event.integration_base is not None
-                    and dispatch is not None
-                    and event.integration_base != dispatch.pre_head
-                ):
-                    prefix_dependents.setdefault(
-                        event.integration_base, (event.epoch, event.seq)
-                    )
-                continue
-            if not isinstance(event, Integrated):
-                continue
-            key = (event.epoch, event.node_id)
-            dispatch = dispatches.get(key)
-            result = results.get(key)
-            base = (
-                result.integration_base if result is not None else None
-            ) or (dispatch.pre_head if dispatch is not None else None)
-            if (
-                expected is None or dispatch is None or base is None or result is None
-                or not (dispatch.seq < result.seq < event.seq)
-            ):
-                raise ResumeVerificationError(
-                    f"integrated claim at seq {event.seq} has no contiguous attempt provenance"
-                )
-            if base != expected:
-                raise ResumeVerificationError(
-                    f"integrated claim at seq {event.seq} does not follow the verified tip"
-                )
-            if (
-                not result.ok or not result.receipt_required
-                or result.post_head != event.commit
-            ):
-                if self._fallback_failed_claim(
-                    key[0], self._claim_start(dispatch, result),
-                    f"resume fallback: integrated seq {event.seq} contradicts its result",
-                    expected, event.commit, prefix_dependents,
-                ):
-                    return True
-                raise ResumeVerificationError(
-                    f"integrated claim at seq {event.seq} contradicts its result certificate"
-                )
-            try:
-                self.repo.verify_receipt(base, event.commits)
-            except RepositoryError as exc:
-                if self._fallback_failed_claim(
-                    key[0], self._claim_start(dispatch, result),
-                    f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
-                    expected, event.commit, prefix_dependents,
-                ):
-                    return True
-                raise ResumeVerificationError(
-                    f"receipt at seq {event.seq} is unverifiable and its effect is live: {exc}"
-                ) from exc
-            expected = event.commit
-            verified_tips.add(expected)
-            integrated_after[key] = event.seq
-        if expected is None:
-            raise ResumeVerificationError("journal has no worktree-model opened boundary")
-        live = self.repo.branch_claim()
-        outstanding = [
-            (key, result)
-            for key, result in results.items()
-            if result.ok
-            and result.receipt_required
-            and integrated_after.get(key, -1) < result.seq
-        ]
-        if len(outstanding) > 1:
-            raise ResumeVerificationError("journal has multiple unintegrated successful attempts")
-        if outstanding:
-            key, result = outstanding[0]
-            dispatch = dispatches.get(key)
-            base = result.integration_base or (
-                dispatch.pre_head if dispatch is not None else None
-            )
-            candidate = result.post_head
-            if base != expected or candidate is None:
-                if live == expected:
-                    assert dispatch is not None
-                    self._journal_fallback(
-                        key[0], dispatch.seq, "resume fallback: incomplete integration claim",
-                        expected,
-                    )
-                    return True
-                raise BranchDivergedError("run branch does not match an incomplete claim")
-            if live == candidate:
-                if not self.repo.commit_exists(candidate):
-                    assert dispatch is not None
-                    if self._fallback_failed_claim(
-                        key[0], self._claim_start(dispatch, result),
-                        "resume fallback: incomplete integration candidate is missing",
-                        expected, candidate, prefix_dependents,
-                    ):
-                        return True
-                try:
-                    receipt = self.repo.receipt(base, candidate)
-                except RepositoryError as exc:
-                    raise ResumeVerificationError(
-                        f"could not reconstruct landed integration: {exc}"
-                    ) from exc
-                if not receipt.commits:
-                    raise ResumeVerificationError("effectful result reconstructed no commits")
-                self._append_integrated(key, receipt)
-                return True
-            if live == expected:
-                assert dispatch is not None
-                cleaned = self.repo.restore_interrupted_integration(expected, candidate)
-                reason = "resume fallback: result was journalled but its commits did not land"
-                if cleaned:
-                    reason += "; removed ownerless interrupted Git lock residue"
-                self._journal_fallback(
-                    key[0], self._claim_start(dispatch, result), reason, expected
-                )
-                return True
-            if self._fallback_known_prefix(prefix_dependents, live):
-                return True
-            raise BranchDivergedError(
-                f"run branch moved outside incomplete attempt: expected {expected} "
-                f"or {candidate}, found {live}"
-            )
-        if not self.repo.commit_exists(live):
-            raise BranchDivergedError(
-                f"run branch {self.repo.branch!r} has unknown or missing tip {live}"
-            )
-        if live != expected:
-            if self._fallback_known_prefix(prefix_dependents, live):
-                return True
-            raise BranchDivergedError(
-                f"run branch {self.repo.branch!r} has operator commits: "
-                f"journal expects {expected}, found {live}"
-            )
-        unfinished = [
-            (key, node)
-            for key, node in self._proj.nodes.items()
-            if key not in host_dispatches and node.last_dispatch_seq > node.result_seq
-        ]
-        if unfinished:
-            key, node = min(unfinished, key=lambda item: item[1].last_dispatch_seq)
-            if node.dispatched_pre_head == expected:
-                self._journal_fallback(
-                    key[0], node.last_dispatch_seq,
-                    "resume fallback: interrupted attempt abandoned", expected,
-                )
-                return True
-            if node.dispatched_pre_head in verified_tips:
-                self._append_result(
-                    key,
-                    Result(
-                        text="resume: interrupted concurrent sibling abandoned",
-                        outcome="failed",
-                    ),
-                    post_head=expected,
-                )
-                return True
-            raise ResumeVerificationError("unfinished attempt did not start at verified tip")
-        return False
-    @staticmethod
-    def _claim_start(dispatch: Dispatched, result: ResultEvent) -> int:
-        if (
-            result.integration_base is not None
-            and result.integration_base != dispatch.pre_head
-        ):
-            return result.seq
-        return dispatch.seq
-    def _fallback_failed_claim(
-        self,
-        epoch_id: int,
-        start: int,
-        text: str,
-        expected: str,
-        claimed: str,
-        prefix_dependents: dict[str, tuple[int, int]],
-    ) -> bool:
-        live = self.repo.branch_claim()
-        if live == expected:
-            reason = text
-        elif live == claimed and not self.repo.commit_exists(claimed):
-            cleaned = self.repo.restore_missing_claim(claimed, expected)
-            reason = f"resume fallback: missing current claimed commit {claimed}"
-            if cleaned:
-                reason += "; removed ownerless interrupted Git lock residue"
+            if str(self.repository.root) != opened.repository:
+                raise ValueError("resumed repository differs from durable run")
+            if run_branch is not None:
+                requested = run_branch.removeprefix("refs/heads/")
+                if requested != opened.run_branch:
+                    raise ValueError("resumed run branch differs from durable run")
+            self._verify_integrations()
         else:
-            return self._fallback_known_prefix(prefix_dependents, live)
-        self._journal_fallback(epoch_id, start, reason, expected)
-        return True
-    def _fallback_known_prefix(
-        self, prefix_dependents: dict[str, tuple[int, int]], live: str
-    ) -> bool:
-        dependent = prefix_dependents.get(live)
-        if dependent is None or not self.repo.commit_exists(live):
-            return False
-        epoch_id, start = dependent
-        self._journal_fallback(
-            epoch_id, start, "resume fallback: exact verified prefix rewind", live
-        )
-        return True
-    def _journal_fallback(self, epoch_id: int, start: int, text: str, tip: str) -> None:
-        self.repo.sync_run_ref()
-        epoch = self._proj.epochs[epoch_id]
-        self.journal.append(Boundary(
-            run_id=self.run_id, epoch=epoch_id, node_id="n0", phase="opened",
-            expr=epoch.expr, run_branch=self.repo.ref, base_commit=tip,
-            reason=text, fallback_from=start, rails=epoch.rails,
-            rationale=epoch.rationale,
-        ))
-    def _exec(self, node: Expr, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
-        self._check_deadline()
-        key = (epoch, node.node_id)
-        if isinstance(node, (Do, Combine, Inplace, Ask, Setup)) and self._proj.resume_action(
-            key, floor
-        ) == "done":
-            return ExecutionOutcome(key=key)
-        if isinstance(node, Dispatch):
-            if self.max_workers > 1 and all(
-                isinstance(child, (Do, Inplace)) for child in node.children
-            ):
-                return self._exec_dispatch(node, epoch, floor)
-            return self._exec_children(node.children, epoch, floor, collect_asks=True)
-        if isinstance(node, Seq):
-            return self._exec_children(node.children, epoch, floor)
-        if isinstance(node, Loop):
-            return self._exec_loop(node, epoch, floor)
-        if isinstance(node, Combine):
-            return self._exec_combine(node, epoch, floor)
-        if isinstance(node, Do):
-            return self._exec_do(node, epoch)
-        if isinstance(node, Inplace):
-            return self._exec_inplace(node, epoch)
-        if isinstance(node, Ask):
-            return self._exec_ask(node, epoch, floor)
-        assert isinstance(node, Setup)
-        return self._exec_setup(node, epoch)
-    def _exec_children(
-        self,
-        children: list[Expr],
-        epoch: int,
-        floor: Floor,
-        *,
-        collect_asks: bool = False,
-    ) -> ExecutionOutcome:
-        outcomes: list[ExecutionOutcome] = []
-        failures: list[RuntimeError] = []
-        questions: list[OwnerQuestion] = []
-        for child in children:
-            try:
-                outcomes.append(self._exec(child, epoch, floor))
-            except AwaitingOwner as exc:
-                if not collect_asks:
-                    raise
-                outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
-                questions.extend(exc.questions)
-            except (NodeExecutionError, PredicateEvaluationError) as exc:
-                outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
-                failures.append(exc)
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise NodeExecutionError("; ".join(str(exc) for exc in failures))
-        if questions:
-            raise AwaitingOwner(tuple(questions))
-        return ExecutionOutcome(children=tuple(outcomes))
-    def _check_deadline(self) -> None:
-        if self._deadline_at is None or time.time() < self._deadline_at:
-            return
-        limit = self._active_rails.deadline_s or 0.0
-        raise RailStop(
-            run_id=self.run_id,
-            epoch=self._active_epoch,
-            rail="deadline_s",
-            limit=limit,
-            observed=max(limit, limit + time.time() - self._deadline_at),
-        )
-    def _exec_ask(self, node: Ask, epoch: int, floor: Floor) -> ExecutionOutcome:
-        state = self._proj.node((epoch, node.node_id))
-        if (
-            floor is not None
-            and state.asked_seq > floor
-            and state.asked_seq > state.answered_seq
-        ):
-            raise AwaitingOwner((OwnerQuestion(
-                epoch, node.node_id, node.question, tuple(node.options)
-            ),))
-        self.journal.append(Asked(
-            run_id=self.run_id,
-            epoch=epoch,
-            node_id=node.node_id,
-            question=node.question,
-            options=node.options,
-        ))
-        raise AwaitingOwner((OwnerQuestion(
-            epoch, node.node_id, node.question, tuple(node.options)
-        ),))
-    def _exec_setup(self, node: Setup, epoch: int) -> ExecutionOutcome:
-        key = (epoch, node.node_id)
-        state = self._proj.node(key)
-        if (
-            not node.idempotent
-            and state.dispatch_count
-            and (state.result is None or not state.result.ok)
-            and not self._retry_setups
-        ):
-            raise SetupResumeRequired(epoch, node.node_id)
-        base = self.repo.branch_tip()
-        self.journal.append(Dispatched(
-            run_id=self.run_id,
-            epoch=epoch,
-            node_id=node.node_id,
-            cmd=node.cmd,
-            workdir=str(self.repo.root),
-            pre_head=base,
-            host=True,
-        ))
-        try:
-            execution = run_shell(node.cmd, self.repo.root, 900.0)
-        except OSError as exc:
-            self._fail_node(key, base, f"setup launch failed: {exc}")
-        text = (execution.stdout + execution.stderr)[-8192:]
-        if execution.timed_out:
-            self._fail_node(key, base, f"setup timed out after 900s\n{text}")
-        assert execution.returncode is not None
-        result = Result(
-            text=text,
-            exit_code=execution.returncode,
-            outcome="ok" if execution.returncode == 0 else "failed",
-        )
-        if not result.ok:
-            self._record_failed_result(key, base, result)
-        self._append_result(key, result, post_head=base)
-        return ExecutionOutcome(key=key)
-    def _prepare_attempt(self, node: Do | Inplace, epoch: int, base: str) -> _Attempt:
-        key = (epoch, node.node_id)
-        attempt = self._proj.node(key).dispatch_count
-        worktree = self.repo.create_worktree(epoch, node.node_id, attempt, base)
-        if isinstance(node, Do):
-            self.journal.append(Dispatched(
-                run_id=self.run_id, epoch=epoch, node_id=node.node_id,
-                rig=node.rig.name, task=node.task, workdir=str(worktree.path),
-                pre_head=base,
+            self.policy = policy or AdmissionPolicy()
+            self.repository = Repository(
+                workdir,
+                self.run_dir,
+                run_id,
+                run_branch=run_branch,
+                worktrees_root=worktrees_root,
+            )
+            if root_rig not in registry:
+                raise ValueError(f"root rig {root_rig!r} is not in the rig allowlist")
+            started = time.time()
+            self.journal.append(RunOpened(
+                run_id=run_id,
+                repository=str(self.repository.root),
+                run_branch=self.repository.branch,
+                base_commit=self.repository.branch_tip(),
+                root_frame_id=self.ROOT_FRAME_ID,
+                root_rig=root_rig,
+                root_prompt=root_prompt,
+                worktrees_root=str(self.repository.worktrees_root),
+                started_at=started,
+                policy=self.policy,
             ))
-            prompt = self._materialize_ctx(node, epoch, worktree)
-            if prompt is None:
-                self.repo.remove_worktree(worktree)
-                self._fail_node(key, base, "unresolved or escaping context reference")
-            return _Attempt(node, key, base, worktree, prompt)
-        self.journal.append(Dispatched(
-            run_id=self.run_id, epoch=epoch, node_id=node.node_id,
-            task=f"inplace: {len(node.edits)} edit(s)",
-            workdir=str(worktree.path), pre_head=base,
-        ))
-        return _Attempt(node, key, base, worktree)
-    def _build_candidate(self, attempt: _Attempt) -> _Candidate:
-        self._check_deadline()
-        node = attempt.node
-        if isinstance(node, Do):
-            assert attempt.prompt is not None
-            try:
-                result = self.registry.resolve(node.rig.name).run(
-                    attempt.prompt, attempt.worktree.path
-                )
-            except Exception as exc:
-                result = Result(text=f"rig raised: {exc}", outcome="failed")
-            if not result.ok:
-                return _Candidate(result, attempt.base, IntegrationReceipt())
-            try:
-                self.repo.commit_all(
-                    attempt.worktree.path, self._commit_message("do", attempt.key)
-                )
-                candidate = self.repo.head(attempt.worktree.path)
-                receipt = self.repo.receipt(attempt.base, candidate)
-            except RepositoryError as exc:
-                return _Candidate(
-                    Result(text=f"do integration failed: {exc}", outcome="failed"),
-                    attempt.base,
-                    IntegrationReceipt(),
-                )
-            return _Candidate(result, candidate, receipt)
-        paths = [edit.path for edit in node.edits]
-        try:
-            for edit in node.edits:
-                target = self.repo.safe_path(
-                    attempt.worktree.path, edit.path, for_write=True
-                )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(edit.content, encoding="utf-8")
-            self.repo.commit_declared(
-                attempt.worktree.path,
-                paths,
-                self._commit_message("inplace", attempt.key),
+        self.server = MCPServer(self)
+
+    @property
+    def projection(self) -> RunProjection:
+        return self.journal.projection
+
+    def _verify_integrations(self) -> None:
+        for frame in self.journal.projection.frames.values():
+            integrated = frame.integrated
+            if integrated is None:
+                continue
+            self.repository.verify_receipt(
+                integrated.integration_base, integrated.landed_commits
             )
-            candidate = self.repo.head(attempt.worktree.path)
-            receipt = self.repo.receipt(attempt.base, candidate)
-            undeclared = [path for path in receipt.paths if path not in set(paths)]
-            if undeclared:
-                raise IntegrationError(
-                    f"inplace commit contains undeclared paths: {', '.join(undeclared)}"
+            if integrated.landed_commits:
+                target_ref = (
+                    self.repository.ref
+                    if integrated.target_frame_id is None
+                    else self.journal.projection.frame(integrated.target_frame_id).branch
                 )
-        except (OSError, UnicodeError, ValueError, RepositoryError) as exc:
-            return _Candidate(
-                Result(text=f"inplace failed: {exc}", outcome="failed"),
-                attempt.base,
-                IntegrationReceipt(),
-            )
-        result = Result(
-            text=(
-                f"wrote {', '.join(paths)}"
-                if receipt.commits else "inplace: no diff (already applied)"
-            ),
-            files=paths if receipt.commits else [],
-        )
-        return _Candidate(result, candidate, receipt)
-    def _exec_combine(
-        self, node: Combine, epoch: int, floor: Floor
-    ) -> ExecutionOutcome:
-        try:
-            inputs = self._exec_children(node.inputs, epoch, floor)
-        except (NodeExecutionError, PredicateEvaluationError) as exc:
-            raise CombineDependencyError(f"combine input failed: {exc}") from exc
-        refs: list[CtxRef] = []
-        for key in inputs.result_keys():
-            result = self._proj.result(key)
-            if result is None or not result.ok:
-                raise CombineDependencyError(
-                    f"combine input {key[1]!r} has no successful result"
-                )
-            refs.append(CtxRef(kind="node", ref=key[1]))
-        return self._exec_do(Do(
-            node_id=node.node_id, task=node.task, rig=node.rig, ctx=refs
-        ), epoch)
-    def _exec_do(self, node: Do, epoch: int) -> ExecutionOutcome:
-        return self._exec_leaf(node, epoch)
-    def _exec_inplace(self, node: Inplace, epoch: int) -> ExecutionOutcome:
-        return self._exec_leaf(node, epoch)
-    def _exec_leaf(self, node: Do | Inplace, epoch: int) -> ExecutionOutcome:
-        self._verify_resume_claims()
-        attempt = self._prepare_attempt(node, epoch, self.repo.branch_tip())
-        try:
-            candidate = self._build_candidate(attempt)
-            if not candidate.result.ok:
-                self._record_failed_result(attempt.key, attempt.base, candidate.result)
-            self._complete_attempt(
-                attempt.key, attempt.base, candidate.commit,
-                candidate.result, candidate.receipt,
-            )
-            return ExecutionOutcome(key=attempt.key)
-        finally:
-            self.repo.remove_worktree(attempt.worktree)
-    def _exec_dispatch(
-        self, node: Dispatch, epoch: int, floor: Floor
-    ) -> ExecutionOutcome:
-        """Run eligible leaf siblings together; this thread alone lands and journals."""
-        self._verify_resume_claims()
-        base = self.repo.branch_tip()
-        outcomes = [
-            ExecutionOutcome(key=(epoch, child.node_id)) for child in node.children
-        ]
-        attempts: list[_Attempt] = []
-        failures: list[NodeExecutionError] = []
-        owned_paths: set[str] = set()
-        try:
-            for child in node.children:
-                self._check_deadline()
-                assert isinstance(child, (Do, Inplace))
-                key = (epoch, child.node_id)
-                if self._proj.resume_action(key, floor) == "done":
-                    continue
-                try:
-                    attempts.append(self._prepare_attempt(child, epoch, base))
-                except NodeExecutionError as exc:
-                    failures.append(exc)
-            with ThreadPoolExecutor(
-                max_workers=min(self.max_workers, len(attempts) or 1)
-            ) as executor:
-                pending: dict[Future[_Candidate], _Attempt] = {
-                    executor.submit(self._build_candidate, attempt): attempt
-                    for attempt in attempts
-                }
-                for future in as_completed(pending):
-                    attempt = pending[future]
-                    candidate = future.result()
-                    failure = self._land_sibling(
-                        attempt, candidate, owned_paths, epoch
+                target_tip = self.repository.branch_tip(target_ref)
+                candidate = integrated.candidate_head
+                if self.repository.git(
+                    ["merge-base", "--is-ancestor", candidate, target_tip], check=False
+                ).returncode:
+                    raise RepositoryError(
+                        f"integrated frame {frame.frame_id!r} is absent from its target branch"
                     )
-                    if failure is not None:
-                        failures.append(failure)
-        finally:
-            for attempt in attempts:
-                self.repo.remove_worktree(attempt.worktree)
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise NodeExecutionError("; ".join(str(exc) for exc in failures))
-        return ExecutionOutcome(children=tuple(outcomes))
-    def _land_sibling(
+
+    def run(self) -> FrameResult:
+        """Start or replay the root stack and return its terminal frame result."""
+        finished = self.journal.projection.finished
+        if finished is not None:
+            return FrameResult(
+                outcome=finished.outcome,
+                text=finished.text,
+                exit_code=0 if finished.outcome == "ok" else 1,
+            )
+        opened = self.journal.projection.opened
+        assert opened is not None
+        with self.server:
+            root = self.journal.projection.frames.get(self.ROOT_FRAME_ID)
+            if root is None or root.outcome is None:
+                root = self._launch_frame(
+                    frame_id=self.ROOT_FRAME_ID,
+                    parent_frame_id=None,
+                    parent_call_index=None,
+                    task_index=None,
+                    depth=0,
+                    rig=opened.root_rig,
+                    prompt=opened.root_prompt,
+                    base_commit=opened.base_commit,
+                    subtree_deadline=opened.started_at + self.policy.subtree_timeout_s,
+                )
+            if root.outcome == "ok" and root.integrated is None:
+                try:
+                    self._integrate_frame(root.frame_id, target_frame_id=None, owned=set())
+                except RepositoryError as exc:
+                    root.outcome = "failed"
+                    root.text = f"root integration failed: {exc}"
+            self._pop_once(root, root.outcome or "failed")
+            root_head = root.head or self.repository.branch_tip(root.branch)
+            outcome = root.outcome or "failed"
+            self.journal.append(RunFinished(
+                run_id=self.run_id,
+                outcome=outcome,
+                root_head=root_head,
+                text=root.text,
+            ))
+            return FrameResult(
+                outcome=outcome,
+                text=root.text,
+                exit_code=root.exit_code,
+                stdout=root.stdout,
+                stderr=root.stderr,
+            )
+
+    def handle_tool(
         self,
-        attempt: _Attempt,
-        candidate: _Candidate,
-        owned_paths: set[str],
-        epoch: int,
-    ) -> NodeExecutionError | None:
-        current = self.repo.branch_tip()
-        if not candidate.result.ok:
-            self._append_result(attempt.key, candidate.result, post_head=current)
-            return NodeExecutionError(
-                candidate.result.text or f"node {attempt.key[1]} failed"
+        frame_id: str,
+        call_index: int,
+        tool: ToolName,
+        request: ToolRequest,
+    ) -> ToolResponse:
+        worktree = self._active_worktree(frame_id)
+        frame = self.journal.projection.frame(frame_id)
+        digest = call_hash(tool, request)
+        existing = self.journal.projection.call(frame_id, call_index)
+        if existing is not None:
+            if existing.tool != tool or existing.call_hash != digest:
+                raise CallConflictError(
+                    f"call {frame_id}:{call_index} content differs from its durable call"
+                )
+            if existing.response is not None:
+                return existing.response
+        elif call_index != self.journal.projection.next_call_index(frame_id):
+            raise CallConflictError(
+                f"call {frame_id}:{call_index} is not the next logical call"
             )
-        if not candidate.receipt.commits:
-            self._append_result(attempt.key, candidate.result, post_head=current)
-            return None
-        try:
-            self.repo.verify_receipt(attempt.base, candidate.receipt.commits)
-        except RepositoryError as exc:
-            text = f"sibling candidate receipt is invalid: {exc}"
-            self._append_result(
-                attempt.key, Result(text=text, outcome="failed"), post_head=current
-            )
-            return NodeExecutionError(text)
-        overlap = owned_paths.intersection(candidate.receipt.paths)
-        if overlap:
-            text = "concurrent sibling ownership overlaps: " + ", ".join(sorted(overlap))
-            self._append_result(
-                attempt.key, Result(text=text, outcome="failed"), post_head=current
-            )
-            return SiblingOwnershipError(text)
-        landing_commit = candidate.commit
-        landing_receipt = candidate.receipt
-        if current != attempt.base:
-            combine = self.repo.create_worktree(
-                epoch,
-                f"{attempt.key[1]}.integrate",
-                self._proj.node(attempt.key).dispatch_count,
-                current,
-            )
+
+        if tool == "dispatch":
+            if not isinstance(request, DispatchRequest):
+                raise TypeError("dispatch received the wrong request model")
+            return self._dispatch(frame, worktree, call_index, digest, request, existing is not None)
+        if tool == "gate":
+            if not isinstance(request, GateRequest):
+                raise TypeError("gate received the wrong request model")
+            return self._gate(frame, worktree, call_index, digest, request, existing is not None)
+        if not isinstance(request, AskRequest):
+            raise TypeError("ask received the wrong request model")
+        return self._ask(frame, worktree, call_index, digest, request, existing is not None)
+
+    def _active_worktree(self, frame_id: str) -> FrameWorktree:
+        with self._active_lock:
             try:
-                self.repo.cherry_pick(combine.path, candidate.receipt.commits)
-                landing_commit = self.repo.head(combine.path)
-                landing_receipt = self.repo.receipt(current, landing_commit)
-                source_paths = [item.paths for item in candidate.receipt.commits]
-                if [item.paths for item in landing_receipt.commits] != source_paths:
-                    raise IntegrationError("reapplied sibling changed its per-commit paths")
-            except RepositoryError as exc:
-                text = f"sibling reapply failed: {exc}"
-                self._append_result(
-                    attempt.key, Result(text=text, outcome="failed"), post_head=current
-                )
-                return NodeExecutionError(text)
-            finally:
-                self.repo.remove_worktree(combine)
-        try:
-            self._complete_attempt(
-                attempt.key, current, landing_commit,
-                candidate.result, landing_receipt,
-            )
-        except NodeExecutionError as exc:
-            return exc
-        owned_paths.update(candidate.receipt.paths)
-        return None
-    def _complete_attempt(
+                return self._active[frame_id]
+            except KeyError as exc:
+                raise FrameNotActiveError(f"frame {frame_id!r} is not active") from exc
+
+    def _dispatch(
         self,
-        key: NodeKey,
-        base: str,
-        candidate: str,
-        result: Result,
-        receipt: IntegrationReceipt,
-    ) -> None:
-        self.repo.ensure_tip(base)
-        self._append_result(
-            key,
-            result,
-            post_head=candidate,
-            receipt_required=bool(receipt.commits),
-            integration_base=base,
-        )
-        if not receipt.commits:
-            return
-        try:
-            self.repo.integrate(base, candidate)
-        except IntegrationError as exc:
-            self._append_result(
-                key,
-                Result(text=f"run-branch integration failed: {exc}", outcome="failed"),
-                post_head=base,
-            )
-            raise NodeExecutionError(str(exc)) from exc
-        self._append_integrated(key, receipt)
-    def _exec_loop(self, node: Loop, epoch: int, floor: Floor) -> ExecutionOutcome:
-        key = (epoch, node.node_id)
-        state = self._proj.node(key)
-        if (
-            floor is not None and state.result is not None and state.result_seq > floor
-            and state.loop_status is not None
-        ):
-            return ExecutionOutcome(key=key)
-        resume_from, partial_floor, last_converged, last_body = self._proj.loop_resume(
-            key, floor
-        )
-        if resume_from and (last_converged or resume_from >= node.cap):
-            self._finish_loop(node, epoch, last_body, resume_from, last_converged)
-            return ExecutionOutcome(key=key)
-        iterations = resume_from
-        converged = False
-        for index in range(resume_from, node.cap):
-            body_floor: Floor = partial_floor if index == resume_from else None
-            outcome = self._exec(node.body, epoch, body_floor)
-            body_key = outcome.result_key()
-            assert body_key is not None
-            body = self._proj.result(body_key)
-            if body is not None:
-                last_body = body
-            body_seq = self._proj.node(body_key).result_seq
-            converged = self._exec_predicate(node, epoch)
-            self.journal.append(
-                LoopIter(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=node.node_id,
-                    iteration=index,
-                    commit=self.repo.branch_tip(),
-                    converged=converged,
-                    body_result_seq=body_seq,
-                )
-            )
-            iterations = index + 1
-            partial_floor = None
-            if converged:
-                break
-        self._finish_loop(node, epoch, last_body, iterations, converged)
-        return ExecutionOutcome(key=key)
-    def _finish_loop(
-        self,
-        node: Loop,
-        epoch: int,
-        body: Result | None,
-        iterations: int,
-        converged: bool,
-    ) -> None:
-        status = (
-            f"converged after {iterations} iteration(s)"
-            if converged
-            else f"hit cap {node.cap} without convergence (partial progress preserved)"
-        )
-        result = Result(
-            text=body.text if body is not None else "",
-            files=body.files if body is not None else [],
-            exit_code=body.exit_code if body is not None else None,
-            outcome="ok" if converged else "failed",
-        )
-        self._append_result(
-            (epoch, node.node_id),
-            result,
-            post_head=self.repo.branch_tip(),
-            loop_status=status,
-        )
-    def _until_command(self, until: Until) -> str:
-        assert until.cmd is not None
-        return until.cmd
-    def _exec_predicate(self, node: Loop, epoch: int) -> bool:
-        self._check_deadline()
-        key = (epoch, f"{node.node_id}.until")
-        self._verify_resume_claims()
-        base = self.repo.branch_tip()
-        attempt = self._proj.node(key).dispatch_count
-        worktree = self.repo.create_worktree(epoch, key[1], attempt, base)
-        command = self._until_command(node.until)
-        try:
-            self.journal.append(
-                Dispatched(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=key[1],
-                    cmd=command,
-                    workdir=str(worktree.path),
-                    pre_head=base,
-                )
-            )
+        frame: FrameProjection,
+        worktree: FrameWorktree,
+        call_index: int,
+        digest: str,
+        request: DispatchRequest,
+        replaying: bool,
+    ) -> DispatchResult:
+        if replaying:
+            self.repository.ensure_clean(worktree.path, frame.branch)
+        else:
+            caller_head = self.repository.ensure_clean(worktree.path, frame.branch)
+            descendants = self.journal.projection.descendants(frame.frame_id)
+            spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
             try:
-                evaluation = run_shell(command, worktree.path, node.until.timeout_s)
-            except OSError as exc:
-                self._append_result(
-                    key,
-                    Result(text=f"predicate launch failed: {exc}", outcome="failed"),
-                    post_head=base,
+                admit_dispatch(
+                    request,
+                    caller_depth=frame.depth,
+                    subtree_frames=len(descendants),
+                    subtree_spend=spend,
+                    subtree_deadline=frame.subtree_deadline,
+                    policy=self.policy,
+                    registry=self.registry,
                 )
-                raise PredicateEvaluationError(str(exc)) from exc
-            self.repo.ensure_tip(base)
-            if evaluation.timed_out:
-                text = f"predicate timed out after {node.until.timeout_s}s"
-                self._append_result(
-                    key, Result(text=text, outcome="failed"), post_head=base
+            except AdmissionError as exc:
+                self.journal.append(DispatchCalled(
+                    run_id=self.run_id,
+                    frame_id=frame.frame_id,
+                    call_index=call_index,
+                    call_hash=digest,
+                    request=request,
+                    caller_head=caller_head,
+                ))
+                refused = DispatchResult(
+                    outcome="refused",
+                    error_code=exc.code,
+                    message=str(exc),
                 )
-                raise PredicateEvaluationError(text)
-            assert evaluation.returncode is not None
-            text = evaluation.stdout if evaluation.returncode == 0 else (
-                evaluation.stderr or evaluation.stdout
-            )
-            self._append_result(
-                key,
-                Result(text=text, exit_code=evaluation.returncode),
-                post_head=base,
-            )
-            return evaluation.returncode == 0
-        finally:
-            self.repo.remove_worktree(worktree)
-    def _append_result(
+                self.journal.append(DispatchReturned(
+                    run_id=self.run_id,
+                    frame_id=frame.frame_id,
+                    call_index=call_index,
+                    call_hash=digest,
+                    result=refused,
+                ))
+                return refused
+            self.journal.append(DispatchCalled(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                request=request,
+                caller_head=caller_head,
+            ))
+
+        results = (
+            self._parallel_children(frame, worktree, call_index, request)
+            if request.parallel and len(request.tasks) > 1
+            else self._serial_children(frame, worktree, call_index, request)
+        )
+        outcome: FrameOutcome = (
+            "ok" if all(result.outcome == "ok" for result in results) else "failed"
+        )
+        returned = DispatchResult(outcome=outcome, children=results)
+        self.journal.append(DispatchReturned(
+            run_id=self.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            result=returned,
+        ))
+        return returned
+
+    def _serial_children(
         self,
-        key: NodeKey,
-        result: Result,
+        parent: FrameProjection,
+        parent_worktree: FrameWorktree,
+        call_index: int,
+        request: DispatchRequest,
+    ) -> list[ChildResult]:
+        results: list[ChildResult] = []
+        for task_index, task in enumerate(request.tasks):
+            child = self._execute_child(
+                parent, call_index, task_index, task, request.rig,
+                base_commit=self.repository.branch_tip(parent.branch),
+            )
+            results.append(self._finish_child(
+                child, parent, parent_worktree, owned=set()
+            ))
+        return results
+
+    def _parallel_children(
+        self,
+        parent: FrameProjection,
+        parent_worktree: FrameWorktree,
+        call_index: int,
+        request: DispatchRequest,
+    ) -> list[ChildResult]:
+        base = self.repository.branch_tip(parent.branch)
+        by_index: dict[int, ChildResult] = {}
+        owned: set[str] = set()
+        with ThreadPoolExecutor(max_workers=len(request.tasks)) as executor:
+            futures: dict[Future[FrameProjection], int] = {}
+            for task_index, task in enumerate(request.tasks):
+                future = executor.submit(
+                    self._execute_child,
+                    parent,
+                    call_index,
+                    task_index,
+                    task,
+                    request.rig,
+                    base_commit=base,
+                )
+                futures[future] = task_index
+            for future in as_completed(futures):
+                task_index = futures[future]
+                try:
+                    child = future.result()
+                    result = self._finish_child(
+                        child, parent, parent_worktree, owned=owned
+                    )
+                    if result.outcome == "ok":
+                        owned.update(path for commit in result.commits for path in commit.paths)
+                except Exception as exc:
+                    frame_id = self._child_id(parent.frame_id, call_index, task_index)
+                    result = ChildResult(
+                        frame_id=frame_id,
+                        outcome="failed",
+                        text=f"child execution failed: {exc}",
+                    )
+                by_index[task_index] = result
+        return [by_index[index] for index in range(len(request.tasks))]
+
+    def _execute_child(
+        self,
+        parent: FrameProjection,
+        call_index: int,
+        task_index: int,
+        task: str,
+        rig: str,
         *,
-        post_head: str | None,
-        receipt_required: bool = False,
-        integration_base: str | None = None,
-        loop_status: str | None = None,
-    ) -> None:
-        artifact = self._persist_artifact(key, result)
-        self.journal.append(
-            ResultEvent(
+        base_commit: str,
+    ) -> FrameProjection:
+        frame_id = self._child_id(parent.frame_id, call_index, task_index)
+        existing = self.journal.projection.frames.get(frame_id)
+        if existing is not None:
+            if (
+                existing.parent_frame_id != parent.frame_id
+                or existing.parent_call_index != call_index
+                or existing.task_index != task_index
+                or existing.prompt != task
+                or existing.rig != rig
+            ):
+                raise CallConflictError(f"durable child identity differs for {frame_id}")
+            if existing.outcome is not None:
+                return existing
+        return self._launch_frame(
+            frame_id=frame_id,
+            parent_frame_id=parent.frame_id,
+            parent_call_index=call_index,
+            task_index=task_index,
+            depth=parent.depth + 1,
+            rig=rig,
+            prompt=task,
+            base_commit=existing.base_commit if existing is not None else base_commit,
+            subtree_deadline=parent.subtree_deadline,
+        )
+
+    @staticmethod
+    def _child_id(parent: str, call_index: int, task_index: int) -> str:
+        return f"{parent}.c{call_index}.t{task_index}"
+
+    def _finish_child(
+        self,
+        child: FrameProjection,
+        parent: FrameProjection,
+        parent_worktree: FrameWorktree,
+        *,
+        owned: set[str],
+    ) -> ChildResult:
+        if child.outcome != "ok":
+            self._pop_once(child, child.outcome or "failed")
+            return self._child_result(child, [])
+        try:
+            integrated = child.integrated
+            if integrated is None:
+                integrated = self._integrate_frame(
+                    child.frame_id,
+                    target_frame_id=parent.frame_id,
+                    owned=owned,
+                    target_worktree=parent_worktree.path,
+                )
+            paths = {path for commit in integrated.source_commits for path in commit.paths}
+            overlap = paths.intersection(owned)
+            if overlap:
+                raise IntegrationError(
+                    f"parallel sibling path ownership overlaps: {', '.join(sorted(overlap))}"
+                )
+            self._pop_once(child, "ok")
+            return self._child_result(child, integrated.landed_commits)
+        except RepositoryError as exc:
+            self._pop_once(child, "failed")
+            return ChildResult(
+                frame_id=child.frame_id,
+                outcome="failed",
+                text=f"integration failed: {exc}",
+                exit_code=child.exit_code,
+            )
+
+    def _child_result(
+        self, child: FrameProjection, commits: list[CommitReceipt]
+    ) -> ChildResult:
+        return ChildResult(
+            frame_id=child.frame_id,
+            outcome=child.outcome or "failed",
+            text=child.text,
+            exit_code=child.exit_code,
+            commits=commits,
+        )
+
+    def _launch_frame(
+        self,
+        *,
+        frame_id: str,
+        parent_frame_id: str | None,
+        parent_call_index: int | None,
+        task_index: int | None,
+        depth: int,
+        rig: str,
+        prompt: str,
+        base_commit: str,
+        subtree_deadline: float,
+    ) -> FrameProjection:
+        existing = self.journal.projection.frames.get(frame_id)
+        branch = existing.branch if existing is not None else self.repository.frame_branch(frame_id)
+        resume = existing is not None or self.repository.ref_exists(branch)
+        worktree = self.repository.create_frame_worktree(
+            frame_id, branch, base_commit, resume=resume
+        )
+        attempt = 0 if existing is None else existing.push_count
+        self.journal.append(FramePushed(
+            run_id=self.run_id,
+            frame_id=frame_id,
+            parent_frame_id=parent_frame_id,
+            parent_call_index=parent_call_index,
+            task_index=task_index,
+            attempt=attempt,
+            depth=depth,
+            rig=rig,
+            prompt=prompt,
+            branch=branch,
+            base_commit=base_commit,
+            worktree=str(worktree.path),
+            subtree_deadline=subtree_deadline,
+        ))
+        with self._active_lock:
+            self._active[frame_id] = worktree
+        try:
+            runtime_dir = self.run_dir / "runtime" / frame_id / f"attempt-{attempt}"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            shim = write_pi_shim(
+                runtime_dir,
+                self.server.endpoint,
+                self.server.token,
+                frame_id,
+                self.journal.projection.next_call_index(frame_id),
+            )
+            runtime = FrameRuntime(
+                endpoint=self.server.endpoint,
+                token=self.server.token,
+                frame_id=frame_id,
+                shim_path=shim,
+                runtime_dir=runtime_dir,
+                next_call_index=self.journal.projection.next_call_index(frame_id),
+            )
+            result = self.registry.resolve(rig).run(
+                self._frame_prompt(frame_id, prompt), worktree.path, runtime
+            )
+            if result.outcome == "ok":
+                try:
+                    head = self.repository.commit_all(
+                        worktree.path, f"wildflows frame {frame_id}"
+                    )
+                except RepositoryError as exc:
+                    result = FrameResult(
+                        outcome="failed",
+                        text=f"frame commit failed: {exc}",
+                        exit_code=result.exit_code,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                    )
+                    head = self.repository.head(worktree.path)
+            else:
+                head = self.repository.head(worktree.path)
+            self.journal.append(FrameExited(
                 run_id=self.run_id,
-                epoch=key[0],
-                node_id=key[1],
-                text=result.text,
-                files=result.files,
-                exit_code=result.exit_code,
+                frame_id=frame_id,
+                attempt=attempt,
                 outcome=result.outcome,
-                post_head=post_head,
-                integration_base=integration_base,
-                receipt_required=receipt_required,
-                loop_status=loop_status,
-                artifact=artifact,
-            )
-        )
-    def _append_integrated(self, key: NodeKey, receipt: IntegrationReceipt) -> None:
-        self.journal.append(
-            Integrated(
+                text=result.text,
+                exit_code=result.exit_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                head=head,
+            ))
+            return self.journal.projection.frame(frame_id)
+        except Exception as exc:
+            head = self.repository.head(worktree.path)
+            self.journal.append(FrameExited(
                 run_id=self.run_id,
-                epoch=key[0],
-                node_id=key[1],
-                commits=receipt.commits,
-            )
+                frame_id=frame_id,
+                attempt=attempt,
+                outcome="failed",
+                text=f"frame rig failed: {exc}",
+                stderr=str(exc),
+                head=head,
+            ))
+            return self.journal.projection.frame(frame_id)
+        finally:
+            with self._active_lock:
+                self._active.pop(frame_id, None)
+            self.repository.remove_worktree(worktree)
+
+    def _frame_prompt(self, frame_id: str, original: str) -> str:
+        digest = self.journal.projection.resume_digest(frame_id)
+        resume = bool(digest) or self.journal.projection.frame(frame_id).push_count > 1
+        preamble = (
+            "You are a WILDFLOWS frame. Work only in your CWD. Commit useful changes "
+            "before calling an engine tool or exiting. The only engine tools are "
+            "wildflows_dispatch, wildflows_gate, and wildflows_ask. Tool calls block; "
+            "child commits are present in your branch when dispatch returns.\n"
         )
-    def _persist_artifact(self, key: NodeKey, result: Result) -> str:
-        node = key[1].replace("/", "-").replace("..", "-")
-        directory = self.run_dir / "artifacts" / f"e{key[0]}-{node}"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"result-{self.journal.n_events}.json"
-        temporary = path.with_suffix(".tmp")
-        payload = json.dumps(
-            result.model_dump(mode="json", exclude_computed_fields=True), sort_keys=True
-        ).encode("utf-8")
-        with open(temporary, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
+        if resume:
+            preamble += (
+                "\nRESUME REPLAY: completed calls below are durable and must not be paid "
+                "for again. Do not re-issue completed calls; continue from their results. "
+                "Re-issue an exact pending call to reconnect the durable stack. If a "
+                "completed call is accidentally re-issued with its original logical index "
+                "and content, the engine returns its memoized result.\n"
+                f"RESUME_DIGEST={json.dumps(digest, sort_keys=True, separators=(',', ':'))}\n"
+            )
+        return f"{preamble}\n--- ORIGINAL FRAME PROMPT ---\n{original}"
+
+    def _integrate_frame(
+        self,
+        frame_id: str,
+        *,
+        target_frame_id: str | None,
+        owned: set[str],
+        target_worktree: Path | None = None,
+    ) -> FrameIntegrated:
+        with self._integration_lock:
+            frame = self.journal.projection.frame(frame_id)
+            if frame.integrated is not None:
+                return frame.integrated
+            if frame.head is None:
+                raise IntegrationError("cannot integrate a frame with no exit head")
+            target_ref = (
+                self.repository.ref
+                if target_frame_id is None
+                else self.journal.projection.frame(target_frame_id).branch
+            )
+            if target_worktree is None:
+                target_worktree = self.repository.checked_out_owner(target_ref)
+            intent = frame.integrating
+            if intent is None:
+                source = self.repository.receipt(frame.base_commit, frame.head)
+                overlap = set(source.paths).intersection(owned)
+                if overlap:
+                    raise IntegrationError(
+                        f"parallel sibling path ownership overlaps: {', '.join(sorted(overlap))}"
+                    )
+                moving_base = self.repository.branch_tip(target_ref)
+                if moving_base == frame.base_commit:
+                    candidate = frame.head
+                    landed = source
+                else:
+                    candidate, landed = self.repository.reapply(
+                        source.commits, moving_base
+                    )
+                intent = FrameIntegrating(
+                    run_id=self.run_id,
+                    frame_id=frame_id,
+                    target_frame_id=target_frame_id,
+                    integration_base=moving_base,
+                    candidate_head=candidate,
+                    source_commits=source.commits,
+                    landed_commits=landed.commits,
+                )
+                self.journal.append(intent)
+            self.repository.advance(
+                target_ref,
+                intent.integration_base,
+                intent.candidate_head,
+                target_worktree=target_worktree,
+            )
+            integrated = FrameIntegrated(
+                run_id=self.run_id,
+                frame_id=frame_id,
+                target_frame_id=target_frame_id,
+                integration_base=intent.integration_base,
+                candidate_head=intent.candidate_head,
+                source_commits=intent.source_commits,
+                landed_commits=intent.landed_commits,
+            )
+            self.journal.append(integrated)
+            return integrated
+
+    def _pop_once(self, frame: FrameProjection, outcome: FrameOutcome) -> None:
+        if frame.popped:
+            return
+        self.journal.append(FramePopped(
+            run_id=self.run_id,
+            frame_id=frame.frame_id,
+            attempt=frame.attempt,
+            outcome=outcome,
+        ))
+
+    def _gate(
+        self,
+        frame: FrameProjection,
+        worktree: FrameWorktree,
+        call_index: int,
+        digest: str,
+        request: GateRequest,
+        replaying: bool,
+    ) -> GateResult:
+        caller_head = self.repository.ensure_clean(worktree.path, frame.branch)
+        if not replaying:
+            self.journal.append(GateCalled(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                request=request,
+                caller_head=caller_head,
+            ))
+        remaining = max(0.01, frame.subtree_deadline - time.time())
+        result = run_shell(request.cmd, worktree.path, remaining)
+        if result.timed_out:
+            gate = GateResult(
+                exit_code=124,
+                stdout=result.stdout,
+                stderr=result.stderr + f"\n[timeout] gate exceeded {remaining:g}s",
+            )
+        else:
+            assert result.returncode is not None
+            gate = GateResult(
+                exit_code=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+        self.journal.append(GateReturned(
+            run_id=self.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            result=gate,
+        ))
+        return gate
+
+    def _ask(
+        self,
+        frame: FrameProjection,
+        worktree: FrameWorktree,
+        call_index: int,
+        digest: str,
+        request: AskRequest,
+        replaying: bool,
+    ) -> AskResult:
+        if not replaying:
+            self.repository.ensure_clean(worktree.path, frame.branch)
+            self.journal.append(Asked(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                request=request,
+            ))
+        answer_path = self._answer_path(frame.frame_id, call_index)
+        with self._answer_condition:
+            while not answer_path.is_file():
+                self._answer_condition.wait(timeout=0.25)
+        answer = answer_path.read_text(encoding="utf-8")
+        self.journal.append(Answered(
+            run_id=self.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            answer=answer,
+        ))
+        return AskResult(answer=answer)
+
+    def _answer_path(self, frame_id: str, call_index: int) -> Path:
+        safe = frame_id.replace("/", "-")
+        return self.run_dir / "answers" / f"{safe}-{call_index}.txt"
+
+    def answer(
+        self,
+        answer: str,
+        *,
+        frame_id: str | None = None,
+        call_index: int | None = None,
+    ) -> tuple[str, int]:
+        pending = self.journal.projection.pending_questions()
+        selected = [
+            call for call in pending
+            if (frame_id is None or call.frame_id == frame_id)
+            and (call_index is None or call.call_index == call_index)
+        ]
+        if len(selected) != 1:
+            raise ValueError(f"answer target is ambiguous or absent ({len(selected)} matches)")
+        call = selected[0]
+        path = self._answer_path(call.frame_id, call.call_index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(answer, encoding="utf-8")
         os.replace(temporary, path)
-        for synced in (directory, directory.parent, self.run_dir):
-            descriptor = os.open(synced, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        return path.relative_to(self.run_dir).as_posix()
-    def _record_failed_result(self, key: NodeKey, base: str, result: Result) -> NoReturn:
-        self.repo.ensure_tip(base)
-        self._append_result(key, result, post_head=base)
-        raise NodeExecutionError(result.text or f"node {key[1]} failed")
-    def _fail_node(self, key: NodeKey, base: str, text: str) -> NoReturn:
-        self._record_failed_result(key, base, Result(text=text, outcome="failed"))
-    def _materialize_ctx(self, node: Do, epoch: int, worktree: NodeWorktree) -> str | None:
-        if not node.ctx:
-            return node.task
-        parts = [node.task]
-        for ref in node.ctx:
-            block = self._resolve_ctx(ref, epoch, worktree.path)
-            if block is None:
-                return None
-            parts.append(block)
-        return "\n\n".join(parts)
-    def _resolve_ctx(self, ref: CtxRef, epoch: int, worktree: Path) -> str | None:
-        if ref.kind == "file":
-            content = self.repo.read_file(worktree, ref.ref)
-            if content is None:
-                return None
-            return f"## Context: file {ref.ref}\n{content}"
-        state = self._proj.node((epoch, ref.ref))
-        result = state.result
-        if result is None:
-            return None
-        artifact_path: str | None = None
-        if state.artifact is not None:
-            candidate = (self.run_dir / state.artifact).resolve(strict=False)
-            if candidate.is_relative_to(self.run_dir.resolve(strict=False)):
-                artifact_path = str(candidate)
-        digest: dict[str, object] = {
-            "node_id": ref.ref,
-            "outcome": result.outcome,
-            "text": result.text,
-            "paths": result.files,
-            "artifact": state.artifact,
-            "artifact_path": artifact_path,
-        }
-        return f"## Context: node {ref.ref}\n{json.dumps(digest, ensure_ascii=False)}"
-    def _commit_message(self, kind: str, key: NodeKey) -> str:
-        return f"wildflows {kind} {key[1]} (run {self.run_id}, epoch {key[0]})"
+        with self._answer_condition:
+            self._answer_condition.notify_all()
+        return call.frame_id, call.call_index

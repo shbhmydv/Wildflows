@@ -1,237 +1,233 @@
+"""One replay fold for v2 frames, calls, memoized results, and pending asks."""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from pathlib import Path
+
 from wildflows.events import (
-    Answered, Asked, Boundary, Dispatched, Event, Integrated, LoopIter, ResultEvent,
+    Answered,
+    Asked,
+    DispatchCalled,
+    DispatchReturned,
+    Event,
+    FrameExited,
+    FrameIntegrated,
+    FrameIntegrating,
+    FramePopped,
+    FramePushed,
+    GateCalled,
+    GateReturned,
+    RunFinished,
+    RunOpened,
 )
-from wildflows.planner import OwnerQuestion, Rails
-from wildflows.result import IntegrationReceipt, Result
-NodeKey = tuple[int, str]
-Floor = int | None
-@dataclass(frozen=True)
-class ExecutionOutcome:
-    key: NodeKey | None = None
-    children: tuple["ExecutionOutcome", ...] = ()
-    def result_key(self) -> NodeKey | None:
-        if self.children:
-            return self.children[-1].result_key()
-        return self.key
-    def result_keys(self) -> tuple[NodeKey, ...]:
-        if self.children:
-            return tuple(
-                key for child in self.children for key in child.result_keys()
-            )
-        return () if self.key is None else (self.key,)
+from wildflows.frame import (
+    AskResult,
+    DispatchRequest,
+    DispatchResult,
+    FrameOutcome,
+    GateRequest,
+    GateResult,
+    ToolName,
+    ToolRequest,
+    ToolResponse,
+)
+from wildflows.result import CommitReceipt
+
+
 @dataclass
-class LoopIterRecord:
-    seq: int
-    commit: str | None
-    converged: bool
-    body: Result | None
+class FrameProjection:
+    frame_id: str
+    parent_frame_id: str | None
+    parent_call_index: int | None
+    task_index: int | None
+    depth: int
+    rig: str
+    prompt: str
+    branch: str
+    base_commit: str
+    worktree: str
+    subtree_deadline: float
+    attempt: int = 0
+    push_count: int = 0
+    outcome: FrameOutcome | None = None
+    text: str = ""
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    head: str | None = None
+    exited_seq: int = -1
+    integrating: FrameIntegrating | None = None
+    integrated: FrameIntegrated | None = None
+    popped: bool = False
+
+
 @dataclass
-class NodeProjection:
-    dispatched: bool = False
-    dispatch_count: int = 0
-    last_dispatch_seq: int = -1
-    dispatched_pre_head: str | None = None
-    result: Result | None = None
-    result_seq: int = -1
-    result_post_head: str | None = None
-    receipt_required: bool = False
-    receipt: IntegrationReceipt | None = None
-    integrated_seq: int = -1
-    artifact: str | None = None
-    question: str | None = None
-    options: tuple[str, ...] = ()
-    asked_seq: int = -1
-    answered_seq: int = -1
-    loop_status: str | None = None
-    loop_iterations: int = 0
-    loop_last_commit: str | None = None
-    loop_last_iter_seq: int = -1
-    loop_last_body: Result | None = None
-    loop_converged: bool = False
-    loop_iters: list[LoopIterRecord] = field(default_factory=list)
-    def has_unfinished_dispatch(self, floor: Floor) -> bool:
-        return (
-            floor is not None and self.last_dispatch_seq > floor
-            and self.last_dispatch_seq > self.result_seq
-        )
+class CallProjection:
+    frame_id: str
+    call_index: int
+    call_hash: str
+    tool: ToolName
+    request: ToolRequest
+    started_seq: int
+    caller_head: str | None = None
+    response: ToolResponse | None = None
+    finished_seq: int = -1
+
+    @property
+    def completed(self) -> bool:
+        return self.response is not None
+
+
 @dataclass
-class EpochProjection:
-    phase: str = ""
-    expr: dict[str, object] | None = None
-    run_branch: str | None = None
-    base_commit: str | None = None
-    rails: Rails | None = None
-    rationale: str | None = None
-    reason: str | None = None
 class RunProjection:
-    def __init__(self) -> None:
-        self._history: list[Event] = []
-        self._clear()
-    def _clear(self) -> None:
-        self.nodes: dict[NodeKey, NodeProjection] = {}
-        self.epochs: dict[int, EpochProjection] = {}
-        self._results_by_seq: dict[int, Result] = {}
-        self._last_result_seq = -1
-    @staticmethod
-    def _effective(history: list[Event]) -> list[Event]:
-        effective: list[Event] = []
-        for event in history:
-            if isinstance(event, Boundary) and event.fallback_from is not None:
-                effective = [old for old in effective if old.seq < event.fallback_from]
-            effective.append(event)
-        return effective
-    @property
-    def effective_events(self) -> list[Event]:
-        return self._effective(self._history)
+    opened: RunOpened | None = None
+    finished: RunFinished | None = None
+    frames: dict[str, FrameProjection] = field(default_factory=dict)
+    calls: dict[tuple[str, int], CallProjection] = field(default_factory=dict)
+    effective_events: list[Event] = field(default_factory=list)
+
     def apply(self, event: Event) -> None:
-        self._history.append(event)
-        if isinstance(event, Boundary) and event.fallback_from is not None:
-            effective = self._effective(self._history)
-            self._clear()
-            for retained in effective:
-                self._apply_fact(retained)
-            return
-        self._apply_fact(event)
-    def _apply_fact(self, event: Event) -> None:
-        if isinstance(event, Boundary):
-            epoch = self.epochs.setdefault(event.epoch, EpochProjection())
-            epoch.phase = event.phase
-            if event.phase == "opened":
-                if event.expr is not None:
-                    epoch.expr = event.expr
-                epoch.run_branch = event.run_branch
-                epoch.base_commit = event.base_commit
-                epoch.rails = event.rails
-                epoch.rationale = event.rationale
-            epoch.reason = event.reason
-            return
-        key = (event.epoch, event.node_id)
-        node = self.nodes.setdefault(key, NodeProjection())
-        if isinstance(event, Dispatched):
-            node.dispatched = True
-            node.dispatch_count += 1
-            node.last_dispatch_seq = event.seq
-            node.dispatched_pre_head = event.pre_head
-        elif isinstance(event, ResultEvent):
-            node.result = Result(
-                text=event.text, files=event.files, exit_code=event.exit_code,
-                outcome=event.outcome,
+        self.effective_events.append(event)
+        if isinstance(event, RunOpened):
+            self.opened = event
+        elif isinstance(event, FramePushed):
+            current = self.frames.get(event.frame_id)
+            if current is None:
+                current = FrameProjection(
+                    frame_id=event.frame_id,
+                    parent_frame_id=event.parent_frame_id,
+                    parent_call_index=event.parent_call_index,
+                    task_index=event.task_index,
+                    depth=event.depth,
+                    rig=event.rig,
+                    prompt=event.prompt,
+                    branch=event.branch,
+                    base_commit=event.base_commit,
+                    worktree=event.worktree,
+                    subtree_deadline=event.subtree_deadline,
+                )
+                self.frames[event.frame_id] = current
+            current.attempt = event.attempt
+            current.push_count += 1
+            current.worktree = event.worktree
+            current.popped = False
+        elif isinstance(event, (DispatchCalled, GateCalled, Asked)):
+            if isinstance(event, DispatchCalled):
+                tool: ToolName = "dispatch"
+                request: ToolRequest = event.request
+                caller_head: str | None = event.caller_head
+            elif isinstance(event, GateCalled):
+                tool = "gate"
+                request = event.request
+                caller_head = event.caller_head
+            else:
+                tool = "ask"
+                request = event.request
+                caller_head = None
+            self.calls[(event.frame_id, event.call_index)] = CallProjection(
+                frame_id=event.frame_id,
+                call_index=event.call_index,
+                call_hash=event.call_hash,
+                tool=tool,
+                request=request,
+                started_seq=event.seq,
+                caller_head=caller_head,
             )
-            node.result_seq = event.seq
-            node.result_post_head = event.post_head
-            node.receipt_required = event.receipt_required
-            node.loop_status = event.loop_status
-            node.artifact = event.artifact
-            self._results_by_seq[event.seq] = node.result
-            self._last_result_seq = event.seq
-        elif isinstance(event, Asked):
-            node.question = event.question
-            node.options = tuple(event.options)
-            node.asked_seq = event.seq
+        elif isinstance(event, DispatchReturned):
+            call = self.calls[(event.frame_id, event.call_index)]
+            call.response = event.result
+            call.finished_seq = event.seq
+        elif isinstance(event, GateReturned):
+            call = self.calls[(event.frame_id, event.call_index)]
+            call.response = event.result
+            call.finished_seq = event.seq
         elif isinstance(event, Answered):
-            node.result = Result(
-                text=event.answer, outcome="ok" if event.ok else "failed"
-            )
-            node.result_seq = event.seq
-            node.answered_seq = event.seq
-            node.receipt_required = False
-            self._results_by_seq[event.seq] = node.result
-            self._last_result_seq = event.seq
-        elif isinstance(event, Integrated):
-            if node.receipt is None:
-                node.receipt = IntegrationReceipt()
-            node.receipt.extend(event.commits)
-            node.integrated_seq = event.seq
-        elif isinstance(event, LoopIter):
-            node.loop_iterations = event.iteration + 1
-            node.loop_last_commit = event.commit
-            node.loop_last_iter_seq = event.seq
-            node.loop_converged = event.converged
-            ref = event.body_result_seq
-            if ref is None:
-                ref = self._last_result_seq
-            node.loop_last_body = self._results_by_seq.get(ref)
-            node.loop_iters.append(LoopIterRecord(
-                seq=event.seq, commit=event.commit, converged=event.converged,
-                body=node.loop_last_body,
-            ))
-    def resume_action(self, key: NodeKey, floor: Floor) -> str:
-        node = self.nodes.get(key)
-        if node is None or floor is None or node.has_unfinished_dispatch(floor):
-            return "run"
-        if node.result is None or node.result_seq <= floor or not node.result.ok:
-            return "run"
-        if node.receipt_required and (
-            node.integrated_seq <= floor or node.integrated_seq <= node.result_seq
-        ):
-            return "run"
-        return "done"
-    def loop_resume(
-        self, key: NodeKey, floor: Floor
-    ) -> tuple[int, Floor, bool, Result | None]:
-        if floor is None:
-            return 0, None, False, None
-        node = self.nodes.get(key)
-        records = [] if node is None else [item for item in node.loop_iters if item.seq > floor]
-        if not records:
-            return 0, floor, False, None
-        last = records[-1]
-        return len(records), last.seq, last.converged, last.body
-    def node(self, key: NodeKey) -> NodeProjection:
-        return self.nodes.get(key, NodeProjection())
-    def result(self, key: NodeKey | None) -> Result | None:
-        if key is None:
-            return None
-        node = self.nodes.get(key)
-        return node.result if node is not None else None
-    def result_text(self, key: NodeKey) -> str | None:
-        result = self.result(key)
-        return result.text if result is not None else None
-    def epoch_opened(self, epoch: int) -> bool:
-        return epoch in self.epochs
-    def epoch_closed(self, epoch: int) -> bool:
-        value = self.epochs.get(epoch)
-        return value is not None and value.phase == "closed"
-    def epoch_expr(self, epoch: int) -> dict[str, object] | None:
-        value = self.epochs.get(epoch)
-        return value.expr if value is not None else None
-    def epoch_rails(self, epoch: int) -> Rails | None:
-        value = self.epochs.get(epoch)
-        return value.rails if value is not None else None
-    def pending_questions(self) -> list[OwnerQuestion]:
-        pending: list[OwnerQuestion] = []
-        for (epoch, node_id), node in self.nodes.items():
-            if (
-                node.question is not None
-                and node.asked_seq > node.answered_seq
-                and not self.epoch_closed(epoch)
-            ):
-                pending.append(OwnerQuestion(epoch, node_id, node.question, node.options))
-        return pending
-    @property
-    def results(self) -> dict[NodeKey, Result]:
-        return {key: node.result for key, node in self.nodes.items() if node.result is not None}
-    @property
-    def integrated(self) -> dict[NodeKey, list[str]]:
-        return {key: node.receipt.paths for key, node in self.nodes.items() if node.receipt}
-    @property
-    def receipts(self) -> dict[NodeKey, IntegrationReceipt]:
-        return {key: node.receipt for key, node in self.nodes.items() if node.receipt}
-    @property
-    def dispatched(self) -> set[NodeKey]:
-        return {key for key, node in self.nodes.items() if node.dispatched}
-    @property
-    def loop_iterations(self) -> dict[NodeKey, int]:
-        return {key: node.loop_iterations for key, node in self.nodes.items() if node.loop_iterations}
-    @property
-    def loop_last_commit(self) -> dict[NodeKey, str | None]:
-        return {
-            key: node.loop_last_commit for key, node in self.nodes.items()
-            if node.loop_last_iter_seq >= 0
-        }
-def replay(run_dir: Path) -> RunProjection:
-    from wildflows.journal import Journal
-    return Journal.load(run_dir).projection
+            call = self.calls[(event.frame_id, event.call_index)]
+            call.response = AskResult(answer=event.answer)
+            call.finished_seq = event.seq
+        elif isinstance(event, FrameExited):
+            frame = self.frames[event.frame_id]
+            frame.outcome = event.outcome
+            frame.text = event.text
+            frame.exit_code = event.exit_code
+            frame.stdout = event.stdout
+            frame.stderr = event.stderr
+            frame.head = event.head
+            frame.exited_seq = event.seq
+        elif isinstance(event, FrameIntegrating):
+            self.frames[event.frame_id].integrating = event
+        elif isinstance(event, FrameIntegrated):
+            frame = self.frames[event.frame_id]
+            frame.integrated = event
+            frame.integrating = None
+        elif isinstance(event, FramePopped):
+            frame = self.frames[event.frame_id]
+            frame.popped = True
+            frame.outcome = event.outcome
+        elif isinstance(event, RunFinished):
+            self.finished = event
+
+    def frame(self, frame_id: str) -> FrameProjection:
+        try:
+            return self.frames[frame_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown frame: {frame_id}") from exc
+
+    def call(self, frame_id: str, call_index: int) -> CallProjection | None:
+        return self.calls.get((frame_id, call_index))
+
+    def completed_calls(self, frame_id: str) -> list[CallProjection]:
+        values = [
+            call
+            for (owner, _), call in self.calls.items()
+            if owner == frame_id and call.completed
+        ]
+        return sorted(values, key=lambda call: call.call_index)
+
+    def next_call_index(self, frame_id: str) -> int:
+        indexes = [index for owner, index in self.calls if owner == frame_id]
+        return max(indexes, default=-1) + 1
+
+    def descendants(self, frame_id: str) -> list[FrameProjection]:
+        descendants: list[FrameProjection] = []
+        for candidate in self.frames.values():
+            parent = candidate.parent_frame_id
+            while parent is not None:
+                if parent == frame_id:
+                    descendants.append(candidate)
+                    break
+                ancestor = self.frames.get(parent)
+                parent = None if ancestor is None else ancestor.parent_frame_id
+        return descendants
+
+    def pending_questions(self) -> list[CallProjection]:
+        return sorted(
+            (
+                call
+                for call in self.calls.values()
+                if call.tool == "ask" and not call.completed
+            ),
+            key=lambda call: call.started_seq,
+        )
+
+    def resume_digest(self, frame_id: str) -> list[dict[str, object]]:
+        digest: list[dict[str, object]] = []
+        calls = sorted(
+            (call for (owner, _), call in self.calls.items() if owner == frame_id),
+            key=lambda call: call.call_index,
+        )
+        for call in calls:
+            response = call.response
+            response_data = None if response is None else response.model_dump(mode="json")
+            digest.append({
+                "call_index": call.call_index,
+                "tool": call.tool,
+                "content_hash": call.call_hash,
+                "request": call.request.model_dump(mode="json"),
+                "status": "completed" if call.completed else "pending",
+                "result": response_data,
+            })
+        return digest
+
+    def integrated_commits(self, frame_id: str) -> list[CommitReceipt]:
+        integrated = self.frame(frame_id).integrated
+        return [] if integrated is None else list(integrated.landed_commits)
