@@ -304,19 +304,51 @@ def test_kill_terminates_slow_scripted_run_and_leaves_resumable_tail(
     assert _json(lambda: client.get("/api/runs/slow-run"))["state"] == "crashed"
 
 
+def test_frontend_declares_binding_light_and_dark_theme_tokens() -> None:
+    root = Path(__file__).resolve().parents[1]
+    index = (root / "wildflows/dashboard/static/index.html").read_text(encoding="utf-8")
+    light = {
+        "--ground": "#fbfcfd", "--surface": "#ffffff", "--hairline": "#e6e8eb",
+        "--ink": "#17181a", "--muted": "#6e7378", "--violet-chip": "#e4e1ff",
+        "--violet": "#514bd8", "--blue-chip": "#dcecff", "--blue": "#1768b0",
+        "--teal-chip": "#d7f3ed", "--teal": "#006f64", "--amber-chip": "#ffebc7",
+        "--amber": "#965400", "--failure": "#c74652", "--success": "#2e9b5f",
+        "--dot-grid": "#dfdef2",
+    }
+    dark = {
+        "--ground": "#101114", "--surface": "#17181b", "--hairline": "#26282c",
+        "--ink": "#e8eaed", "--muted": "#9aa0a6", "--violet-chip": "#302c68",
+        "--violet": "#aaa7ff", "--blue-chip": "#173c65", "--blue": "#7fb9f4",
+        "--teal-chip": "#123f3a", "--teal": "#65d3c2", "--amber-chip": "#503716",
+        "--amber": "#f0b45f", "--failure": "#c76f75", "--success": "#55a977",
+        "--dot-grid": "#2a2939",
+    }
+    assert '<style id="theme-tokens">' in index
+    assert '[data-theme="dark"]' in index
+    assert "@media (prefers-color-scheme: dark)" in index
+    for token, value in light.items():
+        assert f"{token}: {value};" in index
+    for token, value in dark.items():
+        assert f"{token}: {value};" in index
+
+
 def test_frontend_tree_builder_is_pure_and_aggregates_state() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
     script = r'''
-import { buildTree } from "./wildflows/dashboard/static/tree.js";
-const expr = {kind:"dispatch",node_id:"n0",children:[
-  {kind:"do",node_id:"n0.0",task:"done",rig:{name:"x"}},
-  {kind:"ask",node_id:"n0.1",question:"choose"}
+import { buildTree, phaseLayout } from "./wildflows/dashboard/static/tree.js";
+const expr = {kind:"combine",node_id:"n0",task:"judge",rig:{name:"senior"},inputs:[
+  {kind:"dispatch",node_id:"n0.0",children:[
+    {kind:"do",node_id:"n0.0.0",task:"done",rig:{name:"x"}},
+    {kind:"ask",node_id:"n0.0.1",question:"choose"}
+  ]}
 ]};
-const tree = buildTree(expr,{"n0.0":{state:"integrated"},"n0.1":{state:"parked-ask"}});
-if (tree.state !== "parked-ask" || tree.children[0].label !== "done") process.exit(2);
-console.log(JSON.stringify(tree));
+const tree = buildTree(expr,{"n0.0.0":{state:"integrated"},"n0.0.1":{state:"parked-ask"}});
+const layout = phaseLayout(tree);
+if (tree.state !== "parked-ask" || tree.children[0].children[0].label !== "done") process.exit(2);
+if (JSON.stringify(layout.lanes.map(lane => lane.nodes.map(item => item.id))) !== JSON.stringify([["n0.0"],["n0.0.0","n0.0.1"],["n0"]])) process.exit(3);
+console.log(JSON.stringify({tree,layout}));
 '''
     root = Path(__file__).resolve().parents[1]
     syntax = subprocess.run(
@@ -329,4 +361,4 @@ console.log(JSON.stringify(tree));
         cwd=root, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["children"][1]["state"] == "parked-ask"
+    assert json.loads(result.stdout)["tree"]["children"][0]["children"][1]["state"] == "parked-ask"
