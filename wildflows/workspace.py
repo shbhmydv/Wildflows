@@ -180,7 +180,7 @@ class Repository:
             parents = self.git(["show", "-s", "--format=%P", sha]).stdout.split()
             if parents != [parent]:
                 raise IntegrationError("node commit range must be a linear fast-forward chain")
-            paths = self._paths(["diff", "--name-only", "-z", parent, sha], cwd=self.root)
+            paths = self._paths(["diff", "--name-only", "--no-renames", "-z", parent, sha], cwd=self.root)
             commits.append(CommitReceipt(sha=sha, paths=paths))
             parent = sha
         if parent != candidate:
@@ -218,20 +218,15 @@ class Repository:
     def _git_writer_is_live(uid: int) -> bool:
         procfs = Path("/proc")
         if not procfs.is_dir(): return True
-        try:
-            processes = list(procfs.iterdir())
-        except OSError:
-            return True
+        try: processes = list(procfs.iterdir())
+        except OSError: return True
         for process in (path for path in processes if path.name.isdigit()):
             try:
-                if process.stat().st_uid != uid:
-                    continue
+                if process.stat().st_uid != uid: continue
                 fields = (process / "stat").read_text(encoding="utf-8").split()
                 command = (process / "comm").read_text(encoding="utf-8").strip()
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            except (OSError, UnicodeError):
-                return True
+            except (FileNotFoundError, ProcessLookupError): continue
+            except (OSError, UnicodeError): return True
             if len(fields) > 2 and fields[2] != "Z" and (command == "git" or command.startswith("git-")):
                 return True
         return False
@@ -283,25 +278,31 @@ class Repository:
         return cleaned
     def _matches_resume_tree(self, base: str, candidate: str, path: str) -> bool:
         literal = ["--literal-pathspecs"]
-        status = self.git([*literal, "status", "--porcelain", "--untracked-files=all", "--", path]).stdout
-        if not status:
-            return True
+        status = self.git([*literal, "status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", path]).stdout
+        if not status: return True
         index_states = [self.git([
             *literal, "diff", "--cached", "--quiet", tree, "--", path
         ], check=False).returncode for tree in (base, candidate)]
         if 0 not in index_states: return False
-        if not status.startswith("?? "):
+        if not status.startswith(("?? ", "!! ")):
             worktrees = [self.git(
                 [*literal, "diff", "--quiet", tree, "--", path], check=False
             ).returncode for tree in (base, candidate)]
             return 0 in worktrees
         entry = self.git([*literal, "ls-tree", candidate, "--", path]).stdout.split()
         target = self.root / path
+        if len(entry) >= 3 and entry[0] == "120000" and target.is_symlink():
+            return os.readlink(target) == self.git(["cat-file", "blob", entry[2]]).stdout
         if len(entry) < 3 or target.is_symlink() or not target.is_file():
             return False
         mode = "100755" if os.access(target, os.X_OK) else "100644"
         hashed = self.git(["hash-object", f"--path={path}", "--", path], check=False)
         return entry[0] == mode and hashed.returncode == 0 and entry[2] == hashed.stdout.strip()
+    def sync_run_ref(self) -> None:
+        ref_path = self._lock_path(self.ref)
+        if not ref_path.exists(): ref_path = self._lock_path("packed-refs")
+        self._sync_path(ref_path)
+        self._sync_path(ref_path.parent, directory=True)
     def _sync_checkout(self, paths: list[str]) -> None:
         for target in [self._lock_path("index"), *(self.root / path for path in paths)]:
             if target.is_file() and not target.is_symlink():
@@ -360,9 +361,7 @@ class Repository:
         proc = self._move_ref(["update-ref", self.ref, fallback, missing], cwd=self.root)
         actual = self.branch_claim()
         if actual == fallback:
-            ref_path = self._lock_path(self.ref)
-            self._sync_path(ref_path)
-            self._sync_path(ref_path.parent, directory=True)
+            self.sync_run_ref()
             return cleaned
         detail = proc.stderr.strip() or proc.stdout.strip() or "compare-and-swap refused"
         if actual == missing:

@@ -25,6 +25,7 @@ from wildflows.expr import Do, Edit, Inplace, Loop, RigRef, Seq, Until
 from wildflows.projection import ExecutionOutcome
 from wildflows.journal import Journal
 from wildflows.result import Result
+from wildflows.workspace import Repository
 
 
 class CountingRig:
@@ -957,6 +958,106 @@ def test_interrupted_integration_preserves_mode_changed_candidate_addition(
 
     assert (repo / "added").exists()
     assert os.access(repo / "added", os.X_OK)
+
+
+def test_interrupted_integration_restores_both_sides_of_rename(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    (repo / "old").write_text("content", encoding="utf-8")
+    git(repo, "add", "old")
+    git(repo, "commit", "-qm", "base path")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "mv", "old", "new")
+    git(repo, "commit", "-qm", "rename")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    (repo / "old").unlink()
+    (repo / "new").write_text("content", encoding="utf-8")
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    assert engine.repo.restore_interrupted_integration(base, candidate) is False
+
+    assert (repo / "old").read_text(encoding="utf-8") == "content"
+    assert not (repo / "new").exists()
+    assert git(repo, "status", "--porcelain") == ""
+    assert engine.repo.receipt(base, candidate).paths == ["new", "old"]
+
+
+def test_interrupted_integration_restores_candidate_symlink_addition(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    (repo / "link").symlink_to("seed")
+    git(repo, "add", "link")
+    git(repo, "commit", "-qm", "symlink candidate")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    (repo / "link").symlink_to("seed")
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    assert engine.repo.restore_interrupted_integration(base, candidate) is False
+
+    assert not os.path.lexists(repo / "link")
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_interrupted_integration_preserves_changed_ignored_addition(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    (repo / ".gitignore").write_text("ignored\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-qm", "ignore candidate path")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / "ignored").write_text("candidate", encoding="utf-8")
+    git(repo, "add", "-f", "ignored")
+    git(repo, "commit", "-qm", "ignored candidate")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    (repo / "ignored").write_text("operator", encoding="utf-8")
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    with pytest.raises(RepositoryTransientError, match="changed outside"):
+        engine.repo.restore_interrupted_integration(base, candidate)
+
+    assert (repo / "ignored").read_text(encoding="utf-8") == "operator"
+
+
+def test_missing_claim_ref_is_resynced_before_repeated_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="target", content="candidate")])
+    engine = Engine(run_dir, repo, registry())
+    engine.run_epoch(tree, 0)
+    missing = git(repo, "rev-parse", "HEAD")
+    (repo / ".git" / "objects" / missing[:2] / missing[2:]).unlink()
+    sync = Repository.sync_run_ref
+    calls = 0
+
+    def crash_first_sync(self: Repository) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RepositoryTransientError("simulated ref sync crash")
+        sync(self)
+
+    monkeypatch.setattr(Repository, "sync_run_ref", crash_first_sync)
+    with pytest.raises(RepositoryTransientError, match="simulated ref sync crash"):
+        Engine(run_dir, repo, registry())
+
+    resumed = Engine(run_dir, repo, registry())
+    assert calls >= 2
+    assert any(
+        event.kind == "boundary" and event.fallback_from is not None
+        for event in resumed.journal.events()
+    )
 
 
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:

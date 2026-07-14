@@ -290,6 +290,7 @@ class Engine:
         )
         return True
     def _journal_fallback(self, epoch_id: int, start: int, text: str, tip: str) -> None:
+        self.repo.sync_run_ref()
         epoch = self._proj.epochs[epoch_id]
         self.journal.append(Boundary(
             run_id=self.run_id, epoch=epoch_id, node_id="n0", phase="opened",

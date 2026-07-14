@@ -1313,9 +1313,11 @@ than patching each row. Both are the transaction model of record — not a later
     stopped. Successful cleanup is named in the fallback boundary. Before journalling a
     checked-out result→integration fallback, every receipted path's index and worktree state
     must match either the verified base or the interrupted candidate; a third state is
-    preserved with a typed transient refusal. Parent-bound, path-scoped Git reset/restore
-    then returns those paths to the base and removes only verified candidate additions, so
-    a mid-checkout kill cannot leave unjournalled candidate files behind and unrelated
+    preserved with a typed transient refusal. Receipts disable rename collapsing so both
+    sides are restored; ignored additions and candidate file mode/type/blob (including
+    symlinks) are verified before removal. Parent-bound, path-scoped Git reset/restore then
+    returns those paths to the base and removes only verified candidate additions, so a
+    mid-checkout kill cannot leave unjournalled candidate files behind and unrelated
     worktree state is untouched. The restored index, files, deletions, and containing
     directories are fsynced before the fallback boundary.
 
@@ -1325,7 +1327,9 @@ than patching each row. Both are the transaction model of record — not a later
     rule 83 to any dead child's residue before retrying; a live/uncertain owner, failed
     index update, or unchanged claim after failed CAS is a typed transient retry rather
     than a raw Git `RepositoryError`. Restored tracked state and the CAS-updated ref are
-    fsynced before fallback publication. A different live claim remains typed divergence.
+    fsynced before fallback publication; every fallback also re-syncs the current run ref,
+    covering a crash after CAS but before its first sync. A different live claim remains
+    typed divergence.
 
 85. **M2 residue rule.** Parent death fences engine-owned ref-moving/index-writing Git
     children but is not filesystem cleanup. Checked-out integration now has an explicit
