@@ -465,12 +465,11 @@ class Engine:
         self, key: NodeKey, stage: str, fault: WorkspaceFault,
         recovery_action: Literal["fail", "retry"],
     ) -> NoReturn:
-        """Record the failed result marked `workspace_unclean` (honest: a live effect may
-        survive), then re-raise to HALT the epoch — the fault is durable in the journal and
-        no `boundary(closed)` is written for a workspace we could not clean."""
+        """Durably mark the workspace unclean, then halt without closing the epoch."""
         self.rec.record_result(key, Result(
             text=self._fail_text(f"{stage} failed, workspace UNCLEAN: {fault}", fault.diff_path),
-            outcome="failed"), post_head=self.ws.head_commit(), workspace_unclean=True,
+            outcome="failed"), post_head=None if fault.scope_broken else self.ws.head_commit(),
+            workspace_unclean=True,
             recovery_action=recovery_action)
         raise fault
 

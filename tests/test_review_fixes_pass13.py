@@ -15,6 +15,7 @@ import pytest
 from wildflows.engine import Engine, replay
 from wildflows.expr import Do, RigRef
 from wildflows.rig import EchoRig, RigRegistry, ShellRig
+from wildflows.workspace import WorkspaceEffects, WorkspaceFault
 
 from tests.test_review_fixes_pass12 import (
     _fork_engine,
@@ -73,6 +74,21 @@ def test_engine_process_launch_sites_are_all_explicitly_supervised() -> None:
         ("workspace.WorkspaceEffects.run_process", "os.fork"),
         ("workspace.WorkspaceEffects.run_predicate.execute", "subprocess.run"),
     ]
+
+
+def test_dead_core_scope_protocol_is_a_typed_workspace_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = WorkspaceEffects(tmp_path / "work", tmp_path / "run")
+    ws._core_scope = (1, 2)
+
+    def broken_write(_fd: int, _data: bytes) -> None:
+        raise BrokenPipeError("dead guardian")
+
+    monkeypatch.setattr(ws, "_write_all", broken_write)
+    with pytest.raises(WorkspaceFault, match="core Git process scope failed") as raised:
+        ws.git("status")
+    assert raised.value.scope_broken
 
 
 def test_core_git_scope_transports_non_utf8_temporary_index_path(

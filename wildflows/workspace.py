@@ -58,9 +58,12 @@ def _fs_path(wire: str) -> str:
 class WorkspaceFault(Exception):
     """An unproved effect/recovery; halt unclean and retain `diff_path` evidence."""
 
-    def __init__(self, message: str, diff_path: "Path | None" = None) -> None:
+    def __init__(
+        self, message: str, diff_path: "Path | None" = None, *, scope_broken: bool = False
+    ) -> None:
         super().__init__(message)
         self.diff_path = diff_path
+        self.scope_broken = scope_broken
 
 
 class LeaseRecord(BaseModel):
@@ -2280,14 +2283,17 @@ class WorkspaceEffects:
             input_b64=(None if input_data is None else
                        base64.b64encode(input_data).decode("ascii")),
         ).model_dump_json().encode("utf-8")
-        self._write_all(request_fd, len(request).to_bytes(8, "big") + request)
-        deadline = time.monotonic() + 300
-        size = int.from_bytes(self._read_exact(result_fd, 8, deadline), "big")
-        if size > 1024 * 1024 * 1024:
-            raise WorkspaceFault("core Git result exceeds 1 GiB")
-        response = GitResponse.model_validate_json(
-            self._read_exact(result_fd, size, deadline)
-        )
+        try:
+            self._write_all(request_fd, len(request).to_bytes(8, "big") + request)
+            deadline = time.monotonic() + 300
+            size = int.from_bytes(self._read_exact(result_fd, 8, deadline), "big")
+            if size > 1024 * 1024 * 1024:
+                raise WorkspaceFault("core Git result exceeds 1 GiB")
+            response = GitResponse.model_validate_json(
+                self._read_exact(result_fd, size, deadline)
+            )
+        except Exception as exc:
+            raise WorkspaceFault(f"core Git process scope failed: {exc}", scope_broken=True) from exc
         if response.error is not None:
             raise WorkspaceFault("cannot launch core Git: " + response.error)
         return subprocess.CompletedProcess(
