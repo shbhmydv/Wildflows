@@ -1452,3 +1452,96 @@ than patching each row. Both are the transaction model of record — not a later
     through stdin, process-group handles and Git ceilings match the ScriptRig boundary,
     and nonzero quota signatures retain the existing `busy` classification. Model calls
     are operator smoke tests; repository tests use fake transports on `PATH`.
+
+---
+
+## 12. v2 — the frame architecture (call-stack pivot, 2026-07-14)
+
+Owner-driven redesign settled live during DF1. Supersedes the epoch/expression
+execution model (§1–§4) as the target architecture; v1 remains the shipped
+baseline until v2 lands. The trigger: DF1 ran `loop(senior)` and the engine
+decapitated a working senior between iterations — grindstone's cold-attempt
+model wearing a new name. The founding requirement was an always-alive,
+in-context senior; disk-journal "resume" of a mind is not resume (owner:
+"you can't construct resume using disk journalling, it simply does not work").
+
+### The model
+
+98. **A run is a call stack of frames, not a declared expression.** A frame is
+    a resident agent process (pi/claude -p/codex exec) working in its own
+    worktree on its own branch. When a frame needs subordinate work it calls an
+    engine tool; the blocking tool call IS the bank — the parent's context
+    stays live in RAM at zero token cost while children grind. Structure is
+    discovered (journaled as it happens), not forecast. The planner dissolves
+    into the root frame: the war general runs the campaign in one persistent
+    head.
+
+99. **Most v1 primitives dissolve into agent control flow.** `seq` = the
+    caller makes calls in order; `loop` = the caller's own while(); `combine` =
+    the parent reading child results in-context. The engine tool surface is
+    exactly three (+setup as a dispatch flag): **`dispatch(tasks[], rig,
+    parallel?)`** — push child frame(s), block, return result text;
+    **`gate(cmd)`** — run a deterministic check in the caller's worktree,
+    return exit + full stdout AND stderr; **`ask(question)`** — park the frame
+    for the owner. Loops-as-engine-control-flow (`loop(senior)`) are the named
+    anti-pattern; engine-visible retry loops over disposable one-shot juniors
+    remain legitimate *inside* a parent's while().
+
+100. **Worktrees stack with the frames.** A child's worktree branches from the
+    parent's frame branch (never run root); on unwind the child's commits
+    integrate into the parent's branch only. Parallel siblings within a frame
+    keep the v1 disjoint-ownership merge. The run branch advances only when
+    the root frame commits. Worktrees live OUTSIDE the target repo tree
+    (DF1 defect: nested worktrees let Node resolution silently borrow the host
+    checkout's node_modules; the until-gate false-red that cost DF1 a wasted
+    second senior).
+
+101. **"State machine disposes" moves to the call boundary.** Every dispatch
+    passes engine admission: depth cap, breadth cap, per-subtree spend/time
+    rails, rig allowlist. The engine can refuse a frame. Every push/pop is a
+    journal event; child work is durable per-frame. Gates journal exit code
+    plus BOTH output streams (DF1 defect: stdout-only capture made the matrix
+    script's fatal error invisible).
+
+102. **Resume = replay with memoized tool calls.** No session-file
+    resurrection. On crash, the engine restarts each ancestor frame with its
+    original prompt + a structured digest of its completed calls and results
+    ("resume event — do not re-issue; continue"), carried by the default frame
+    skill so every frame handles resume identically (ONE ENTRY PATH scar:
+    resume classification lives in the engine, never per-case prompts). If a
+    resumed frame re-issues a completed call anyway, the engine matches it
+    (frame + call index + content hash) and returns the journaled result
+    instantly — the engine refuses to pay twice. Only the in-flight frontier
+    frame's uncommitted work is ever lost. Resident processes are thereby a
+    performance tier, not a durability requirement.
+
+103. **Standalone engine; MCP is the frame boundary.** The orchestrator is NOT
+    a pi extension: the supervisor must outlive the supervised (the engine
+    replays the stack; a passenger cannot). The engine serves one per-run MCP
+    endpoint (localhost + run token); the frame contract is "any agent process
+    that reads a prompt, works in a CWD, can call MCP tools, exits with text."
+    pi is the reference frame implementation (optional thin adapter shim, e.g.
+    abort-signal kill semantics); claude -p and codex exec are peers, so
+    heterogeneous stacks (claude root for vision/judgment, Sol sub-seniors,
+    local qwen juniors) are first-class. Rig-level: frames get per-frame
+    compaction/context settings via their CWD without writing .pi/ into gated
+    diffs; senior frames pin their pi-subagent roles to local backends (with
+    flock GPU pinning) for free in-context micro-delegation — that agentic
+    layer stays invisible to and ungated by the engine, by design.
+
+### Evidence
+
+104. **Mechanism smokes (2026-07-14).** Depth-1: headless `pi --print` with a
+    20-line extension banked 10s on a blocking custom tool and resumed with
+    the result verbatim. Depth-2: root pi → dispatch tool → engine spawned a
+    real child pi in a stacked worktree, child committed, engine ff-merged
+    into the parent branch on unwind, parent woke and verified the commit in
+    its own CWD. Both first-shot.
+
+105. **DF1 (dogfood 1) — WON, and the autopsy priced the pivot.** The senior
+    fixed the arc-stage defect family grindstone left acceptance-RED after 8
+    epochs/~5h: one iteration, 20m40s launch-to-integrated (`edaa7526`),
+    independently verified in a fresh worktree (Lesson 255/255, hang guard,
+    viewport matrix 4/4, rc=0). Both failures in the run were engine, not
+    model: the stdout-only false-red gate (§101) and the cold re-dispatch of
+    a fresh senior with an identical prompt (§98 exists to delete this).
