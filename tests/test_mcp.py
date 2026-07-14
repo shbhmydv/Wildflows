@@ -72,8 +72,8 @@ class FakeHandler:
         return AskResult(answer=f"answer: {request.question}")
 
 
-class BlockingGateHandler:
-    """A gate handler whose completion is controlled by a transport test."""
+class BlockingDispatchHandler:
+    """A dispatch handler whose completion is controlled by a transport test."""
 
     def __init__(self) -> None:
         self.started = threading.Event()
@@ -87,12 +87,15 @@ class BlockingGateHandler:
         request: ToolRequest,
     ) -> ToolResponse:
         del frame_id, call_index
-        assert tool == "gate"
-        assert isinstance(request, GateRequest)
+        assert tool == "dispatch"
+        assert isinstance(request, DispatchRequest)
         self.started.set()
         if not self.release.wait(timeout=5):
             raise RuntimeError("test handler was not released")
-        return GateResult(exit_code=0, stdout=request.cmd, stderr="")
+        return DispatchResult(
+            outcome="ok",
+            children=[ChildResult(frame_id="slow-child", outcome="ok", text="done")],
+        )
 
 
 class MemoizingBlockingGateHandler:
@@ -242,6 +245,23 @@ def gate_call_payload(call_index: int = 0) -> dict[str, object]:
     )
 
 
+def dispatch_call_payload(call_index: int = 0) -> dict[str, object]:
+    return rpc_request(
+        "tools/call",
+        call_index,
+        {
+            "name": "dispatch",
+            "arguments": {
+                "tasks": ["slow child"],
+                "rig": "echo",
+                "parallel": False,
+                "skills": [[]],
+            },
+            "_meta": {"wildflows": {"callIndex": call_index}},
+        },
+    )
+
+
 def test_mcp_heartbeat_interval_must_be_positive_and_finite() -> None:
     handler = FakeHandler()
     for interval in (0.0, -1.0, float("inf"), float("nan")):
@@ -249,8 +269,8 @@ def test_mcp_heartbeat_interval_must_be_positive_and_finite() -> None:
             MCPServer(handler, token=_TOKEN, heartbeat_interval=interval)
 
 
-def test_mcp_tool_call_streams_heartbeats_before_its_final_json_rpc_payload() -> None:
-    handler = BlockingGateHandler()
+def test_mcp_slow_dispatch_streams_heartbeats_before_its_final_json_rpc_payload() -> None:
+    handler = BlockingDispatchHandler()
     with MCPServer(handler, token=_TOKEN, heartbeat_interval=0.01) as server:
         endpoint = urlsplit(server.endpoint)
         assert endpoint.hostname == "127.0.0.1"
@@ -262,7 +282,7 @@ def test_mcp_tool_call_streams_heartbeats_before_its_final_json_rpc_payload() ->
             connection.request(
                 "POST",
                 endpoint.path,
-                body=json.dumps(gate_call_payload(12)).encode("utf-8"),
+                body=json.dumps(dispatch_call_payload(12)).encode("utf-8"),
                 headers={
                     "Authorization": f"Bearer {_TOKEN}",
                     "Content-Type": "application/json",
