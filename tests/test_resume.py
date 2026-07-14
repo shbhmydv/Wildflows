@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 
@@ -11,11 +12,12 @@ from wildflows.engine import Engine
 from wildflows.events import (
     DispatchCalled,
     DispatchReturned,
+    FrameExited,
     FrameIntegrated,
     FrameIntegrating,
     FramePushed,
 )
-from wildflows.frame import FrameResult, FrameRuntime
+from wildflows.frame import DispatchRequest, FrameResult, FrameRuntime, call_hash
 from wildflows.rig import RigRegistry
 
 
@@ -92,6 +94,68 @@ class ReplayRig:
             raise SimulatedKill()
         (workdir / "root.txt").write_text("resumed\n", encoding="utf-8")
         return FrameResult(text="root resumed", exit_code=0)
+
+
+class PartialParallelReplayRig:
+    """Replays a pending parallel call whose first child already exited."""
+
+    timeout_s = 30.0
+
+    def __init__(self) -> None:
+        self.dispatches = 0
+        self.reused_child_runs = 0
+        self.unfinished_child_runs = 0
+
+    @staticmethod
+    def _dispatch(runtime: FrameRuntime) -> dict[str, object]:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "tools/call",
+            "params": {
+                "name": "dispatch",
+                "arguments": {
+                    "tasks": ["completed child", "unfinished child"],
+                    "rig": "partial-replay",
+                    "parallel": True,
+                    "skills": [["long"], ["skill-selection"]],
+                },
+                "_meta": {"wildflows": {"callIndex": 0}},
+            },
+        }
+        request = urllib.request.Request(
+            runtime.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {runtime.token}",
+                "X-Wildflows-Frame": runtime.frame_id,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            decoded = json.load(response)
+        assert isinstance(decoded, dict)
+        return cast(dict[str, object], decoded)
+
+    def run(
+        self, prompt: str, workdir: Path, runtime: FrameRuntime
+    ) -> FrameResult:
+        del prompt
+        if runtime.frame_id == Engine.ROOT_FRAME_ID:
+            self.dispatches += 1
+            response = self._dispatch(runtime)
+            assert "result" in response
+            assert (workdir / "completed-child.txt").read_text(encoding="utf-8") == "reused\n"
+            assert (workdir / "unfinished-child.txt").read_text(encoding="utf-8") == "ran once\n"
+            (workdir / "root-after-replay.txt").write_text("done\n", encoding="utf-8")
+            return FrameResult(text="root resumed", exit_code=0)
+        if runtime.frame_id == "f0.c0.t0":
+            self.reused_child_runs += 1
+            raise AssertionError("the durable successful child must not rerun")
+        assert runtime.frame_id == "f0.c0.t1"
+        self.unfinished_child_runs += 1
+        (workdir / "unfinished-child.txt").write_text("ran once\n", encoding="utf-8")
+        return FrameResult(text="unfinished child complete", exit_code=0)
 
 
 def test_resume_reconciles_ref_move_after_frame_integrating_tear(
@@ -187,3 +251,165 @@ def test_resume_replays_stack_and_memoizes_completed_dispatch(
     pushes = [event for event in events if isinstance(event, FramePushed)]
     assert len([event for event in pushes if event.frame_id == "f0"]) == 2
     assert len([event for event in pushes if event.frame_id != "f0"]) == 1
+
+
+def test_resume_replays_only_unfinished_parallel_child_without_barrier(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "partial-parallel-run"
+    worktrees = tmp_path / "partial-parallel-worktrees"
+    rig = PartialParallelReplayRig()
+    request = DispatchRequest(
+        tasks=["completed child", "unfinished child"],
+        rig="partial-replay",
+        parallel=True,
+        skills=[["long"], ["skill-selection"]],
+    )
+    first = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"partial-replay": rig}),
+        run_id="partial-parallel",
+        root_rig="partial-replay",
+        root_prompt="resume a partial parallel dispatch",
+        worktrees_root=worktrees,
+    )
+    base = first.repository.branch_tip()
+    root_branch = first.repository.frame_branch(Engine.ROOT_FRAME_ID)
+    first.repository.git(["branch", root_branch.removeprefix("refs/heads/"), base])
+    first.journal.append(FramePushed(
+        run_id=first.run_id,
+        frame_id=Engine.ROOT_FRAME_ID,
+        attempt=0,
+        depth=0,
+        rig="partial-replay",
+        prompt="resume a partial parallel dispatch",
+        skills=[],
+        branch=root_branch,
+        base_commit=base,
+        worktree=str(worktrees / "lost-root"),
+        subtree_deadline=9_999_999_999.0,
+    ))
+    digest = call_hash("dispatch", request)
+    first.journal.append(DispatchCalled(
+        run_id=first.run_id,
+        frame_id=Engine.ROOT_FRAME_ID,
+        call_index=0,
+        call_hash=digest,
+        request=request,
+        caller_head=base,
+    ))
+
+    completed_id = "f0.c0.t0"
+    completed_branch = first.repository.frame_branch(completed_id)
+    completed_worktree = first.repository.create_frame_worktree(
+        completed_id, completed_branch, base, resume=False
+    )
+    (completed_worktree.path / "completed-child.txt").write_text(
+        "reused\n", encoding="utf-8"
+    )
+    completed_head = first.repository.commit_all(
+        completed_worktree.path, "durable completed child"
+    )
+    first.repository.remove_worktree(completed_worktree)
+    first.journal.append(FramePushed(
+        run_id=first.run_id,
+        frame_id=completed_id,
+        parent_frame_id=Engine.ROOT_FRAME_ID,
+        parent_call_index=0,
+        task_index=0,
+        attempt=0,
+        depth=1,
+        rig=request.rig,
+        prompt=request.tasks[0],
+        skills=request.skill_bundle(0),
+        branch=completed_branch,
+        base_commit=base,
+        worktree=str(completed_worktree.path),
+        subtree_deadline=9_999_999_999.0,
+    ))
+    first.journal.append(FrameExited(
+        run_id=first.run_id,
+        frame_id=completed_id,
+        attempt=0,
+        outcome="ok",
+        text="completed before interruption",
+        exit_code=0,
+        head=completed_head,
+    ))
+
+    unfinished_id = "f0.c0.t1"
+    unfinished_branch = first.repository.frame_branch(unfinished_id)
+    first.repository.git(["branch", unfinished_branch.removeprefix("refs/heads/"), base])
+    first.journal.append(FramePushed(
+        run_id=first.run_id,
+        frame_id=unfinished_id,
+        parent_frame_id=Engine.ROOT_FRAME_ID,
+        parent_call_index=0,
+        task_index=1,
+        attempt=0,
+        depth=1,
+        rig=request.rig,
+        prompt=request.tasks[1],
+        skills=request.skill_bundle(1),
+        branch=unfinished_branch,
+        base_commit=base,
+        worktree=str(worktrees / "lost-unfinished-child"),
+        subtree_deadline=9_999_999_999.0,
+    ))
+
+    def unexpected_barrier(parties: int) -> NoReturn:
+        pytest.fail(f"partial replay must not create a barrier for {parties} children")
+
+    monkeypatch.setattr("wildflows.engine.threading.Barrier", unexpected_barrier)
+    resumed = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"partial-replay": rig}),
+        run_id="partial-parallel",
+        root_rig="partial-replay",
+        root_prompt="resume a partial parallel dispatch",
+    )
+    started = time.monotonic()
+    assert resumed.run().outcome == "ok"
+    assert time.monotonic() - started < 10
+
+    assert rig.dispatches == 1
+    assert rig.reused_child_runs == 0
+    assert rig.unfinished_child_runs == 1
+    assert (repo / "completed-child.txt").read_text(encoding="utf-8") == "reused\n"
+    assert (repo / "unfinished-child.txt").read_text(encoding="utf-8") == "ran once\n"
+    assert (repo / "root-after-replay.txt").read_text(encoding="utf-8") == "done\n"
+
+    events = resumed.journal.events()
+    assert len([event for event in events if isinstance(event, DispatchCalled)]) == 1
+    returned = [event for event in events if isinstance(event, DispatchReturned)]
+    assert len(returned) == 1
+    assert [child.frame_id for child in returned[0].result.children] == [
+        completed_id,
+        unfinished_id,
+    ]
+    assert [child.outcome for child in returned[0].result.children] == ["ok", "ok"]
+    pushes = [event for event in events if isinstance(event, FramePushed)]
+    child_pushes = [event for event in pushes if event.parent_frame_id == "f0"]
+    assert [(event.frame_id, event.prompt, event.skills) for event in child_pushes] == [
+        (completed_id, request.tasks[0], request.skill_bundle(0)),
+        (unfinished_id, request.tasks[1], request.skill_bundle(1)),
+        (unfinished_id, request.tasks[1], request.skill_bundle(1)),
+    ]
+    assert len([
+        event for event in events
+        if isinstance(event, FrameExited) and event.frame_id == completed_id
+    ]) == 1
+    assert len([
+        event for event in events
+        if isinstance(event, FrameExited) and event.frame_id == unfinished_id
+    ]) == 1
+    assert len([
+        event for event in events
+        if isinstance(event, FrameIntegrated) and event.frame_id == completed_id
+    ]) == 1
+    assert len([
+        event for event in events
+        if isinstance(event, FrameIntegrated) and event.frame_id == unfinished_id
+    ]) == 1

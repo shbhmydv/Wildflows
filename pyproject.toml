@@ -21,6 +21,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["wildflows*"]
 
+[tool.setuptools.package-data]
+wildflows = ["skills/*.md"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

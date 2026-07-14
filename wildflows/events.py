@@ -48,6 +48,7 @@ class FramePushed(_Header):
     depth: int
     rig: str
     prompt: str
+    skills: list[str] = Field(default_factory=list)
     branch: str
     base_commit: str
     worktree: str

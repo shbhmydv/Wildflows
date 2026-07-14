@@ -11,21 +11,34 @@ from wildflows.admission import AdmissionPolicy
 from wildflows.engine import Engine
 from wildflows.events import (
     Answered,
+    DispatchCalled,
     DispatchReturned,
     FramePushed,
+    GateCalled,
     GateReturned,
 )
-from wildflows.frame import AskRequest
+from wildflows.frame import (
+    AskRequest,
+    GateRequest,
+    GateResult,
+    ToolName,
+    ToolRequest,
+    ToolResponse,
+)
+from wildflows.projection import FrameProjection
 from wildflows.rig import RigRegistry, ShellRig
+from wildflows.workspace import FrameWorktree
 from tests.conftest import executable
 
 
 _FAKE_AGENT = r'''#!/usr/bin/env python3
+import http.client
 import json
 import os
 import pathlib
 import threading
 import time
+from urllib.parse import urlsplit
 import urllib.request
 
 endpoint = os.environ["WILDFLOWS_MCP_URL"]
@@ -94,6 +107,94 @@ elif mode == "singleflight":
         [thread.join() for thread in threads]
         assert len(results) == 2
         print("single flight complete")
+elif mode == "ordered-concurrent":
+    if frame == "f0":
+        results = []
+        def gate(index, word):
+            results.append(call(index, "gate", {"cmd": "printf " + word}))
+        first = threading.Thread(target=gate, args=(0, "zero"))
+        second = threading.Thread(target=gate, args=(1, "one"))
+        first.start()
+        time.sleep(0.05)
+        second.start()
+        first.join()
+        second.join()
+        assert len(results) == 2
+        print("ordered concurrent calls complete")
+elif mode == "disconnect-refetch":
+    if frame == "f0":
+        parsed = urlsplit(endpoint)
+        assert parsed.hostname == "127.0.0.1" and parsed.port is not None
+        payload = json.dumps({
+            "jsonrpc": "2.0", "id": 0, "method": "tools/call",
+            "params": {
+                "name": "dispatch",
+                "arguments": {"tasks": ["slow child"], "rig": "fake", "parallel": False},
+                "_meta": {"wildflows": {"callIndex": 0}},
+            },
+        }, separators=(",", ":")).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+            "X-Wildflows-Frame": frame,
+        }
+        counter = pathlib.Path(os.environ["CHILD_COUNTER"])
+        release = pathlib.Path(os.environ["CHILD_RELEASE"])
+        first = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        retry = None
+        try:
+            first.request("POST", parsed.path, body=payload, headers=headers)
+            initial = first.getresponse()
+            assert initial.status == 200
+            assert initial.getheader("Transfer-Encoding") == "chunked"
+
+            deadline = time.monotonic() + 5
+            while not counter.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(counter.read_text().splitlines()) == 1, "slow child did not start"
+            first.close()
+
+            refetched = []
+            refetch_headers = threading.Event()
+            def refetch():
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+                try:
+                    connection.request("POST", parsed.path, body=payload, headers=headers)
+                    response = connection.getresponse()
+                    assert response.status == 200
+                    assert response.getheader("Transfer-Encoding") == "chunked"
+                    refetch_headers.set()
+                    refetched.append(json.loads(response.read())["result"])
+                finally:
+                    connection.close()
+            retry = threading.Thread(target=refetch)
+            retry.start()
+            assert refetch_headers.wait(timeout=5), "refetch did not receive headers"
+            deadline = time.monotonic() + 5
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert release.exists(), "test did not observe the live refetch"
+            retry.join(timeout=10)
+            assert not retry.is_alive(), "refetch did not complete"
+            assert len(refetched) == 1
+            (cwd / "disconnect-result.json").write_text(json.dumps(refetched[0]["structuredContent"]))
+            print("disconnect refetch root complete")
+        finally:
+            release.touch()
+            first.close()
+            if retry is not None:
+                retry.join(timeout=10)
+    else:
+        counter = pathlib.Path(os.environ["CHILD_COUNTER"])
+        with counter.open("a") as stream:
+            stream.write(str(os.getpid()) + "\n")
+        release = pathlib.Path(os.environ["CHILD_RELEASE"])
+        deadline = time.monotonic() + 5
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert release.exists(), "root never refetched the pending dispatch"
+        (cwd / "disconnect-child.txt").write_text("disconnect effect\n")
+        print("slow child complete")
 elif mode == "kill-resume":
     if frame == "f0":
         call(0, "dispatch", {"tasks": ["paid child"], "rig": "fake", "parallel": False})
@@ -244,6 +345,153 @@ def test_duplicate_live_call_is_single_flight_and_memoized(
     assert (repo / "gate-count.txt").read_text(encoding="utf-8") == "run\n"
     gates = [event for event in engine.journal.events() if isinstance(event, GateReturned)]
     assert len(gates) == 1
+
+
+def test_concurrent_later_call_waits_for_live_earlier_index(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    engine = _engine(repo, tmp_path, monkeypatch, "ordered-concurrent")
+    first_gate_entered = threading.Event()
+    later_call_entered = threading.Event()
+    release_first_gate = threading.Event()
+    original_gate = engine._gate  # noqa: SLF001 - ordering regression seam
+    original_handle_tool = engine.handle_tool
+
+    def delayed_gate(
+        frame: FrameProjection,
+        worktree: FrameWorktree,
+        call_index: int,
+        digest: str,
+        request: GateRequest,
+        replaying: bool,
+    ) -> GateResult:
+        if call_index == 0:
+            first_gate_entered.set()
+            assert release_first_gate.wait(timeout=5)
+        return original_gate(
+            frame, worktree, call_index, digest, request, replaying
+        )
+
+    def observe_handle_tool(
+        frame_id: str,
+        call_index: int,
+        tool: ToolName,
+        request: ToolRequest,
+    ) -> ToolResponse:
+        if frame_id == "f0" and call_index == 1:
+            later_call_entered.set()
+        return original_handle_tool(frame_id, call_index, tool, request)
+
+    monkeypatch.setattr(engine, "_gate", delayed_gate)
+    monkeypatch.setattr(engine, "handle_tool", observe_handle_tool)
+
+    def release_in_order() -> None:
+        if first_gate_entered.wait(timeout=5) and later_call_entered.wait(timeout=5):
+            release_first_gate.set()
+
+    releaser = threading.Thread(target=release_in_order)
+    releaser.start()
+    assert engine.run().outcome == "ok"
+    releaser.join(timeout=5)
+    assert not releaser.is_alive()
+    assert first_gate_entered.is_set() and later_call_entered.is_set()
+    events = engine.journal.events()
+    assert [event.call_index for event in events if isinstance(event, GateCalled)] == [0, 1]
+    returned = [event for event in events if isinstance(event, GateReturned)]
+    assert [event.call_index for event in returned] == [0, 1]
+    assert [event.result.stdout for event in returned] == ["zero", "one"]
+
+
+def test_disconnect_mid_dispatch_refetches_the_engine_single_flight_once(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    counter = tmp_path / "disconnect-child-counter"
+    release = tmp_path / "disconnect-child-release"
+    monkeypatch.setenv("CHILD_COUNTER", str(counter))
+    monkeypatch.setenv("CHILD_RELEASE", str(release))
+    engine = _engine(repo, tmp_path, monkeypatch, "disconnect-refetch")
+    original_handle_tool = engine.handle_tool
+    live_refetch_entered = threading.Event()
+    entry_lock = threading.Lock()
+    matching_entries = 0
+
+    def observe_handle_tool(
+        frame_id: str,
+        call_index: int,
+        tool: ToolName,
+        request: ToolRequest,
+    ) -> ToolResponse:
+        nonlocal matching_entries
+        if frame_id == "f0" and call_index == 0 and tool == "dispatch":
+            with entry_lock:
+                matching_entries += 1
+                if matching_entries == 2:
+                    live_refetch_entered.set()
+        return original_handle_tool(frame_id, call_index, tool, request)
+
+    monkeypatch.setattr(engine, "handle_tool", observe_handle_tool)
+
+    def release_after_live_refetch() -> None:
+        if live_refetch_entered.wait(timeout=10):
+            release.write_text("release\n", encoding="utf-8")
+
+    releaser = threading.Thread(target=release_after_live_refetch)
+    releaser.start()
+    assert engine.run().outcome == "ok"
+    releaser.join(timeout=10)
+    assert not releaser.is_alive()
+    assert live_refetch_entered.is_set()
+    assert matching_entries == 2
+    returned_payload = json.loads(
+        (repo / "disconnect-result.json").read_text(encoding="utf-8")
+    )
+    child = engine.projection.frame("f0.c0.t0")
+    assert child.integrated is not None
+    expected = {
+        "outcome": "ok",
+        "children": [
+            {
+                "frame_id": "f0.c0.t0",
+                "outcome": "ok",
+                "text": "slow child complete\n",
+                "exit_code": 0,
+                "commits": [
+                    receipt.model_dump(mode="json")
+                    for receipt in child.integrated.landed_commits
+                ],
+            }
+        ],
+        "error_code": None,
+        "message": None,
+    }
+    assert returned_payload == expected
+    assert (repo / "disconnect-child.txt").read_text(encoding="utf-8") == (
+        "disconnect effect\n"
+    )
+    assert len(counter.read_text(encoding="utf-8").splitlines()) == 1
+
+    events = engine.journal.events()
+    pushes = [event for event in events if isinstance(event, FramePushed)]
+    child_pushes = [event for event in pushes if event.parent_frame_id == "f0"]
+    assert len(child_pushes) == 1
+    assert child_pushes[0].frame_id == "f0.c0.t0"
+    assert child_pushes[0].parent_call_index == 0
+    called = [event for event in events if isinstance(event, DispatchCalled)]
+    returned = [event for event in events if isinstance(event, DispatchReturned)]
+    assert len(called) == len(returned) == 1
+    assert called[0].frame_id == returned[0].frame_id == "f0"
+    assert called[0].call_index == returned[0].call_index == 0
+    assert called[0].request.model_dump(mode="json") == {
+        "tasks": ["slow child"],
+        "rig": "fake",
+        "parallel": False,
+        "skills": [[]],
+    }
+    assert returned[0].result.model_dump(mode="json") == returned_payload
 
 
 def test_ask_parks_until_owner_answer(

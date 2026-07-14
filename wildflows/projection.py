@@ -42,6 +42,7 @@ class FrameProjection:
     depth: int
     rig: str
     prompt: str
+    skills: list[str]
     branch: str
     base_commit: str
     worktree: str
@@ -100,6 +101,7 @@ class RunProjection:
                     depth=event.depth,
                     rig=event.rig,
                     prompt=event.prompt,
+                    skills=list(event.skills),
                     branch=event.branch,
                     base_commit=event.base_commit,
                     worktree=event.worktree,
@@ -218,14 +220,17 @@ class RunProjection:
         for call in calls:
             response = call.response
             response_data = None if response is None else response.model_dump(mode="json")
-            digest.append({
+            item: dict[str, object] = {
                 "call_index": call.call_index,
                 "tool": call.tool,
                 "content_hash": call.call_hash,
                 "request": call.request.model_dump(mode="json"),
                 "status": "completed" if call.completed else "pending",
                 "result": response_data,
-            })
+            }
+            if isinstance(call.request, DispatchRequest):
+                item["skills"] = [list(bundle) for bundle in call.request.skills]
+            digest.append(item)
         return digest
 
     def integrated_commits(self, frame_id: str) -> list[CommitReceipt]:

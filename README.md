@@ -6,8 +6,9 @@ Wildflows v2 is a standalone supervisor for long-running agent work. A run start
 root frame in an external Git worktree. That resident agent owns strategy and ordinary
 control flow; when it needs help it calls one of three authenticated engine tools:
 
-- `dispatch(tasks[], rig, parallel?)` pushes child frames and blocks until their
-  committed work is integrated into the caller's frame branch;
+- `dispatch(tasks[], rig, parallel?, skills?)` pushes child frames and blocks until
+  their committed work is integrated into the caller's frame branch; `skills` is one
+  ordered skill-name list per task;
 - `gate(cmd)` runs a deterministic check in the caller's worktree and returns the exit
   code plus complete stdout **and** stderr;
 - `ask(question)` parks the frame until its owner supplies an answer.
@@ -31,8 +32,15 @@ journalled result without launching another agent or rerunning a gate. Only the
 frontier frame's uncommitted work is disposable.
 
 Dispatch admission is enforced before child effects: depth, breadth, subtree frame,
-spend/time, and rig-allowlist rails. The per-run MCP-compatible JSON-RPC endpoint binds
-an ephemeral `127.0.0.1` port and requires its random bearer token.
+spend/time, and rig-allowlist rails. Skills are prompt data and do not change admission.
+Repository Markdown skills in `.wildflows/skills/` shadow bundled stock skills. Every
+frame receives its assigned skill texts, job, the full skill manifest, then the engine
+tool preamble.
+
+The per-run MCP-compatible JSON-RPC endpoint binds an ephemeral `127.0.0.1` port and
+requires its random bearer token. Banked tool calls use HTTP/1.1 chunked whitespace
+heartbeats. A disconnected Pi shim retries the same hidden call identity, allowing the
+engine's durable single flight to return the original result without recomposed work.
 
 ## Run
 

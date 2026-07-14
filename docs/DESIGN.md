@@ -1648,3 +1648,57 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      parent-death-bound leader plus same-process-group watchdog, so supervisor
      death kills ordinary descendants while abandoned worktree paths remain
      never reused.
+
+### Hand-30 calls
+
+117. **Skills are prompt data, not capability.** A dispatch accepts an optional
+     ordered skill bundle for EACH task (`skills: list[list[str]]`); omission is
+     canonically one empty bundle per task. Per-task bundles are required because
+     siblings at different tiers need different steering. Skill names do not
+     participate in admission, rig allowlists, or spend reservation. The library
+     is frontmatter-free Markdown loaded from `<target>/.wildflows/skills/*.md`
+     over the packaged `wildflows/skills/*.md`; a repository file shadows a
+     bundled file with the same stem. The filename stem is the name and the
+     required first `# title — one-line description` heading supplies the
+     manifest description.
+
+118. **The engine owns one prompt assembly order.** Every launch, including a
+     replayed frame, receives: assigned skill files in declared list order and
+     in full; then the frame job/task; then a deterministic `SKILL MANIFEST` of
+     every resolved library name and first-line description; then the engine tool
+     preamble. This final preamble carries replay instructions/digest. A committed
+     `progress.md` is included in that digest on replay. The manifest is the
+     discovery surface by which a frame can select small bundles for children;
+     stock `skill-selection`, `long`, and `plan-compress-execute` skills ship as
+     package data.
+
+119. **Skill identity is durable call identity.** `frame_pushed` records the
+     frame's assigned skill names. Validated dispatch requests normalize empty
+     bundles before the canonical SHA-256 is computed, so omitted and explicit
+     empty bundles share one identity while the same tasks with different skill
+     names or order are a cache miss. Projection replay retains the bundles and
+     every dispatch entry in a resumed frame's call digest shows the per-task
+     skills it used. A resumed child must match its durable prompt, rig, task
+     position, and assigned skills.
+
+120. **Banked MCP calls use chunked whitespace heartbeats.** A valid id-bearing
+     `tools/call` starts an HTTP/1.1 chunked JSON response before execution, runs
+     the typed handler independently of the client socket, writes a whitespace
+     chunk every 15 seconds while pending, then writes one JSON-RPC object and the
+     terminal chunk. JSON permits the leading whitespace, and periodic body bytes
+     survive intermediary/node-fetch idle timeouts without a second protocol.
+     Broken-pipe/reset writes end only that response stream: the engine operation
+     continues to its durable memoized return and produces no disconnect traceback.
+
+121. **The Pi shim reconnects one frozen request.** It allocates the hidden call
+     index once, serializes one request body, and retries that exact body with
+     bounded exponential delay after fetch rejection, HTTP failure, interrupted
+     or malformed JSON, or malformed response/result framing. None of those
+     transport failures becomes model-visible tool output. A valid JSON-RPC
+     engine/protocol error remains terminal; ordinary admission refusals and rig
+     failures remain typed tool results. An explicit Pi abort stops retry rather
+     than spinning and seals that attempt's local call frontier, so no later index
+     can pass an ambiguously delivered call; process replay reconstructs the
+     durable frontier. A live retry preserves `(frame, index, canonical hash)` and
+     joins the engine's existing single flight. Distinct concurrent later indexes
+     wait behind an earlier in-flight index even before its called event is durable.

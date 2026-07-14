@@ -95,6 +95,7 @@ const frameId = {_literal(frame_id)};
 let nextCallIndex = {next_call_index};
 const replayCalls: Array<{{callIndex: number; name: string; arguments: Record<string, unknown>}}> = {json.dumps(replay, ensure_ascii=False)};
 const claimedReplayCalls = new Set<number>();
+let sealedFrontierError: Error | undefined;
 
 type TextContent = {{ type: "text"; text: string }};
 type ToolResult = {{
@@ -107,12 +108,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {{
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }}
 
-function errorText(value: unknown): string {{
+class EngineCallError extends Error {{}}
+
+function engineError(value: unknown): EngineCallError | undefined {{
   if (!isRecord(value) || typeof value.code !== "number" ||
       typeof value.message !== "string") {{
-    throw new Error("wildflows: malformed JSON-RPC error");
+    return undefined;
   }}
-  return `wildflows MCP error ${{value.code}}: ${{value.message}}`;
+  return new EngineCallError(
+    `wildflows MCP error ${{value.code}}: ${{value.message}}`,
+  );
 }}
 
 function toolResult(value: unknown): ToolResult {{
@@ -149,14 +154,42 @@ function allocateCallIndex(
   return nextCallIndex++;
 }}
 
-async function callTool(
-  name: string,
-  arguments_: Record<string, unknown>,
+const retryInitialDelayMs = 100;
+const retryMaximumDelayMs = 1_000;
+
+function abortError(): Error {{
+  return new Error("wildflows: tool call aborted");
+}}
+
+function throwIfAborted(signal: AbortSignal): void {{
+  if (signal.aborted) {{
+    throw abortError();
+  }}
+}}
+
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {{
+  return new Promise((resolve, reject) => {{
+    if (signal.aborted) {{
+      reject(abortError());
+      return;
+    }}
+    const onAbort = () => {{
+      clearTimeout(timer);
+      reject(abortError());
+    }};
+    const timer = setTimeout(() => {{
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }}, delayMs);
+    signal.addEventListener("abort", onAbort, {{ once: true }});
+  }});
+}}
+
+async function callAttempt(
+  body: string,
+  callIndex: number,
   signal: AbortSignal,
 ): Promise<ToolResult> {{
-  // Allocate before awaiting fetch, so concurrent Pi tool calls cannot reuse an
-  // index. Exact calls from a replay digest reclaim their durable logical index.
-  const callIndex = allocateCallIndex(name, arguments_);
   const response = await fetch(endpoint, {{
     method: "POST",
     headers: {{
@@ -164,38 +197,73 @@ async function callTool(
       Authorization: `Bearer ${{token}}`,
       "X-Wildflows-Frame": frameId,
     }},
-    body: JSON.stringify({{
-      jsonrpc: "2.0",
-      id: callIndex,
-      method: "tools/call",
-      params: {{
-        name,
-        arguments: arguments_,
-        _meta: {{ wildflows: {{ callIndex }} }},
-      }},
-    }}),
+    body,
     signal,
   }});
   if (!response.ok) {{
     throw new Error(`wildflows MCP HTTP ${{response.status}}`);
   }}
-
-  let payload: unknown;
-  try {{
-    payload = await response.json();
-  }} catch {{
-    throw new Error("wildflows: MCP response was not JSON");
-  }}
+  const payload: unknown = await response.json();
   if (!isRecord(payload) || payload.jsonrpc !== "2.0" || payload.id !== callIndex) {{
     throw new Error("wildflows: malformed JSON-RPC response");
   }}
   if ("error" in payload) {{
-    throw new Error(errorText(payload.error));
+    const error = engineError(payload.error);
+    if (error !== undefined) {{
+      throw error;
+    }}
+    throw new Error("wildflows: malformed JSON-RPC error");
   }}
   if (!("result" in payload)) {{
     throw new Error("wildflows: JSON-RPC response omitted result");
   }}
   return toolResult(payload.result);
+}}
+
+async function callTool(
+  name: string,
+  arguments_: Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<ToolResult> {{
+  // Allocate before awaiting fetch, so concurrent Pi tool calls cannot reuse an
+  // index. Exact calls from a replay digest reclaim their durable logical index.
+  if (sealedFrontierError !== undefined) {{
+    throw sealedFrontierError;
+  }}
+  throwIfAborted(signal);
+  const callIndex = allocateCallIndex(name, arguments_);
+  const body = JSON.stringify({{
+    jsonrpc: "2.0",
+    id: callIndex,
+    method: "tools/call",
+    params: {{
+      name,
+      arguments: arguments_,
+      _meta: {{ wildflows: {{ callIndex }} }},
+    }},
+  }});
+  let delayMs = retryInitialDelayMs;
+  try {{
+    for (;;) {{
+      throwIfAborted(signal);
+      try {{
+        return await callAttempt(body, callIndex, signal);
+      }} catch (error) {{
+        throwIfAborted(signal);
+        if (error instanceof EngineCallError) {{
+          throw error;
+        }}
+        await waitForRetry(delayMs, signal);
+        delayMs = Math.min(delayMs * 2, retryMaximumDelayMs);
+      }}
+    }}
+  }} catch (error) {{
+    if (signal.aborted) {{
+      sealedFrontierError = abortError();
+      throw sealedFrontierError;
+    }}
+    throw error;
+  }}
 }}
 
 function piResult(result: ToolResult) {{
@@ -217,12 +285,18 @@ export default function (pi: ExtensionAPI) {{
       tasks: Type.Array(Type.String({{ description: "Self-contained child task" }})),
       rig: Type.String({{ description: "Allowed wildflows rig name" }}),
       parallel: Type.Optional(Type.Boolean({{ description: "Run siblings in parallel" }})),
+      skills: Type.Optional(Type.Array(Type.Array(Type.String({{
+        description: "Bundled skill name for this task",
+      }}), {{ description: "Ordered skill bundle for one task" }}), {{
+        description: "One ordered skill-name list per task",
+      }})),
     }}),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {{
       return piResult(await callTool("dispatch", {{
         tasks: params.tasks,
         rig: params.rig,
         parallel: params.parallel ?? false,
+        skills: params.skills ?? params.tasks.map(() => []),
       }}, signal));
     }},
   }});

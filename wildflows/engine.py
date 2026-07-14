@@ -47,6 +47,7 @@ from wildflows.projection import FrameProjection, RunProjection
 from wildflows.result import CommitReceipt
 from wildflows.rig import RigRegistry, run_shell
 from wildflows.shim import write_pi_shim
+from wildflows.skill import SkillLibrary, SkillLibraryError
 from wildflows.workspace import (
     FrameWorktree,
     IntegrationError,
@@ -156,6 +157,7 @@ class Engine:
                 started_at=started,
                 policy=self.policy,
             ))
+        self.skill_library = SkillLibrary(self.repository.root)
         self._restore_dispatch_reservations()
         self.server = MCPServer(self)
 
@@ -208,6 +210,7 @@ class Engine:
                     depth=0,
                     rig=opened.root_rig,
                     prompt=opened.root_prompt,
+                    skills=[],
                     base_commit=opened.base_commit,
                     subtree_deadline=opened.started_at + self.policy.subtree_timeout_s,
                 )
@@ -261,6 +264,12 @@ class Engine:
                         raise CallConflictError(
                             f"call {frame_id}:{call_index} conflicts with its live call"
                         )
+                    self._call_condition.wait()
+                    continue
+                if any(
+                    owner == frame_id and index < call_index
+                    for owner, index in self._inflight_calls
+                ):
                     self._call_condition.wait()
                     continue
                 lower_pending = [
@@ -367,14 +376,28 @@ class Engine:
                 return refused
 
         try:
+            for bundle in request.skills:
+                self.skill_library.resolve(bundle)
+        except SkillLibraryError as exc:
+            self._clear_dispatch_reservation(frame.frame_id, call_index)
+            failed = DispatchResult(outcome="failed", message=str(exc))
+            self.journal.append(DispatchReturned(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                result=failed,
+            ))
+            return failed
+
+        try:
             results = (
                 self._parallel_children(frame, worktree, call_index, request)
                 if request.parallel and len(request.tasks) > 1
                 else self._serial_children(frame, worktree, call_index, request)
             )
         finally:
-            if not replaying:
-                self._clear_dispatch_reservation(frame.frame_id, call_index)
+            self._clear_dispatch_reservation(frame.frame_id, call_index)
         outcome: FrameOutcome = (
             "ok" if all(result.outcome == "ok" for result in results) else "failed"
         )
@@ -513,7 +536,12 @@ class Engine:
         results: list[ChildResult] = []
         for task_index, task in enumerate(request.tasks):
             child = self._execute_child(
-                parent, call_index, task_index, task, request.rig,
+                parent,
+                call_index,
+                task_index,
+                task,
+                request.rig,
+                request.skill_bundle(task_index),
                 base_commit=self.repository.branch_tip(parent.branch),
             )
             results.append(self._finish_child(
@@ -548,7 +576,18 @@ class Engine:
         base = self.repository.branch_tip(parent.branch)
         by_index: dict[int, ChildResult] = {}
         owned = self._parallel_owned_paths(parent.frame_id, call_index)
-        start_barrier = threading.Barrier(len(request.tasks))
+        launching = sum(
+            1
+            for task_index in range(len(request.tasks))
+            if (
+                (existing := self.journal.projection.frames.get(
+                    self._child_id(parent.frame_id, call_index, task_index)
+                ))
+                is None
+                or existing.outcome is None
+            )
+        )
+        start_barrier = threading.Barrier(launching) if launching > 1 else None
         with ThreadPoolExecutor(max_workers=len(request.tasks)) as executor:
             futures: dict[Future[FrameProjection], int] = {}
             for task_index, task in enumerate(request.tasks):
@@ -559,6 +598,7 @@ class Engine:
                     task_index,
                     task,
                     request.rig,
+                    request.skill_bundle(task_index),
                     base_commit=base,
                     start_barrier=start_barrier,
                 )
@@ -587,6 +627,7 @@ class Engine:
         task_index: int,
         task: str,
         rig: str,
+        skills: list[str],
         *,
         base_commit: str,
         start_barrier: threading.Barrier | None = None,
@@ -600,6 +641,7 @@ class Engine:
                 or existing.task_index != task_index
                 or existing.prompt != task
                 or existing.rig != rig
+                or existing.skills != skills
             ):
                 raise CallConflictError(f"durable child identity differs for {frame_id}")
             if existing.outcome is not None:
@@ -612,6 +654,7 @@ class Engine:
             depth=parent.depth + 1,
             rig=rig,
             prompt=task,
+            skills=skills,
             base_commit=existing.base_commit if existing is not None else base_commit,
             subtree_deadline=parent.subtree_deadline,
             start_barrier=start_barrier,
@@ -679,6 +722,7 @@ class Engine:
         depth: int,
         rig: str,
         prompt: str,
+        skills: list[str],
         base_commit: str,
         subtree_deadline: float,
         start_barrier: threading.Barrier | None = None,
@@ -701,6 +745,7 @@ class Engine:
             depth=depth,
             rig=rig,
             prompt=prompt,
+            skills=list(skills),
             branch=branch,
             base_commit=base_commit,
             worktree=str(worktree.path),
@@ -751,7 +796,9 @@ class Engine:
                 next_call_index=self.journal.projection.next_call_index(frame_id),
             )
             result = self.registry.resolve(rig).run(
-                self._frame_prompt(frame_id, prompt), worktree.path, runtime
+                self._frame_prompt(frame_id, prompt, skills, worktree.path),
+                worktree.path,
+                runtime,
             )
             if result.outcome == "ok":
                 try:
@@ -800,16 +847,34 @@ class Engine:
             with self._workspace_lock:
                 self.repository.remove_worktree(worktree)
 
-    def _frame_prompt(self, frame_id: str, original: str) -> str:
-        digest = self.journal.projection.resume_digest(frame_id)
-        resume = bool(digest) or self.journal.projection.frame(frame_id).push_count > 1
+    def _frame_prompt(
+        self,
+        frame_id: str,
+        original: str,
+        assigned_skills: list[str],
+        worktree: Path,
+    ) -> str:
+        skills = self.skill_library.resolve(assigned_skills)
+        calls = self.journal.projection.resume_digest(frame_id)
+        resume = bool(calls) or self.journal.projection.frame(frame_id).push_count > 1
+        progress_path = worktree / "progress.md"
+        progress_note = (
+            progress_path.read_text(encoding="utf-8")
+            if resume and progress_path.is_file()
+            else None
+        )
         preamble = (
             "You are a WILDFLOWS frame. Work only in your CWD. Commit useful changes "
             "before calling an engine tool or exiting. The only engine tools are "
             "wildflows_dispatch, wildflows_gate, and wildflows_ask. Tool calls block; "
-            "child commits are present in your branch when dispatch returns.\n"
+            "child commits are present in your branch when dispatch returns. Dispatch "
+            "skills is optional and contains one ordered skill-name list per task.\n"
         )
         if resume:
+            digest: dict[str, object] = {
+                "calls": calls,
+                "progress_note": progress_note,
+            }
             preamble += (
                 "\nRESUME REPLAY: completed calls below are durable and must not be paid "
                 "for again. Do not re-issue completed calls; continue from their results. "
@@ -818,7 +883,13 @@ class Engine:
                 "and content, the engine returns its memoized result.\n"
                 f"RESUME_DIGEST={json.dumps(digest, sort_keys=True, separators=(',', ':'))}\n"
             )
-        return f"{preamble}\n--- ORIGINAL FRAME PROMPT ---\n{original}"
+        sections = [skill.text for skill in skills]
+        sections.extend([
+            f"--- FRAME JOB ---\n{original}",
+            self.skill_library.manifest(),
+            f"--- TOOL PREAMBLE ---\n{preamble}",
+        ])
+        return "\n\n".join(sections)
 
     def _integrate_frame(
         self,

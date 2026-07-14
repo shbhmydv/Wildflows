@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wildflows.result import CommitReceipt
 
@@ -31,6 +31,7 @@ class DispatchRequest(_ToolRequestBase):
     tasks: list[str] = Field(min_length=1)
     rig: str = Field(min_length=1)
     parallel: bool = False
+    skills: list[list[str]] = Field(default_factory=list)
 
     @field_validator("tasks")
     @classmethod
@@ -38,6 +39,21 @@ class DispatchRequest(_ToolRequestBase):
         if any(not value.strip() for value in values):
             raise ValueError("dispatch tasks must be non-blank")
         return values
+
+    @model_validator(mode="after")
+    def _per_task_skill_bundles(self) -> "DispatchRequest":
+        # Omission is canonicalized to one empty bundle per task. This keeps an
+        # omitted bundle and explicit no-skill bundles at one memoization identity.
+        if not self.skills:
+            self.skills = [[] for _ in self.tasks]
+        if len(self.skills) != len(self.tasks):
+            raise ValueError("dispatch skills must contain one list per task")
+        if any(not name.strip() for bundle in self.skills for name in bundle):
+            raise ValueError("dispatch skill names must be non-blank")
+        return self
+
+    def skill_bundle(self, task_index: int) -> list[str]:
+        return list(self.skills[task_index])
 
 
 class GateRequest(_ToolRequestBase):
@@ -82,6 +98,8 @@ class DispatchResult(BaseModel):
     def as_text(self) -> str:
         if self.outcome == "refused":
             return f"dispatch refused [{self.error_code}]: {self.message}"
+        if not self.children and self.message:
+            return self.message
         blocks = [
             f"[{child.frame_id}] {child.outcome} (exit={child.exit_code})\n{child.text}"
             for child in self.children

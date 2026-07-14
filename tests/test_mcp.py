@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 import http.client
 import json
+import threading
 from typing import cast
+
+import pytest
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -67,6 +70,76 @@ class FakeHandler:
         assert tool == "ask"
         assert isinstance(request, AskRequest)
         return AskResult(answer=f"answer: {request.question}")
+
+
+class BlockingGateHandler:
+    """A gate handler whose completion is controlled by a transport test."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def handle_tool(
+        self,
+        frame_id: str,
+        call_index: int,
+        tool: ToolName,
+        request: ToolRequest,
+    ) -> ToolResponse:
+        del frame_id, call_index
+        assert tool == "gate"
+        assert isinstance(request, GateRequest)
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test handler was not released")
+        return GateResult(exit_code=0, stdout=request.cmd, stderr="")
+
+
+class MemoizingBlockingGateHandler:
+    """Minimal engine-like exact-call memoization for disconnect coverage."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.refetch_waiting = threading.Event()
+        self.release = threading.Event()
+        self.completed = threading.Event()
+        self.executions = 0
+        self._condition = threading.Condition()
+        self._inflight: set[tuple[str, int, ToolName, str]] = set()
+        self._responses: dict[tuple[str, int, ToolName, str], GateResult] = {}
+
+    def handle_tool(
+        self,
+        frame_id: str,
+        call_index: int,
+        tool: ToolName,
+        request: ToolRequest,
+    ) -> ToolResponse:
+        assert tool == "gate"
+        assert isinstance(request, GateRequest)
+        identity = (frame_id, call_index, tool, request.model_dump_json())
+        with self._condition:
+            cached = self._responses.get(identity)
+            if cached is not None:
+                return cached
+            if identity in self._inflight:
+                self.refetch_waiting.set()
+                while identity in self._inflight:
+                    self._condition.wait()
+                return self._responses[identity]
+            self._inflight.add(identity)
+            self.executions += 1
+
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test handler was not released")
+        response = GateResult(exit_code=0, stdout=request.cmd, stderr="")
+        with self._condition:
+            self._responses[identity] = response
+            self._inflight.remove(identity)
+            self._condition.notify_all()
+        self.completed.set()
+        return response
 
 
 def json_object(value: object) -> dict[str, object]:
@@ -157,6 +230,123 @@ def rpc_error_code(body: object) -> int:
     return code
 
 
+def gate_call_payload(call_index: int = 0) -> dict[str, object]:
+    return rpc_request(
+        "tools/call",
+        call_index,
+        {
+            "name": "gate",
+            "arguments": {"cmd": "sleep"},
+            "_meta": {"wildflows": {"callIndex": call_index}},
+        },
+    )
+
+
+def test_mcp_heartbeat_interval_must_be_positive_and_finite() -> None:
+    handler = FakeHandler()
+    for interval in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="heartbeat interval"):
+            MCPServer(handler, token=_TOKEN, heartbeat_interval=interval)
+
+
+def test_mcp_tool_call_streams_heartbeats_before_its_final_json_rpc_payload() -> None:
+    handler = BlockingGateHandler()
+    with MCPServer(handler, token=_TOKEN, heartbeat_interval=0.01) as server:
+        endpoint = urlsplit(server.endpoint)
+        assert endpoint.hostname == "127.0.0.1"
+        assert endpoint.port is not None
+        connection = http.client.HTTPConnection(
+            endpoint.hostname, endpoint.port, timeout=5
+        )
+        try:
+            connection.request(
+                "POST",
+                endpoint.path,
+                body=json.dumps(gate_call_payload(12)).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {_TOKEN}",
+                    "Content-Type": "application/json",
+                    "X-Wildflows-Frame": "frame-12",
+                },
+            )
+            response = connection.getresponse()
+            assert response.status == HTTPStatus.OK
+            assert response.getheader("Transfer-Encoding") == "chunked"
+            assert handler.started.wait(timeout=2)
+
+            # HTTPResponse de-chunks the wire body. Each byte is still an
+            # independent whitespace chunk, so the body cannot idle while the
+            # controlled synchronous handler remains blocked.
+            first_heartbeat = response.read(1)
+            second_heartbeat = response.read(1)
+            assert first_heartbeat == b" "
+            assert second_heartbeat == b" "
+
+            handler.release.set()
+            raw = first_heartbeat + second_heartbeat + response.read()
+        finally:
+            handler.release.set()
+            connection.close()
+
+    body = json_object(json_body(raw))
+    assert body["id"] == 12
+    assert raw.count(b'{"jsonrpc"') == 1
+
+
+def test_mcp_disconnected_tool_call_continues_for_an_exact_memoized_refetch() -> None:
+    handler = MemoizingBlockingGateHandler()
+    payload = gate_call_payload(4)
+    with MCPServer(handler, token=_TOKEN, heartbeat_interval=0.01) as server:
+        endpoint = urlsplit(server.endpoint)
+        assert endpoint.hostname == "127.0.0.1"
+        assert endpoint.port is not None
+        connection = http.client.HTTPConnection(
+            endpoint.hostname, endpoint.port, timeout=5
+        )
+        try:
+            connection.request(
+                "POST",
+                endpoint.path,
+                body=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {_TOKEN}",
+                    "Content-Type": "application/json",
+                    "X-Wildflows-Frame": "frame-4",
+                },
+            )
+            response = connection.getresponse()
+            assert response.status == HTTPStatus.OK
+            assert handler.started.wait(timeout=2)
+            assert response.read(1) == b" "
+            connection.close()
+
+            refetched: list[tuple[int, object | None]] = []
+
+            def refetch() -> None:
+                refetched.append(post_json(server, payload, frame_id="frame-4"))
+
+            retry = threading.Thread(target=refetch)
+            retry.start()
+            assert handler.refetch_waiting.wait(timeout=2)
+            handler.release.set()
+            retry.join(timeout=5)
+            assert not retry.is_alive()
+        finally:
+            handler.release.set()
+            connection.close()
+
+    assert handler.completed.is_set()
+    assert handler.executions == 1
+    assert len(refetched) == 1
+    status, body = refetched[0]
+    assert status == HTTPStatus.OK
+    assert rpc_result(body)["structuredContent"] == {
+        "exit_code": 0,
+        "stdout": "sleep",
+        "stderr": "",
+    }
+
+
 def test_mcp_requires_token_and_exposes_fixed_loopback_tool_surface() -> None:
     handler = FakeHandler()
     with MCPServer(handler, token=_TOKEN) as server:
@@ -190,6 +380,11 @@ def test_mcp_requires_token_and_exposes_fixed_loopback_tool_surface() -> None:
             "gate",
             "ask",
         ]
+        dispatch_schema = json_object(json_object(tools[0])["inputSchema"])
+        properties = json_object(dispatch_schema["properties"])
+        skills_schema = json_object(properties["skills"])
+        assert skills_schema["description"] == "One ordered skill-name list per task."
+        assert json_object(json_object(skills_schema["items"])["items"])["type"] == "string"
 
 
 def test_frame_capability_cannot_spoof_another_active_frame() -> None:
@@ -247,8 +442,18 @@ def test_mcp_tool_calls_use_hidden_index_and_return_typed_results() -> None:
         ] = [
             (
                 "dispatch",
-                {"tasks": ["child task"], "rig": "echo", "parallel": True},
-                DispatchRequest(tasks=["child task"], rig="echo", parallel=True),
+                {
+                    "tasks": ["child task"],
+                    "rig": "echo",
+                    "parallel": True,
+                    "skills": [["long", "repo-conventions"]],
+                },
+                DispatchRequest(
+                    tasks=["child task"],
+                    rig="echo",
+                    parallel=True,
+                    skills=[["long", "repo-conventions"]],
+                ),
                 2,
                 DispatchResult(
                     outcome="ok",
@@ -331,6 +536,19 @@ def test_mcp_rejects_malformed_oversized_and_unknown_requests() -> None:
         status, raw = raw_post(server, b"{not json")
         assert status == HTTPStatus.OK
         assert rpc_error_code(json_body(raw)) == -32700
+
+        nonstandard_number = (
+            b'{"jsonrpc":"2.0","id":1,"method":"initialize",'
+            b'"params":{"noise":NaN}}'
+        )
+        status, raw = raw_post(server, nonstandard_number)
+        assert status == HTTPStatus.OK
+        assert rpc_error_code(json_body(raw)) == -32700
+
+        surrogate_id = b'{"jsonrpc":"2.0","id":"\\ud800","method":"tools/list"}'
+        status, raw = raw_post(server, surrogate_id)
+        assert status == HTTPStatus.OK
+        assert json_object(json_body(raw))["id"] == "\ud800"
 
         status, raw = raw_post(server, b"", content_length=MAX_BODY_BYTES + 1)
         assert status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE

@@ -7,8 +7,10 @@ the frame engine.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hmac
 import json
+import math
 import secrets
 import threading
 from collections.abc import Iterator, Mapping
@@ -30,7 +32,13 @@ from wildflows.frame import (
     ToolResponse,
 )
 
-__all__ = ["MAX_BODY_BYTES", "MCPServer", "ToolHandler", "ToolProtocolError"]
+__all__ = [
+    "DEFAULT_HEARTBEAT_INTERVAL",
+    "MAX_BODY_BYTES",
+    "MCPServer",
+    "ToolHandler",
+    "ToolProtocolError",
+]
 
 
 class ToolProtocolError(RuntimeError):
@@ -38,8 +46,17 @@ class ToolProtocolError(RuntimeError):
 
 
 MAX_BODY_BYTES = 1 << 20
+"""Largest accepted JSON-RPC request body in bytes."""
+
+DEFAULT_HEARTBEAT_INTERVAL = 15.0
+"""Seconds between whitespace chunks for a pending ``tools/call`` response."""
+
 _JSON_RPC_VERSION = "2.0"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _reject_non_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant: {value}")
 
 
 @runtime_checkable
@@ -53,6 +70,17 @@ class ToolHandler(Protocol):
         tool: ToolName,
         request: ToolRequest,
     ) -> ToolResponse: ...
+
+
+@dataclass(frozen=True)
+class _PreparedToolCall:
+    """A validated tool request ready for independent execution."""
+
+    frame_id: str
+    call_index: int
+    tool: ToolName
+    request: ToolRequest
+    request_id: object
 
 
 class _MCPHTTPServer(ThreadingHTTPServer):
@@ -73,11 +101,17 @@ class _MCPRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path != "/mcp":
-            self._empty(HTTPStatus.NOT_FOUND)
+        try:
+            if self.path != "/mcp":
+                self._empty(HTTPStatus.NOT_FOUND)
+                return
+            application = cast(_MCPHTTPServer, self.server).application
+            application._serve_post(self)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # A peer can close while a normal response is being written. These
+            # are expected transport outcomes, not server failures worth a
+            # ThreadingHTTPServer traceback.
             return
-        application = cast(_MCPHTTPServer, self.server).application
-        application._serve_post(self)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._method_not_allowed()
@@ -123,11 +157,25 @@ class MCPServer:
     nested MCP calls without serializing or deadlocking the HTTP workers.
     """
 
-    def __init__(self, handler: ToolHandler, token: str | None = None) -> None:
+    def __init__(
+        self,
+        handler: ToolHandler,
+        token: str | None = None,
+        *,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+    ) -> None:
         if token is not None and not token:
             raise ValueError("MCP token must be non-empty")
+        if (
+            not isinstance(heartbeat_interval, int | float)
+            or isinstance(heartbeat_interval, bool)
+            or not math.isfinite(heartbeat_interval)
+            or heartbeat_interval <= 0
+        ):
+            raise ValueError("MCP heartbeat interval must be a positive finite number")
         self._handler = handler
         self.token = token if token is not None else secrets.token_urlsafe(32)
+        self._heartbeat_interval = float(heartbeat_interval)
         self._server: _MCPHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
@@ -237,8 +285,8 @@ class MCPServer:
         if body is None:
             return
         try:
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = json.loads(body, parse_constant=_reject_non_json_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             self._send_json(request, self._error(None, -32700, "Parse error"))
             return
 
@@ -249,7 +297,12 @@ class MCPServer:
             request.send_header("Content-Length", "0")
             request.end_headers()
             return
-        response = self._dispatch(payload, bound_frame or claimed_frame)
+        frame_id = bound_frame or claimed_frame
+        prepared = self._streamable_tool_call(payload, frame_id)
+        if prepared is not None:
+            self._stream_tool_call(request, prepared)
+            return
+        response = self._dispatch(payload, frame_id)
         if response is None:
             request._empty(HTTPStatus.NO_CONTENT)
             return
@@ -332,8 +385,8 @@ class MCPServer:
     @staticmethod
     def _valid_id(value: object) -> bool:
         return value is None or isinstance(value, str) or (
-            isinstance(value, int | float) and not isinstance(value, bool)
-        )
+            isinstance(value, int) and not isinstance(value, bool)
+        ) or (isinstance(value, float) and math.isfinite(value))
 
     def _initialize(
         self,
@@ -353,38 +406,69 @@ class MCPServer:
         }
         return self._result(request_id, result) if has_id else None
 
+    def _streamable_tool_call(
+        self, payload: object, frame_id: str | None
+    ) -> _PreparedToolCall | None:
+        """Return an id-bearing, valid call that needs a streaming response."""
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("jsonrpc") != _JSON_RPC_VERSION:
+            return None
+        if payload.get("method") != "tools/call" or "id" not in payload:
+            return None
+        request_id = payload["id"]
+        if not self._valid_id(request_id):
+            return None
+        params = payload.get("params", {})
+        if not isinstance(params, dict):
+            return None
+        return self._prepare_tool_call(params, frame_id, request_id)
+
     def _call_tool(
         self,
         params: dict[str, object],
         frame_id: str | None,
         request_id: object,
     ) -> dict[str, object]:
-        if not isinstance(frame_id, str) or not frame_id:
+        prepared = self._prepare_tool_call(params, frame_id, request_id)
+        if prepared is None:
             return self._error(request_id, -32602, "Invalid params")
+        return self._complete_tool_call(prepared)
+
+    def _prepare_tool_call(
+        self,
+        params: dict[str, object],
+        frame_id: str | None,
+        request_id: object,
+    ) -> _PreparedToolCall | None:
+        if not isinstance(frame_id, str) or not frame_id:
+            return None
         name = params.get("name")
         arguments = params.get("arguments")
         if not isinstance(name, str) or not isinstance(arguments, dict):
-            return self._error(request_id, -32602, "Invalid params")
+            return None
         call_index = self._call_index(params)
         if call_index is None:
-            return self._error(request_id, -32602, "Invalid params")
+            return None
         try:
             tool, validated = self._validate_tool(name, arguments)
         except (KeyError, ValidationError, ValueError):
-            return self._error(request_id, -32602, "Invalid params")
+            return None
+        return _PreparedToolCall(frame_id, call_index, tool, validated, request_id)
 
+    def _complete_tool_call(self, call: _PreparedToolCall) -> dict[str, object]:
         try:
             tool_response = self._handler.handle_tool(
-                frame_id, call_index, tool, validated
+                call.frame_id, call.call_index, call.tool, call.request
             )
         except ToolProtocolError as exc:
-            return self._error(request_id, -32602, str(exc))
+            return self._error(call.request_id, -32602, str(exc))
         except Exception:
             # Tool failures that are meaningful to a frame are values returned
             # by its handler. An exception is a transport/server fault instead.
-            return self._error(request_id, -32603, "Internal error")
+            return self._error(call.request_id, -32603, "Internal error")
         if not isinstance(tool_response, (DispatchResult, GateResult, AskResult)):
-            return self._error(request_id, -32603, "Internal error")
+            return self._error(call.request_id, -32603, "Internal error")
 
         result = {
             "content": [{"type": "text", "text": tool_response.as_text()}],
@@ -394,7 +478,51 @@ class MCPServer:
                 and tool_response.outcome == "refused"
             ),
         }
-        return self._result(request_id, result)
+        return self._result(call.request_id, result)
+
+    def _stream_tool_call(
+        self, request: _MCPRequestHandler, call: _PreparedToolCall
+    ) -> None:
+        """Stream a pending call without coupling execution to the client socket."""
+        started = threading.Event()
+        completed = threading.Event()
+        response: dict[str, object] = self._error(
+            call.request_id, -32603, "Internal error"
+        )
+
+        def execute() -> None:
+            nonlocal response
+            try:
+                started.wait()
+                response = self._complete_tool_call(call)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(
+            target=execute,
+            name="wildflows-mcp-tool",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            self._start_chunked_json(request)
+        finally:
+            # Even a disconnect while headers are sent must not cancel a call
+            # that has already passed MCP validation.
+            started.set()
+
+        try:
+            while not completed.wait(self._heartbeat_interval):
+                self._write_chunk(request, b" ")
+            raw = json.dumps(
+                response, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+            self._write_chunk(request, raw)
+            self._finish_chunks(request)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The independent worker retains responsibility for completing the
+            # engine call; only this client's response stream is gone.
+            return
 
     @staticmethod
     def _call_index(params: Mapping[str, object]) -> int | None:
@@ -414,7 +542,7 @@ class MCPServer:
         name: str, arguments: dict[str, object]
     ) -> tuple[ToolName, ToolRequest]:
         if name == "dispatch":
-            MCPServer._only_keys(arguments, {"tasks", "rig", "parallel"})
+            MCPServer._only_keys(arguments, {"tasks", "rig", "parallel", "skills"})
             return "dispatch", DispatchRequest.model_validate(arguments)
         if name == "gate":
             MCPServer._only_keys(arguments, {"cmd"})
@@ -455,10 +583,30 @@ class MCPServer:
         return self._error(request_id, code, message) if has_id else None
 
     @staticmethod
+    def _start_chunked_json(request: _MCPRequestHandler) -> None:
+        request.send_response(HTTPStatus.OK)
+        request.send_header("Content-Type", "application/json")
+        request.send_header("Transfer-Encoding", "chunked")
+        request.end_headers()
+        request.wfile.flush()
+
+    @staticmethod
+    def _write_chunk(request: _MCPRequestHandler, data: bytes) -> None:
+        request.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+        request.wfile.write(data)
+        request.wfile.write(b"\r\n")
+        request.wfile.flush()
+
+    @staticmethod
+    def _finish_chunks(request: _MCPRequestHandler) -> None:
+        request.wfile.write(b"0\r\n\r\n")
+        request.wfile.flush()
+
+    @staticmethod
     def _send_json(
         request: _MCPRequestHandler, payload: dict[str, object]
     ) -> None:
-        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         request.send_response(HTTPStatus.OK)
         request.send_header("Content-Type", "application/json")
         request.send_header("Content-Length", str(len(raw)))
@@ -490,6 +638,18 @@ class MCPServer:
                             "pattern": r".*\S.*",
                         },
                         "parallel": {"type": "boolean", "default": False},
+                        "skills": {
+                            "type": "array",
+                            "description": "One ordered skill-name list per task.",
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "pattern": r".*\S.*",
+                                },
+                            },
+                        },
                     },
                     "required": ["tasks", "rig"],
                 },
