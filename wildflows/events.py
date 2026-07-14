@@ -30,6 +30,7 @@ class ResultEvent(_Header):
     files: list[str] = Field(default_factory=list)
     exit_code: int | None = None
     post_head: str | None = None
+    integration_base: str | None = None
     loop_status: str | None = None
     outcome: Literal["ok", "failed", "busy"] = "ok"
     receipt_required: bool = False

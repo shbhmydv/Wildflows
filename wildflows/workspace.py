@@ -1,12 +1,16 @@
 from __future__ import annotations
 import ctypes
+import fcntl
+import hashlib
 import os
 import re
 import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Callable
 from uuid import uuid4
 from wildflows.result import CommitReceipt, IntegrationReceipt
@@ -95,6 +99,25 @@ class Repository:
     @property
     def branch(self) -> str:
         return self.ref.removeprefix("refs/heads/")
+    @contextmanager
+    def integration_guard(self) -> Iterator[None]:
+        """Coordinate Wildflows owners for this ref; raw Git during a run is unsupported."""
+        common = self.git(["rev-parse", "--git-common-dir"]).stdout.strip()
+        common_dir = Path(common) if Path(common).is_absolute() else self.root / common
+        digest = hashlib.sha256(self.ref.encode("utf-8")).hexdigest()[:20]
+        path = common_dir / f"wildflows-{digest}.lock"
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RepositoryTransientError(
+                    f"run branch {self.branch!r} already has an active Wildflows owner"
+                ) from exc
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
     def branch_claim(self) -> str:
         proc = self.git(["rev-parse", "--verify", self.ref], check=False)
         if proc.returncode != 0:
@@ -197,6 +220,15 @@ class Repository:
         if actual.model_dump() != IntegrationReceipt(commits=commits).model_dump():
             raise RepositoryError("receipt commit range or changed paths do not match Git")
         return actual
+    def cherry_pick(self, worktree: Path, commits: list[CommitReceipt]) -> None:
+        """Reapply one verified sibling chain in a disposable worktree."""
+        for commit in commits:
+            proc = self.git(
+                ["cherry-pick", "--allow-empty", commit.sha], cwd=worktree, check=False
+            )
+            if proc.returncode != 0:
+                detail = proc.stderr.strip() or proc.stdout.strip() or "cherry-pick refused"
+                raise IntegrationError(detail)
     def _branch_worktrees(self) -> list[Path]:
         fields = self.git(["worktree", "list", "--porcelain", "-z"]).stdout.split("\0")
         owners: list[Path] = []

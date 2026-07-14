@@ -1,4 +1,6 @@
 from __future__ import annotations
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,7 @@ from wildflows.workspace import (
 __all__ = [
     "Engine",
     "NodeExecutionError",
+    "SiblingOwnershipError",
     "PredicateEvaluationError",
     "ResumeVerificationError",
     "BranchDivergedError",
@@ -30,10 +33,24 @@ __all__ = [
 ]
 class NodeExecutionError(RuntimeError):
     """A node failed; its worktree was abandoned and the epoch remains open."""
+class SiblingOwnershipError(NodeExecutionError):
+    """A later concurrent sibling touched a path already owned by a landed sibling."""
 class PredicateEvaluationError(RuntimeError):
     """A command predicate timed out or could not be evaluated."""
 class ResumeVerificationError(RuntimeError):
     """Journalled Git claims cannot be reconciled with the run branch."""
+@dataclass(frozen=True)
+class _Attempt:
+    node: Do | Inplace
+    key: NodeKey
+    base: str
+    worktree: NodeWorktree
+    prompt: str | None = None
+@dataclass(frozen=True)
+class _Candidate:
+    result: Result
+    commit: str
+    receipt: IntegrationReceipt
 class Engine:
     def __init__(
         self,
@@ -41,18 +58,23 @@ class Engine:
         workdir: Path,
         registry: RigRegistry,
         run_branch: str | None = None,
+        max_workers: int = 1,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.repo = Repository(workdir, self.run_dir, run_branch)
         self.registry = registry
-        self.journal = Journal.load(self.run_dir)
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
+        self.max_workers = max_workers
         self.run_id = self.run_dir.name
-        for epoch in self.journal.projection.epochs.values():
-            if epoch.run_branch is not None and epoch.run_branch != self.repo.ref:
-                raise ResumeVerificationError(
-                    f"journal belongs to {epoch.run_branch!r}, not {self.repo.ref!r}"
-                )
-        self._verify_resume_claims()
+        with self.repo.integration_guard():
+            self.journal = Journal.load(self.run_dir)
+            for epoch in self.journal.projection.epochs.values():
+                if epoch.run_branch is not None and epoch.run_branch != self.repo.ref:
+                    raise ResumeVerificationError(
+                        f"journal belongs to {epoch.run_branch!r}, not {self.repo.ref!r}"
+                    )
+            self._verify_resume_claims()
     @property
     def workdir(self) -> Path:
         return self.repo.root
@@ -63,6 +85,9 @@ class Engine:
     def _proj(self) -> RunProjection:
         return self.journal.projection
     def run_epoch(self, tree: Expr, epoch: int) -> None:
+        with self.repo.integration_guard():
+            self._run_epoch(tree, epoch)
+    def _run_epoch(self, tree: Expr, epoch: int) -> None:
         self._verify_resume_claims()
         tree = admit_epoch(tree, epoch, self._proj, self.registry)
         if self._proj.epoch_closed(epoch):
@@ -102,6 +127,7 @@ class Engine:
         results: dict[NodeKey, ResultEvent] = {}
         integrated_after: dict[NodeKey, int] = {}
         prefix_dependents: dict[str, tuple[int, int]] = {}
+        verified_tips: set[str] = set()
         expected: str | None = None
         for event in events:
             if isinstance(event, Boundary) and event.phase == "opened":
@@ -115,6 +141,7 @@ class Engine:
                     )
                 if expected is None:
                     expected = event.base_commit
+                    verified_tips.add(expected)
                 elif event.base_commit != expected:
                     raise ResumeVerificationError(
                         "epoch base does not match the preceding verified journal tip"
@@ -126,14 +153,26 @@ class Engine:
                     prefix_dependents.setdefault(expected, (event.epoch, event.seq))
                 continue
             if isinstance(event, ResultEvent):
-                results[(event.epoch, event.node_id)] = event
+                key = (event.epoch, event.node_id)
+                results[key] = event
+                dispatch = dispatches.get(key)
+                if (
+                    event.integration_base is not None
+                    and dispatch is not None
+                    and event.integration_base != dispatch.pre_head
+                ):
+                    prefix_dependents.setdefault(
+                        event.integration_base, (event.epoch, event.seq)
+                    )
                 continue
             if not isinstance(event, Integrated):
                 continue
             key = (event.epoch, event.node_id)
             dispatch = dispatches.get(key)
             result = results.get(key)
-            base = dispatch.pre_head if dispatch is not None else None
+            base = (
+                result.integration_base if result is not None else None
+            ) or (dispatch.pre_head if dispatch is not None else None)
             if (
                 expected is None or dispatch is None or base is None or result is None
                 or not (dispatch.seq < result.seq < event.seq)
@@ -150,7 +189,7 @@ class Engine:
                 or result.post_head != event.commit
             ):
                 if self._fallback_failed_claim(
-                    key[0], dispatch.seq,
+                    key[0], self._claim_start(dispatch, result),
                     f"resume fallback: integrated seq {event.seq} contradicts its result",
                     expected, event.commit, prefix_dependents,
                 ):
@@ -162,7 +201,7 @@ class Engine:
                 self.repo.verify_receipt(base, event.commits)
             except RepositoryError as exc:
                 if self._fallback_failed_claim(
-                    key[0], dispatch.seq,
+                    key[0], self._claim_start(dispatch, result),
                     f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
                     expected, event.commit, prefix_dependents,
                 ):
@@ -171,6 +210,7 @@ class Engine:
                     f"receipt at seq {event.seq} is unverifiable and its effect is live: {exc}"
                 ) from exc
             expected = event.commit
+            verified_tips.add(expected)
             integrated_after[key] = event.seq
         if expected is None:
             raise ResumeVerificationError("journal has no worktree-model opened boundary")
@@ -187,7 +227,9 @@ class Engine:
         if outstanding:
             key, result = outstanding[0]
             dispatch = dispatches.get(key)
-            base = dispatch.pre_head if dispatch is not None else None
+            base = result.integration_base or (
+                dispatch.pre_head if dispatch is not None else None
+            )
             candidate = result.post_head
             if base != expected or candidate is None:
                 if live == expected:
@@ -202,7 +244,7 @@ class Engine:
                 if not self.repo.commit_exists(candidate):
                     assert dispatch is not None
                     if self._fallback_failed_claim(
-                        key[0], dispatch.seq,
+                        key[0], self._claim_start(dispatch, result),
                         "resume fallback: incomplete integration candidate is missing",
                         expected, candidate, prefix_dependents,
                     ):
@@ -223,7 +265,9 @@ class Engine:
                 reason = "resume fallback: result was journalled but its commits did not land"
                 if cleaned:
                     reason += "; removed ownerless interrupted Git lock residue"
-                self._journal_fallback(key[0], dispatch.seq, reason, expected)
+                self._journal_fallback(
+                    key[0], self._claim_start(dispatch, result), reason, expected
+                )
                 return True
             if self._fallback_known_prefix(prefix_dependents, live):
                 return True
@@ -249,14 +293,32 @@ class Engine:
         ]
         if unfinished:
             key, node = min(unfinished, key=lambda item: item[1].last_dispatch_seq)
-            if node.dispatched_pre_head != expected:
-                raise ResumeVerificationError("unfinished attempt did not start at verified tip")
-            self._journal_fallback(
-                key[0], node.last_dispatch_seq,
-                "resume fallback: interrupted attempt abandoned", expected,
-            )
-            return True
+            if node.dispatched_pre_head == expected:
+                self._journal_fallback(
+                    key[0], node.last_dispatch_seq,
+                    "resume fallback: interrupted attempt abandoned", expected,
+                )
+                return True
+            if node.dispatched_pre_head in verified_tips:
+                self._append_result(
+                    key,
+                    Result(
+                        text="resume: interrupted concurrent sibling abandoned",
+                        outcome="failed",
+                    ),
+                    post_head=expected,
+                )
+                return True
+            raise ResumeVerificationError("unfinished attempt did not start at verified tip")
         return False
+    @staticmethod
+    def _claim_start(dispatch: Dispatched, result: ResultEvent) -> int:
+        if (
+            result.integration_base is not None
+            and result.integration_base != dispatch.pre_head
+        ):
+            return result.seq
+        return dispatch.seq
     def _fallback_failed_claim(
         self,
         epoch_id: int,
@@ -301,7 +363,13 @@ class Engine:
         key = (epoch, node.node_id)
         if isinstance(node, (Do, Inplace)) and self._proj.resume_action(key, floor) == "done":
             return ExecutionOutcome(key=key)
-        if isinstance(node, (Seq, Dispatch)):
+        if isinstance(node, Dispatch):
+            if self.max_workers > 1 and all(
+                isinstance(child, (Do, Inplace)) for child in node.children
+            ):
+                return self._exec_dispatch(node, epoch, floor)
+            return self._exec_children(node.children, epoch, floor)
+        if isinstance(node, Seq):
             return self._exec_children(node.children, epoch, floor)
         if isinstance(node, Loop):
             return self._exec_loop(node, epoch, floor)
@@ -324,90 +392,213 @@ class Engine:
         if failures:
             raise NodeExecutionError("; ".join(str(exc) for exc in failures))
         return ExecutionOutcome(children=tuple(outcomes))
-    def _exec_do(self, node: Do, epoch: int) -> ExecutionOutcome:
+    def _prepare_attempt(self, node: Do | Inplace, epoch: int, base: str) -> _Attempt:
         key = (epoch, node.node_id)
-        self._verify_resume_claims()
-        base = self.repo.branch_tip()
         attempt = self._proj.node(key).dispatch_count
         worktree = self.repo.create_worktree(epoch, node.node_id, attempt, base)
-        try:
-            self.journal.append(
-                Dispatched(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=node.node_id,
-                    rig=node.rig.name,
-                    task=node.task,
-                    workdir=str(worktree.path),
-                    pre_head=base,
-                )
-            )
+        if isinstance(node, Do):
+            self.journal.append(Dispatched(
+                run_id=self.run_id, epoch=epoch, node_id=node.node_id,
+                rig=node.rig.name, task=node.task, workdir=str(worktree.path),
+                pre_head=base,
+            ))
             prompt = self._materialize_ctx(node, epoch, worktree)
             if prompt is None:
+                self.repo.remove_worktree(worktree)
                 self._fail_node(key, base, "unresolved or escaping context reference")
+            return _Attempt(node, key, base, worktree, prompt)
+        self.journal.append(Dispatched(
+            run_id=self.run_id, epoch=epoch, node_id=node.node_id,
+            task=f"inplace: {len(node.edits)} edit(s)",
+            workdir=str(worktree.path), pre_head=base,
+        ))
+        return _Attempt(node, key, base, worktree)
+    def _build_candidate(self, attempt: _Attempt) -> _Candidate:
+        node = attempt.node
+        if isinstance(node, Do):
+            assert attempt.prompt is not None
             try:
-                result = self.registry.resolve(node.rig.name).run(prompt, worktree.path)
+                result = self.registry.resolve(node.rig.name).run(
+                    attempt.prompt, attempt.worktree.path
+                )
             except Exception as exc:
-                self._fail_node(key, base, f"rig raised: {exc}")
+                result = Result(text=f"rig raised: {exc}", outcome="failed")
             if not result.ok:
-                self._record_failed_result(key, base, result)
+                return _Candidate(result, attempt.base, IntegrationReceipt())
             try:
-                self.repo.commit_all(worktree.path, self._commit_message("do", key))
-                candidate = self.repo.head(worktree.path)
-                receipt = self.repo.receipt(base, candidate)
+                self.repo.commit_all(
+                    attempt.worktree.path, self._commit_message("do", attempt.key)
+                )
+                candidate = self.repo.head(attempt.worktree.path)
+                receipt = self.repo.receipt(attempt.base, candidate)
             except RepositoryError as exc:
-                self._fail_node(key, base, f"do integration failed: {exc}")
-            self._complete_attempt(key, base, candidate, result, receipt)
-            return ExecutionOutcome(key=key)
-        finally:
-            self.repo.remove_worktree(worktree)
-    def _exec_inplace(self, node: Inplace, epoch: int) -> ExecutionOutcome:
-        key = (epoch, node.node_id)
-        self._verify_resume_claims()
-        base = self.repo.branch_tip()
-        attempt = self._proj.node(key).dispatch_count
-        worktree = self.repo.create_worktree(epoch, node.node_id, attempt, base)
+                return _Candidate(
+                    Result(text=f"do integration failed: {exc}", outcome="failed"),
+                    attempt.base,
+                    IntegrationReceipt(),
+                )
+            return _Candidate(result, candidate, receipt)
         paths = [edit.path for edit in node.edits]
         try:
-            self.journal.append(
-                Dispatched(
-                    run_id=self.run_id,
-                    epoch=epoch,
-                    node_id=node.node_id,
-                    task=f"inplace: {len(node.edits)} edit(s)",
-                    workdir=str(worktree.path),
-                    pre_head=base,
+            for edit in node.edits:
+                target = self.repo.safe_path(
+                    attempt.worktree.path, edit.path, for_write=True
                 )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(edit.content, encoding="utf-8")
+            self.repo.commit_declared(
+                attempt.worktree.path,
+                paths,
+                self._commit_message("inplace", attempt.key),
+            )
+            candidate = self.repo.head(attempt.worktree.path)
+            receipt = self.repo.receipt(attempt.base, candidate)
+            undeclared = [path for path in receipt.paths if path not in set(paths)]
+            if undeclared:
+                raise IntegrationError(
+                    f"inplace commit contains undeclared paths: {', '.join(undeclared)}"
+                )
+        except (OSError, UnicodeError, ValueError, RepositoryError) as exc:
+            return _Candidate(
+                Result(text=f"inplace failed: {exc}", outcome="failed"),
+                attempt.base,
+                IntegrationReceipt(),
+            )
+        result = Result(
+            text=(
+                f"wrote {', '.join(paths)}"
+                if receipt.commits else "inplace: no diff (already applied)"
+            ),
+            files=paths if receipt.commits else [],
+        )
+        return _Candidate(result, candidate, receipt)
+    def _exec_do(self, node: Do, epoch: int) -> ExecutionOutcome:
+        return self._exec_leaf(node, epoch)
+    def _exec_inplace(self, node: Inplace, epoch: int) -> ExecutionOutcome:
+        return self._exec_leaf(node, epoch)
+    def _exec_leaf(self, node: Do | Inplace, epoch: int) -> ExecutionOutcome:
+        self._verify_resume_claims()
+        attempt = self._prepare_attempt(node, epoch, self.repo.branch_tip())
+        try:
+            candidate = self._build_candidate(attempt)
+            if not candidate.result.ok:
+                self._record_failed_result(attempt.key, attempt.base, candidate.result)
+            self._complete_attempt(
+                attempt.key, attempt.base, candidate.commit,
+                candidate.result, candidate.receipt,
+            )
+            return ExecutionOutcome(key=attempt.key)
+        finally:
+            self.repo.remove_worktree(attempt.worktree)
+    def _exec_dispatch(
+        self, node: Dispatch, epoch: int, floor: Floor
+    ) -> ExecutionOutcome:
+        """Run eligible leaf siblings together; this thread alone lands and journals."""
+        self._verify_resume_claims()
+        base = self.repo.branch_tip()
+        outcomes = [
+            ExecutionOutcome(key=(epoch, child.node_id)) for child in node.children
+        ]
+        attempts: list[tuple[int, _Attempt]] = []
+        failures: list[NodeExecutionError] = []
+        for index, child in enumerate(node.children):
+            assert isinstance(child, (Do, Inplace))
+            key = (epoch, child.node_id)
+            if self._proj.resume_action(key, floor) == "done":
+                continue
+            try:
+                attempts.append((index, self._prepare_attempt(child, epoch, base)))
+            except NodeExecutionError as exc:
+                failures.append(exc)
+        owned_paths: set[str] = set()
+        try:
+            with ThreadPoolExecutor(
+                max_workers=min(self.max_workers, len(attempts) or 1)
+            ) as executor:
+                pending: dict[Future[_Candidate], tuple[int, _Attempt]] = {
+                    executor.submit(self._build_candidate, attempt): (index, attempt)
+                    for index, attempt in attempts
+                }
+                for future in as_completed(pending):
+                    _, attempt = pending[future]
+                    candidate = future.result()
+                    failure = self._land_sibling(
+                        attempt, candidate, owned_paths, epoch
+                    )
+                    if failure is not None:
+                        failures.append(failure)
+        finally:
+            for _, attempt in attempts:
+                self.repo.remove_worktree(attempt.worktree)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise NodeExecutionError("; ".join(str(exc) for exc in failures))
+        return ExecutionOutcome(children=tuple(outcomes))
+    def _land_sibling(
+        self,
+        attempt: _Attempt,
+        candidate: _Candidate,
+        owned_paths: set[str],
+        epoch: int,
+    ) -> NodeExecutionError | None:
+        current = self.repo.branch_tip()
+        if not candidate.result.ok:
+            self._append_result(attempt.key, candidate.result, post_head=current)
+            return NodeExecutionError(
+                candidate.result.text or f"node {attempt.key[1]} failed"
+            )
+        if not candidate.receipt.commits:
+            self._append_result(attempt.key, candidate.result, post_head=current)
+            return None
+        try:
+            self.repo.verify_receipt(attempt.base, candidate.receipt.commits)
+        except RepositoryError as exc:
+            text = f"sibling candidate receipt is invalid: {exc}"
+            self._append_result(
+                attempt.key, Result(text=text, outcome="failed"), post_head=current
+            )
+            return NodeExecutionError(text)
+        overlap = owned_paths.intersection(candidate.receipt.paths)
+        if overlap:
+            text = "concurrent sibling ownership overlaps: " + ", ".join(sorted(overlap))
+            self._append_result(
+                attempt.key, Result(text=text, outcome="failed"), post_head=current
+            )
+            return SiblingOwnershipError(text)
+        landing_commit = candidate.commit
+        landing_receipt = candidate.receipt
+        if current != attempt.base:
+            combine = self.repo.create_worktree(
+                epoch,
+                f"{attempt.key[1]}.integrate",
+                self._proj.node(attempt.key).dispatch_count,
+                current,
             )
             try:
-                for edit in node.edits:
-                    target = self.repo.safe_path(worktree.path, edit.path, for_write=True)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(edit.content, encoding="utf-8")
-                self.repo.commit_declared(
-                    worktree.path, paths, self._commit_message("inplace", key)
+                self.repo.cherry_pick(combine.path, candidate.receipt.commits)
+                landing_commit = self.repo.head(combine.path)
+                landing_receipt = self.repo.receipt(current, landing_commit)
+                source_paths = [item.paths for item in candidate.receipt.commits]
+                if [item.paths for item in landing_receipt.commits] != source_paths:
+                    raise IntegrationError("reapplied sibling changed its per-commit paths")
+            except RepositoryError as exc:
+                text = f"sibling reapply failed: {exc}"
+                self._append_result(
+                    attempt.key, Result(text=text, outcome="failed"), post_head=current
                 )
-                candidate = self.repo.head(worktree.path)
-                receipt = self.repo.receipt(base, candidate)
-                undeclared = [path for path in receipt.paths if path not in set(paths)]
-                if undeclared:
-                    raise IntegrationError(
-                        f"inplace commit contains undeclared paths: {', '.join(undeclared)}"
-                    )
-            except (OSError, UnicodeError, ValueError, RepositoryError) as exc:
-                self._fail_node(key, base, f"inplace failed: {exc}")
-            result = Result(
-                text=(
-                    f"wrote {', '.join(paths)}"
-                    if receipt.commits
-                    else "inplace: no diff (already applied)"
-                ),
-                files=paths if receipt.commits else [],
+                return NodeExecutionError(text)
+            finally:
+                self.repo.remove_worktree(combine)
+        try:
+            self._complete_attempt(
+                attempt.key, current, landing_commit,
+                candidate.result, landing_receipt,
             )
-            self._complete_attempt(key, base, candidate, result, receipt)
-            return ExecutionOutcome(key=key)
-        finally:
-            self.repo.remove_worktree(worktree)
+        except NodeExecutionError as exc:
+            return exc
+        owned_paths.update(candidate.receipt.paths)
+        return None
     def _complete_attempt(
         self,
         key: NodeKey,
@@ -422,6 +613,7 @@ class Engine:
             result,
             post_head=candidate,
             receipt_required=bool(receipt.commits),
+            integration_base=base,
         )
         if not receipt.commits:
             return
@@ -559,6 +751,7 @@ class Engine:
         *,
         post_head: str | None,
         receipt_required: bool = False,
+        integration_base: str | None = None,
         loop_status: str | None = None,
     ) -> None:
         self._persist_artifact(key, result)
@@ -572,6 +765,7 @@ class Engine:
                 exit_code=result.exit_code,
                 outcome=result.outcome,
                 post_head=post_head,
+                integration_base=integration_base,
                 receipt_required=receipt_required,
                 loop_status=loop_status,
             )
