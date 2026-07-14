@@ -1,59 +1,36 @@
-"""The multi-harness seam: Rig.run(prompt, workdir) -> Result.
+"""The multi-harness seam: ``Rig.run(prompt, workdir) -> Result``.
 
-prompt in, text/files out — grindstone's shape-agnostic request.sh contract, so real
-rigs (claude -p, pi, local Qwen, codex exec) plug in later behind ShellRig with no
-engine change. Real rigs are NOT wired up in this build (no network, no model calls).
+External commands use a small in-process process-group barrier.  Timeout kills the
+whole group; there are no durable process records or restart reaper because every
+attempt path is disposable and never reused.
 """
 from __future__ import annotations
 
 import os
 import re
 import shlex
+import signal
 import subprocess
 import tempfile
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TextIO, runtime_checkable
 
 from wildflows.result import Outcome, Result
 
-# `Result`/`Outcome` are core domain values (in `result.py`); re-exported here so
-# `from wildflows.rig import Result` keeps working for rig implementations.
 __all__ = [
-    "Outcome", "Result", "DEFAULT_BUSY_PATTERNS", "Rig", "EchoRig", "ShellRig",
-    "ScriptRig", "RigRegistry", "process_launcher", "run_external",
+    "Outcome",
+    "Result",
+    "DEFAULT_BUSY_PATTERNS",
+    "ExternalResult",
+    "run_shell",
+    "Rig",
+    "EchoRig",
+    "ShellRig",
+    "ScriptRig",
+    "RigRegistry",
 ]
 
-ProcessLauncher = Callable[[Callable[[], bytes], float], bytes]
-_PROCESS_LAUNCHER: ContextVar[ProcessLauncher | None] = ContextVar(
-    "wildflows_process_launcher", default=None
-)
-
-
-@contextmanager
-def process_launcher(launcher: ProcessLauncher) -> Iterator[None]:
-    """Bind the engine-owned process launcher without changing the ``Rig`` protocol."""
-    token = _PROCESS_LAUNCHER.set(launcher)
-    try:
-        yield
-    finally:
-        _PROCESS_LAUNCHER.reset(token)
-
-
-def run_external(operation: Callable[[], Result], timeout_s: float) -> Result:
-    """Use the engine's durable launcher when bound; direct calls are standalone."""
-    launcher = _PROCESS_LAUNCHER.get()
-    if launcher is None:  # direct library use; engine execution always binds a launcher
-        return operation()
-    raw = launcher(
-        lambda: operation().model_dump_json().encode("utf-8"), timeout_s + 1
-    )
-    return Result.model_validate_json(raw)
-
-# The rate/session-limit signatures the grindstone rigs surface on stderr (kept in
-# sync with models/picodex/{senior,planner}_request.sh + grindstone/ratelimit.py).
 DEFAULT_BUSY_PATTERNS = [
     r"rate.?limit",
     r"429",
@@ -66,88 +43,103 @@ DEFAULT_BUSY_PATTERNS = [
 ]
 
 
+@dataclass(frozen=True)
+class ExternalResult:
+    returncode: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+def _kill_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _capture(
+    command: str | list[str],
+    *,
+    cwd: Path,
+    timeout_s: float,
+    shell: bool,
+    env: dict[str, str] | None = None,
+) -> ExternalResult:
+    # Real files cannot be held pipe-open by a background descendant.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, \
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
+        out_file: TextIO = stdout
+        err_file: TextIO = stderr
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=out_file,
+            stderr=err_file,
+            text=True,
+            shell=shell,
+            env=env,
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            returncode: int | None = process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = None
+        finally:
+            # Also quiesce ordinary background children before the core inspects commits.
+            # A deliberate setsid escape remains possible but can only write the abandoned
+            # attempt path after this call returns.
+            _kill_group(process)
+        stdout.seek(0)
+        stderr.seek(0)
+        return ExternalResult(returncode, stdout.read(), stderr.read(), timed_out)
+
+
+def run_shell(command: str, workdir: Path, timeout_s: float) -> ExternalResult:
+    return _capture(command, cwd=workdir, timeout_s=timeout_s, shell=True)
+
+
 @runtime_checkable
 class Rig(Protocol):
-    """A harness+model that executes a `do`."""
-
     def run(self, prompt: str, workdir: Path) -> Result: ...
 
 
 class EchoRig:
-    """Deterministic rig: echoes the prompt back. The test substrate."""
-
     def run(self, prompt: str, workdir: Path) -> Result:
         return Result(text=f"echo: {prompt}", exit_code=0)
 
 
 class ShellRig:
-    """Shells out to a command template with {prompt} substituted; stdout is the result.
-
-    This is the real plug-in path (e.g. template='claude -p {prompt}'); the command
-    runs with cwd=workdir so a real rig writes its files inside the worktree.
-
-    `timeout_s` is REQUIRED — an unbounded rig can hang an epoch forever. During
-    engine execution the workspace-owned process launcher places this command in its
-    durably recorded group and reaps every descendant before returning. A timeout is
-    returned as `outcome="failed"` with a `[timeout]` marker; any non-zero exit is
-    likewise `outcome="failed"`.
-    """
-
     def __init__(self, template: str, timeout_s: float) -> None:
         self.template = template
         self.timeout_s = timeout_s
 
     def run(self, prompt: str, workdir: Path) -> Result:
-        cmd = self.template.replace("{prompt}", shlex.quote(prompt))
-
-        def execute() -> Result:
-            # Regular capture files cannot be held pipe-open by a background descendant.
-            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as out, \
-                    tempfile.TemporaryFile(mode="w+", encoding="utf-8") as err:
-                try:
-                    proc = subprocess.run(
-                        cmd, shell=True, cwd=workdir, stdout=out, stderr=err,
-                        text=True, timeout=self.timeout_s,
-                    )
-                except subprocess.TimeoutExpired:
-                    out.seek(0); err.seek(0)
-                    return Result(
-                        text=f"[timeout] command exceeded {self.timeout_s}s\n{err.read()}",
-                        exit_code=None, outcome="failed",
-                    )
-                out.seek(0); err.seek(0)
-                stdout, stderr = out.read(), err.read()
-                ok = proc.returncode == 0
-                return Result(
-                    text=stdout if ok else stderr, exit_code=proc.returncode,
-                    outcome="ok" if ok else "failed",
-                )
-
-        return run_external(execute, self.timeout_s)
+        command = self.template.replace("{prompt}", shlex.quote(prompt))
+        result = run_shell(command, workdir, self.timeout_s)
+        if result.timed_out:
+            return Result(
+                text=f"[timeout] command exceeded {self.timeout_s}s\n{result.stderr}",
+                outcome="failed",
+            )
+        assert result.returncode is not None
+        ok = result.returncode == 0
+        return Result(
+            text=result.stdout if ok else result.stderr,
+            exit_code=result.returncode,
+            outcome="ok" if ok else "failed",
+        )
 
 
 class ScriptRig:
-    """Drives a real grindstone-contract executor script — the production rig seam.
-
-    The script is invoked with EXACTLY the battle-tested request.sh argument contract:
-
-        <script> --worktree <dir> --prompt <file> --log-dir <dir> \
-                 --handle-out <file> --timeout <secs>
-
-    It grinds agentically inside the worktree, propagates its exit code, and surfaces
-    rate/session-limit signatures on stderr. `--prompt` is a FILE PATH (not inline
-    argv): the real rigs feed the prompt on stdin from that file to dodge the kernel's
-    MAX_ARG_STRLEN wall on large prior-failure context — ScriptRig writes the prompt to
-    `<dispatch-log>/prompt.txt` and passes its path, mirroring the contract exactly.
-
-    Per-dispatch logs land under `<log_dir>/<workdir.name>/` — in the real worktree
-    seam (ladder step 4) each `do` runs in a worktree named for its node_id, so the
-    dispatch key IS the node_id by construction. Captured stdout/stderr are written
-    there so the log dir is populated even if the script writes nothing itself.
-
-    NO real model is invoked by this class; it only shells out to whatever script it is
-    configured with. Real backoff/retry on a `busy` outcome is a later ladder step.
-    """
+    """Drive the existing grindstone-compatible executor script contract."""
 
     def __init__(
         self,
@@ -168,59 +160,50 @@ class ScriptRig:
     def _classify(self, returncode: int, stdout: str, stderr: str) -> Outcome:
         if returncode == 0:
             return "ok"
-        # A limit can land on either stream (grindstone greps both).
         if self._busy_re.search(stderr) or self._busy_re.search(stdout):
             return "busy"
         return "failed"
 
     def run(self, prompt: str, workdir: Path) -> Result:
-        dispatch_dir = self.log_dir / Path(workdir).name
+        dispatch_dir = self.log_dir / workdir.name
         dispatch_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = dispatch_dir / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
         handle_out = dispatch_dir / "handle"
-
         argv = [
             str(self.script),
-            "--worktree", str(workdir),
-            "--prompt", str(prompt_file),
-            "--log-dir", str(dispatch_dir),
-            "--handle-out", str(handle_out),
-            "--timeout", str(int(self.timeout_s)),
+            "--worktree",
+            str(workdir),
+            "--prompt",
+            str(prompt_file),
+            "--log-dir",
+            str(dispatch_dir),
+            "--handle-out",
+            str(handle_out),
+            "--timeout",
+            str(int(self.timeout_s)),
         ]
-        proc_env = {**os.environ, **self.env}
-
-        def execute() -> Result:
-            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as out, \
-                    tempfile.TemporaryFile(mode="w+", encoding="utf-8") as err:
-                try:
-                    proc = subprocess.run(
-                        argv, cwd=workdir, stdout=out, stderr=err, text=True,
-                        env=proc_env, timeout=self.timeout_s,
-                    )
-                except subprocess.TimeoutExpired:
-                    out.seek(0); err.seek(0)
-                    stdout, stderr = out.read(), err.read()
-                    (dispatch_dir / "agent.stdout.log").write_text(stdout, encoding="utf-8")
-                    (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
-                    return Result(
-                        text=f"[timeout] script exceeded {self.timeout_s}s\n{stderr}",
-                        exit_code=None, outcome="failed",
-                    )
-                out.seek(0); err.seek(0)
-                stdout, stderr = out.read(), err.read()
-                (dispatch_dir / "agent.stdout.log").write_text(stdout, encoding="utf-8")
-                (dispatch_dir / "agent.stderr.log").write_text(stderr, encoding="utf-8")
-                outcome = self._classify(proc.returncode, stdout, stderr)
-                text = stdout if proc.returncode == 0 else (stderr or stdout)
-                return Result(text=text, exit_code=proc.returncode, outcome=outcome)
-
-        return run_external(execute, self.timeout_s)
+        result = _capture(
+            argv,
+            cwd=workdir,
+            timeout_s=self.timeout_s,
+            shell=False,
+            env={**os.environ, **self.env},
+        )
+        (dispatch_dir / "agent.stdout.log").write_text(result.stdout, encoding="utf-8")
+        (dispatch_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
+        if result.timed_out:
+            return Result(
+                text=f"[timeout] script exceeded {self.timeout_s}s\n{result.stderr}",
+                outcome="failed",
+            )
+        assert result.returncode is not None
+        outcome = self._classify(result.returncode, result.stdout, result.stderr)
+        text = result.stdout if result.returncode == 0 else (result.stderr or result.stdout)
+        return Result(text=text, exit_code=result.returncode, outcome=outcome)
 
 
 class RigRegistry:
-    """Resolves a RigRef name to a Rig at execution time."""
-
     def __init__(self, rigs: dict[str, Rig]) -> None:
         self._rigs = dict(rigs)
 
