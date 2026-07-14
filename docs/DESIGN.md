@@ -473,9 +473,8 @@ Audit lenses are planner-chosen from a **lens library** (D4); the run-16 seed le
 are kid-simulation, fresh-eyes-architecture, and render-sweep. The user's job-spec
 epoch/shape sketch is the **strongest suggestion** (D3): the planner may deviate with a
 journaled rationale. The user's `done_when` acceptance, if given, runs **once at END**
-(invariant 4); with no acceptance, planner judgment is the exit. This macro is not in
-the PoC engine (it needs `dispatch`/`combine`) but the event vocabulary already carries
-everything it emits (`judged`, `result`, `boundary`).
+(invariant 4); with no acceptance, planner judgment is the exit. This named macro is not bundled yet, but its `dispatch`/`combine` primitives and event
+vocabulary are executable.
 
 ---
 
@@ -513,8 +512,8 @@ Historical build order (D7/D8, bottom-up): (1) expression PoC; (2) durability;
 dashboard. **Current status:** the engine has fsynced journal replay, per-node and
 predicate worktrees, exact receipt/run-tip verification, executable
 `do`/`inplace`/`ask`/`setup`/`seq`/bounded-`dispatch`/command-`loop`, and a
-planner-rig run loop with deadline/max-epoch rails and target-local run state. `combine`,
-a real model planner rig, and the dashboard remain later steps.
+planner-rig run loop with deadline/max-epoch rails, target-local run state, executable
+`combine`, and bundled model adapters. The dashboard remains a later step.
 
 ---
 

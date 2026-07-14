@@ -35,6 +35,8 @@ case "${STUB_MODE:?}" in
   busy) echo '429: usage limit reached' >&2; exit 9 ;;
   garbage) printf '```json\nnot-json\n```\n' ;;
   embedded) printf 'noise\n```json\n{"expression":{"kind":"inplace","edits":[{"path":"x","content":"```python\\nx\\n```"}]}}\n```\n' ;;
+  bare-embedded) printf '{"task":"use ```python\\nx\\n```"}' ;;
+  nonfinite) printf '{"expression":NaN}' ;;
   *) exit 2 ;;
 esac
 ''')
@@ -103,6 +105,8 @@ def test_planner_adapter_reads_stdin_and_prints_only_valid_json(tmp_path: Path) 
     assert json.loads(embedded.text)["expression"]["edits"][0]["content"] == (
         "```python\nx\n```"
     )
+    bare, _ = _run(tmp_path / "bare", "planner-picodex.sh", "bare-embedded")
+    assert json.loads(bare.text)["task"] == "use ```python\nx\n```"
 
 
 def test_planner_adapter_rejects_garbage_nonzero(tmp_path: Path) -> None:
@@ -110,6 +114,9 @@ def test_planner_adapter_rejects_garbage_nonzero(tmp_path: Path) -> None:
     assert result.outcome == "failed"
     assert result.exit_code != 0
     assert "malformed decision JSON" in result.text
+    nonfinite, _ = _run(tmp_path / "nonfinite", "planner-picodex.sh", "nonfinite")
+    assert nonfinite.outcome == "failed"
+    assert "non-standard JSON constant" in nonfinite.text
 
 
 def test_picodex_worker_returns_text_and_classifies_busy(tmp_path: Path) -> None:

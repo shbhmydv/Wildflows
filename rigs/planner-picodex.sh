@@ -60,13 +60,22 @@ import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-fence = re.search(r"```(?:json)?\s*(.*)```", text, flags=re.IGNORECASE | re.DOTALL)
-candidate = fence.group(1).strip() if fence else text.strip()
+
+def reject_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant {value}")
+
+def decode(candidate: str) -> object:
+    return json.loads(candidate, parse_constant=reject_constant)
+
 try:
-    value = json.loads(candidate)
-except json.JSONDecodeError as exc:
-    raise SystemExit(f"planner-picodex: malformed decision JSON: {exc}") from exc
+    value = decode(text.strip())
+except (json.JSONDecodeError, ValueError):
+    fence = re.search(r"```(?:json)?\s*(.*)```", text, flags=re.IGNORECASE | re.DOTALL)
+    try:
+        value = decode(fence.group(1).strip()) if fence else decode(text.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(f"planner-picodex: malformed decision JSON: {exc}") from exc
 if not isinstance(value, dict):
     raise SystemExit("planner-picodex: decision must be one JSON object")
-print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+print(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
 PY

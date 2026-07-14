@@ -88,7 +88,18 @@ def test_load_rigs_rejects_nonpositive_timeout(tmp_path: Path) -> None:
 
 
 def test_example_rigs_yaml_loads() -> None:
-    example = Path(__file__).resolve().parents[1] / "examples" / "rigs.yaml"
-    registry = load_rigs(example)
+    root = Path(__file__).resolve().parents[1]
+    registry = load_rigs(root / "examples" / "rigs.yaml")
     assert isinstance(registry.resolve("echo"), EchoRig)
     assert isinstance(registry.resolve("shell-claude"), ShellRig)
+
+    toy = load_rigs(root / "examples" / "toy-run" / "rigs.yaml")
+    for name, script in (
+        ("planner", "planner-picodex.sh"),
+        ("local", "worker-local.sh"),
+        ("senior", "worker-picodex.sh"),
+    ):
+        adapter = toy.resolve(name)
+        assert isinstance(adapter, ScriptRig)
+        assert adapter.script == root / "rigs" / script
+        assert adapter.script.is_file()
