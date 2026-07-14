@@ -1,0 +1,16 @@
+rigs:
+  planner:
+    kind: script
+    script: ../../rigs/planner-picodex.sh
+    log_dir: .logs/planner
+    timeout_s: 1800
+  local:
+    kind: script
+    script: ../../rigs/worker-local.sh
+    log_dir: .logs/local
+    timeout_s: 900
+  senior:
+    kind: script
+    script: ../../rigs/worker-picodex.sh
+    log_dir: .logs/senior
+    timeout_s: 1800

@@ -8,11 +8,12 @@ crash-recoverable, fully journalled — open source.
 wildflows is an agent-workflow orchestrator. A planner-model owns *strategy*
 (which workflow shape to run, how to verify, when to end); a deterministic core
 owns *effects* (git, disk, journal, budgets/rails). Workflows are not a registry
-of files — they are **expressions** over seven primitives:
+of files — they are **expressions** over eight primitives:
 
 ```
 do(task, rig, ctx)     one agent, one task -> a result
 dispatch(tasks)        parallel do()s
+seq(children)           strict ordered composition
 combine(results, task) a do() whose input is other results
 loop(expr, until, cap) repeat a sub-expression until a condition or cap
 inplace(edit)          the planner's own hands: a small fix, core commits it
@@ -43,25 +44,33 @@ macro is not part of the core yet.
 
 ## Status
 
-Current core: fsynced journal/replay, per-node worktree execution, exact
-receipt/run-branch verification, executable `do`, `inplace`, `ask`, `setup`, `seq`,
-bounded `dispatch`, and command `loop`. A registered rig now drives the durable
-planner/run loop; deadline/max-epoch rails and planner-nudge macro listings are live.
-`combine`, a real picodex planner script, and the dashboard remain on the build ladder.
-See [`docs/DESIGN.md`](docs/DESIGN.md) and
-[`docs/PLANNER-RIG.md`](docs/PLANNER-RIG.md).
+Current core: v1 fsynced journal/replay, per-node worktree execution, exact
+receipt/run-branch verification, all eight expression kinds (command predicates for
+`loop`), bounded `dispatch`, and planner/run rails. Bundled adapters cover picodex
+planner/senior roles and the local OpenAI-compatible worker. The dashboard remains on
+the build ladder. See [`docs/DESIGN.md`](docs/DESIGN.md),
+[`docs/PLANNER-RIG.md`](docs/PLANNER-RIG.md), and [`docs/RIGS.md`](docs/RIGS.md).
 
 ## Develop
 
 ```
 pip install -e '.[dev]'
-pytest
-mypy
+python3 -m pytest -q
+python3 -m mypy --strict wildflows tests
 ```
 
 `Run` stores state at `.wildflows/runs/<run-id>/` in the target repository: the
 journal, verbatim planner decisions, bounded-result artifacts, and disposable worktrees.
 Add `.wildflows/runs/` to the target project's ignore rules when needed.
+
+Run the live adapter smoke from the checkout (see the example README for prerequisites):
+
+```bash
+python3 -m wildflows run examples/toy-run/job.md --repo <target>
+```
+
+Resume with `python3 -m wildflows resume ... --run-id <id>`; add `--answer TEXT`
+for a parked owner question.
 
 ## Topics
 
