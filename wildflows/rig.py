@@ -1,11 +1,9 @@
 """The multi-harness seam: ``Rig.run(prompt, workdir) -> Result``.
-
 External commands use a small in-process process-group barrier.  Timeout kills the
 whole group; there are no durable process records or restart reaper because every
 attempt path is disposable and never reused.
 """
 from __future__ import annotations
-
 import os
 import re
 import shlex
@@ -15,9 +13,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO, runtime_checkable
-
 from wildflows.result import Outcome, Result
-
 __all__ = [
     "Outcome",
     "Result",
@@ -30,7 +26,6 @@ __all__ = [
     "ScriptRig",
     "RigRegistry",
 ]
-
 DEFAULT_BUSY_PATTERNS = [
     r"rate.?limit",
     r"429",
@@ -41,16 +36,12 @@ DEFAULT_BUSY_PATTERNS = [
     r"plan limit",
     r"too many requests",
 ]
-
-
 @dataclass(frozen=True)
 class ExternalResult:
     returncode: int | None
     stdout: str
     stderr: str
     timed_out: bool = False
-
-
 def _kill_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -61,8 +52,6 @@ def _kill_group(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
-
-
 def _capture(
     command: str | list[str],
     *,
@@ -100,27 +89,18 @@ def _capture(
         stdout.seek(0)
         stderr.seek(0)
         return ExternalResult(returncode, stdout.read(), stderr.read(), timed_out)
-
-
 def run_shell(command: str, workdir: Path, timeout_s: float) -> ExternalResult:
     return _capture(command, cwd=workdir, timeout_s=timeout_s, shell=True)
-
-
 @runtime_checkable
 class Rig(Protocol):
     def run(self, prompt: str, workdir: Path) -> Result: ...
-
-
 class EchoRig:
     def run(self, prompt: str, workdir: Path) -> Result:
         return Result(text=f"echo: {prompt}", exit_code=0)
-
-
 class ShellRig:
     def __init__(self, template: str, timeout_s: float) -> None:
         self.template = template
         self.timeout_s = timeout_s
-
     def run(self, prompt: str, workdir: Path) -> Result:
         command = self.template.replace("{prompt}", shlex.quote(prompt))
         result = run_shell(command, workdir, self.timeout_s)
@@ -136,11 +116,8 @@ class ShellRig:
             exit_code=result.returncode,
             outcome="ok" if ok else "failed",
         )
-
-
 class ScriptRig:
     """Drive the existing grindstone-compatible executor script contract."""
-
     def __init__(
         self,
         script: Path,
@@ -156,14 +133,12 @@ class ScriptRig:
         self._busy_re = re.compile(
             "|".join(busy_patterns or DEFAULT_BUSY_PATTERNS), re.IGNORECASE
         )
-
     def _classify(self, returncode: int, stdout: str, stderr: str) -> Outcome:
         if returncode == 0:
             return "ok"
         if self._busy_re.search(stderr) or self._busy_re.search(stdout):
             return "busy"
         return "failed"
-
     def run(self, prompt: str, workdir: Path) -> Result:
         dispatch_dir = self.log_dir / workdir.name
         dispatch_dir.mkdir(parents=True, exist_ok=True)
@@ -201,15 +176,11 @@ class ScriptRig:
         outcome = self._classify(result.returncode, result.stdout, result.stderr)
         text = result.stdout if result.returncode == 0 else (result.stderr or result.stdout)
         return Result(text=text, exit_code=result.returncode, outcome=outcome)
-
-
 class RigRegistry:
     def __init__(self, rigs: dict[str, Rig]) -> None:
         self._rigs = dict(rigs)
-
     def __contains__(self, name: object) -> bool:
         return name in self._rigs
-
     def resolve(self, name: str) -> Rig:
         if name not in self._rigs:
             raise KeyError(f"unknown rig: {name!r}")

@@ -1,38 +1,25 @@
 """Fsynced append-only journal and its one live projection.
-
 Creation and continuation are deliberately separate.  A failed append poisons its
 owner; only a fresh load may classify and durably repair a torn final record.
 """
 from __future__ import annotations
-
 import json
 import os
 from pathlib import Path
-
 from wildflows.events import Event, parse_event
 from wildflows.projection import RunProjection
-
-
 class JournalPoisonedError(RuntimeError):
     pass
-
-
 class JournalExistsError(RuntimeError):
     pass
-
-
 class JournalCompatibilityError(ValueError):
     pass
-
-
 def _fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
-
-
 class Journal:
     def __init__(self, run_dir: Path) -> None:
         self._initialize(run_dir)
@@ -40,7 +27,6 @@ class Journal:
             raise JournalExistsError(
                 "existing nonempty journal must be continued with Journal.load"
             )
-
     def _initialize(self, run_dir: Path) -> None:
         self.run_dir = Path(run_dir)
         missing: list[Path] = []
@@ -55,7 +41,6 @@ class Journal:
         self._events: list[Event] = []
         self.projection = RunProjection()
         self._poisoned = False
-
     def append(self, event: Event) -> int:
         if self._poisoned:
             raise JournalPoisonedError(
@@ -79,14 +64,11 @@ class Journal:
         self._events.append(event)
         self.projection.apply(event)
         return seq
-
     def events(self) -> list[Event]:
         return list(self._events)
-
     @property
     def n_events(self) -> int:
         return len(self._events)
-
     @classmethod
     def load(cls, run_dir: Path) -> "Journal":
         journal = cls.__new__(cls)

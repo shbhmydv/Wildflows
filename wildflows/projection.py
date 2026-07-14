@@ -1,39 +1,28 @@
 """The one live fold of the append-only journal.
-
 Running and resumed engines use the same ``RunProjection.apply`` path.  State is keyed
 by ``(epoch, node_id)`` and loop floors scope repeated node ids to one iteration.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from pathlib import Path
-
 from wildflows.events import Boundary, Dispatched, Event, Integrated, LoopIter, ResultEvent
 from wildflows.result import IntegrationReceipt, Result
-
 NodeKey = tuple[int, str]
 Floor = int | None
-
-
 @dataclass(frozen=True)
 class ExecutionOutcome:
     key: NodeKey | None = None
     children: tuple["ExecutionOutcome", ...] = ()
-
     def result_key(self) -> NodeKey | None:
         if self.children:
             return self.children[-1].result_key()
         return self.key
-
-
 @dataclass
 class LoopIterRecord:
     seq: int
     commit: str | None
     converged: bool
     body: Result | None
-
-
 @dataclass
 class NodeProjection:
     dispatched: bool = False
@@ -52,30 +41,24 @@ class NodeProjection:
     loop_last_body: Result | None = None
     loop_converged: bool = False
     loop_iters: list[LoopIterRecord] = field(default_factory=list)
-
     def has_unfinished_dispatch(self, floor: Floor) -> bool:
         return (
             floor is not None
             and self.last_dispatch_seq > floor
             and self.last_dispatch_seq > self.result_seq
         )
-
-
 @dataclass
 class EpochProjection:
     phase: str = ""
     expr: dict[str, object] | None = None
     run_branch: str | None = None
     base_commit: str | None = None
-
-
 class RunProjection:
     def __init__(self) -> None:
         self.nodes: dict[NodeKey, NodeProjection] = {}
         self.epochs: dict[int, EpochProjection] = {}
         self._results_by_seq: dict[int, Result] = {}
         self._last_result_seq = -1
-
     def apply(self, event: Event) -> None:
         if isinstance(event, Boundary):
             epoch = self.epochs.setdefault(event.epoch, EpochProjection())
@@ -127,7 +110,6 @@ class RunProjection:
                     body=node.loop_last_body,
                 )
             )
-
     def resume_action(self, key: NodeKey, floor: Floor) -> str:
         """Return ``run`` or ``done`` for one leaf in the requested loop scope."""
         node = self.nodes.get(key)
@@ -142,7 +124,6 @@ class RunProjection:
         ):
             return "run"
         return "done"
-
     def loop_resume(
         self, key: NodeKey, floor: Floor
     ) -> tuple[int, Floor, bool, Result | None]:
@@ -154,35 +135,27 @@ class RunProjection:
             return 0, floor, False, None
         last = records[-1]
         return len(records), last.seq, last.converged, last.body
-
     def node(self, key: NodeKey) -> NodeProjection:
         return self.nodes.get(key, NodeProjection())
-
     def result(self, key: NodeKey | None) -> Result | None:
         if key is None:
             return None
         node = self.nodes.get(key)
         return node.result if node is not None else None
-
     def result_text(self, key: NodeKey) -> str | None:
         result = self.result(key)
         return result.text if result is not None else None
-
     def epoch_opened(self, epoch: int) -> bool:
         return epoch in self.epochs
-
     def epoch_closed(self, epoch: int) -> bool:
         value = self.epochs.get(epoch)
         return value is not None and value.phase == "closed"
-
     def epoch_expr(self, epoch: int) -> dict[str, object] | None:
         value = self.epochs.get(epoch)
         return value.expr if value is not None else None
-
     @property
     def results(self) -> dict[NodeKey, Result]:
         return {key: node.result for key, node in self.nodes.items() if node.result is not None}
-
     @property
     def integrated(self) -> dict[NodeKey, list[str]]:
         return {
@@ -190,7 +163,6 @@ class RunProjection:
             for key, node in self.nodes.items()
             if node.receipt is not None
         }
-
     @property
     def receipts(self) -> dict[NodeKey, IntegrationReceipt]:
         return {
@@ -198,11 +170,9 @@ class RunProjection:
             for key, node in self.nodes.items()
             if node.receipt is not None
         }
-
     @property
     def dispatched(self) -> set[NodeKey]:
         return {key for key, node in self.nodes.items() if node.dispatched}
-
     @property
     def loop_iterations(self) -> dict[NodeKey, int]:
         return {
@@ -210,7 +180,6 @@ class RunProjection:
             for key, node in self.nodes.items()
             if node.loop_iterations
         }
-
     @property
     def loop_last_commit(self) -> dict[NodeKey, str | None]:
         return {
@@ -218,9 +187,6 @@ class RunProjection:
             for key, node in self.nodes.items()
             if node.loop_last_iter_seq >= 0
         }
-
-
 def replay(run_dir: Path) -> RunProjection:
     from wildflows.journal import Journal
-
     return Journal.load(run_dir).projection

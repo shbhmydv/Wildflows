@@ -1,17 +1,14 @@
 """Serial workflow execution on fresh per-node Git worktrees.
-
 The run branch is the only accepted state.  A node works on a detached worktree at the
 branch tip, journals its result, then fast-forwards the verified commit range and
 journals the receipt.  Failure discards the worktree; resume verifies the append-only
 claims and reruns incomplete work from the exact last known branch tip.
 """
 from __future__ import annotations
-
 import json
 import os
 from pathlib import Path
 from typing import NoReturn
-
 from wildflows.admission import admit_epoch
 from wildflows.events import Boundary, Dispatched, Integrated, LoopIter, ResultEvent
 from wildflows.expr import CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Until
@@ -26,7 +23,6 @@ from wildflows.workspace import (
     Repository,
     RepositoryError,
 )
-
 __all__ = [
     "Engine",
     "NodeExecutionError",
@@ -36,20 +32,12 @@ __all__ = [
     "replay",
     "RunProjection",
 ]
-
-
 class NodeExecutionError(RuntimeError):
     """A node failed; its worktree was abandoned and the epoch remains open."""
-
-
 class PredicateEvaluationError(RuntimeError):
     """A command predicate timed out or could not be evaluated."""
-
-
 class ResumeVerificationError(RuntimeError):
     """Journalled Git claims cannot be reconciled with the run branch."""
-
-
 class Engine:
     def __init__(
         self,
@@ -69,19 +57,15 @@ class Engine:
                     f"journal belongs to {epoch.run_branch!r}, not {self.repo.ref!r}"
                 )
         self._verify_resume_claims()
-
     @property
     def workdir(self) -> Path:
         return self.repo.root
-
     @property
     def run_branch(self) -> str:
         return self.repo.branch
-
     @property
     def _proj(self) -> RunProjection:
         return self.journal.projection
-
     def run_epoch(self, tree: Expr, epoch: int) -> None:
         self._verify_resume_claims()
         tree = admit_epoch(tree, epoch, self._proj, self.registry)
@@ -111,13 +95,10 @@ class Engine:
                 reason="done",
             )
         )
-
     # -- journal / branch verification -------------------------------------
-
     def _verify_resume_claims(self) -> None:
         while self._verify_once():
             pass
-
     def _verify_once(self) -> bool:
         events = self.journal.events()
         if not events:
@@ -131,7 +112,6 @@ class Engine:
         results: dict[NodeKey, ResultEvent] = {}
         integrated_after: dict[NodeKey, int] = {}
         expected: str | None = None
-
         for event in events:
             if isinstance(event, Boundary) and event.phase == "opened":
                 if event.run_branch is None or event.base_commit is None:
@@ -176,13 +156,10 @@ class Engine:
                 self.repo.verify_receipt(base, event.commits)
             except RepositoryError as exc:
                 if self.repo.branch_tip() == expected:
-                    self._append_result(
+                    self._journal_fallback(
                         key,
-                        Result(
-                            text=f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
-                            outcome="failed",
-                        ),
-                        post_head=expected,
+                        f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
+                        expected,
                         fallback_for=event.seq,
                     )
                     return True
@@ -191,11 +168,9 @@ class Engine:
                 ) from exc
             expected = event.commit
             integrated_after[key] = event.seq
-
         if expected is None:
             raise ResumeVerificationError("journal has no worktree-model opened boundary")
         live = self.repo.branch_tip()
-
         outstanding = [
             (key, result)
             for key, result in results.items()
@@ -212,10 +187,8 @@ class Engine:
             candidate = result.post_head
             if base != expected or candidate is None:
                 if live == expected:
-                    self._append_result(
-                        key,
-                        Result(text="resume fallback: incomplete integration claim", outcome="failed"),
-                        post_head=expected,
+                    self._journal_fallback(
+                        key, "resume fallback: incomplete integration claim", expected
                     )
                     return True
                 raise BranchDivergedError("run branch does not match an incomplete claim")
@@ -231,26 +204,21 @@ class Engine:
                 self._append_integrated(key, receipt)
                 return True
             if live == expected:
-                self._append_result(
+                self._journal_fallback(
                     key,
-                    Result(
-                        text="resume fallback: result was journalled but its commits did not land",
-                        outcome="failed",
-                    ),
-                    post_head=expected,
+                    "resume fallback: result was journalled but its commits did not land",
+                    expected,
                 )
                 return True
             raise BranchDivergedError(
                 f"run branch moved outside incomplete attempt: expected {expected} "
                 f"or {candidate}, found {live}"
             )
-
         if live != expected:
             raise BranchDivergedError(
                 f"run branch {self.repo.branch!r} has operator commits: "
                 f"journal expects {expected}, found {live}"
             )
-
         unfinished = [
             (key, node)
             for key, node in self._proj.nodes.items()
@@ -260,16 +228,26 @@ class Engine:
             key, node = min(unfinished, key=lambda item: item[1].last_dispatch_seq)
             if node.dispatched_pre_head != expected:
                 raise ResumeVerificationError("unfinished attempt did not start at verified tip")
-            self._append_result(
-                key,
-                Result(text="resume fallback: interrupted attempt abandoned", outcome="failed"),
-                post_head=expected,
+            self._journal_fallback(
+                key, "resume fallback: interrupted attempt abandoned", expected
             )
             return True
         return False
-
+    def _journal_fallback(
+        self, key: NodeKey, text: str, tip: str, *, fallback_for: int | None = None
+    ) -> None:
+        self._append_result(
+            key, Result(text=text, outcome="failed"), post_head=tip,
+            fallback_for=fallback_for,
+        )
+        if self._proj.epoch_closed(key[0]):
+            epoch = self._proj.epochs[key[0]]
+            self.journal.append(Boundary(
+                run_id=self.run_id, epoch=key[0], node_id="n0", phase="opened",
+                expr=epoch.expr, run_branch=self.repo.ref, base_commit=tip,
+                reason="resume fallback",
+            ))
     # -- expression traversal ----------------------------------------------
-
     def _exec(self, node: Expr, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if isinstance(node, (Do, Inplace)) and self._proj.resume_action(key, floor) == "done":
@@ -290,7 +268,6 @@ class Engine:
         if isinstance(node, Inplace):
             return self._exec_inplace(node, epoch)
         return ExecutionOutcome(key=key)
-
     def _exec_do(self, node: Do, epoch: int) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         base = self.repo.branch_tip()
@@ -327,7 +304,6 @@ class Engine:
             return ExecutionOutcome(key=key)
         finally:
             self.repo.remove_worktree(worktree)
-
     def _exec_inplace(self, node: Inplace, epoch: int) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         base = self.repo.branch_tip()
@@ -374,7 +350,6 @@ class Engine:
             return ExecutionOutcome(key=key)
         finally:
             self.repo.remove_worktree(worktree)
-
     def _complete_attempt(
         self,
         key: NodeKey,
@@ -402,9 +377,7 @@ class Engine:
             )
             raise NodeExecutionError(str(exc)) from exc
         self._append_integrated(key, receipt)
-
     # -- loops and predicates ----------------------------------------------
-
     def _exec_loop(self, node: Loop, epoch: int, floor: Floor) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         state = self._proj.node(key)
@@ -416,7 +389,6 @@ class Engine:
         if resume_from and (last_converged or resume_from >= node.cap):
             self._finish_loop(node, epoch, last_body, resume_from, last_converged)
             return ExecutionOutcome(key=key)
-
         iterations = resume_from
         converged = False
         for index in range(resume_from, node.cap):
@@ -446,7 +418,6 @@ class Engine:
                 break
         self._finish_loop(node, epoch, last_body, iterations, converged)
         return ExecutionOutcome(key=key)
-
     def _finish_loop(
         self,
         node: Loop,
@@ -472,11 +443,9 @@ class Engine:
             post_head=self.repo.branch_tip(),
             loop_status=status,
         )
-
     def _until_command(self, until: Until) -> str:
         assert until.cmd is not None
         return until.cmd
-
     def _exec_predicate(self, node: Loop, epoch: int) -> bool:
         key = (epoch, f"{node.node_id}.until")
         base = self.repo.branch_tip()
@@ -524,9 +493,7 @@ class Engine:
             return evaluation.returncode == 0
         finally:
             self.repo.remove_worktree(worktree)
-
     # -- results, artifacts, failures, context ------------------------------
-
     def _append_result(
         self,
         key: NodeKey,
@@ -553,7 +520,6 @@ class Engine:
                 fallback_for=fallback_for,
             )
         )
-
     def _append_integrated(self, key: NodeKey, receipt: IntegrationReceipt) -> None:
         self.journal.append(
             Integrated(
@@ -563,7 +529,6 @@ class Engine:
                 commits=receipt.commits,
             )
         )
-
     def _persist_artifact(self, key: NodeKey, result: Result) -> None:
         node = key[1].replace("/", "-").replace("..", "-")
         directory = self.run_dir / "artifacts" / f"e{key[0]}-{node}"
@@ -581,15 +546,12 @@ class Engine:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-
     def _record_failed_result(self, key: NodeKey, base: str, result: Result) -> NoReturn:
         self.repo.ensure_tip(base)
         self._append_result(key, result, post_head=base)
         raise NodeExecutionError(result.text or f"node {key[1]} failed")
-
     def _fail_node(self, key: NodeKey, base: str, text: str) -> NoReturn:
         self._record_failed_result(key, base, Result(text=text, outcome="failed"))
-
     def _materialize_ctx(self, node: Do, epoch: int, worktree: NodeWorktree) -> str | None:
         if not node.ctx:
             return node.task
@@ -600,7 +562,6 @@ class Engine:
                 return None
             parts.append(block)
         return "\n\n".join(parts)
-
     def _resolve_ctx(self, ref: CtxRef, epoch: int, worktree: Path) -> str | None:
         if ref.kind == "file":
             content = self.repo.read_file(worktree, ref.ref)
@@ -611,6 +572,5 @@ class Engine:
         if text is None:
             return None
         return f"## Context: node {ref.ref}\n{text}"
-
     def _commit_message(self, kind: str, key: NodeKey) -> str:
         return f"wildflows {kind} {key[1]} (run {self.run_id}, epoch {key[0]})"
