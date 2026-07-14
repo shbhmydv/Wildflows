@@ -23,7 +23,7 @@ from wildflows.result import Outcome, Result
 # `from wildflows.rig import Result` keeps working for rig implementations.
 __all__ = [
     "Outcome", "Result", "DEFAULT_BUSY_PATTERNS", "Rig", "EchoRig", "ShellRig",
-    "ScriptRig", "RigRegistry", "process_launcher",
+    "ScriptRig", "RigRegistry", "process_launcher", "run_external",
 ]
 
 ProcessLauncher = Callable[[Callable[[], bytes], float], bytes]
@@ -42,7 +42,8 @@ def process_launcher(launcher: ProcessLauncher) -> Iterator[None]:
         _PROCESS_LAUNCHER.reset(token)
 
 
-def _run_external(operation: Callable[[], Result], timeout_s: float) -> Result:
+def run_external(operation: Callable[[], Result], timeout_s: float) -> Result:
+    """Use the engine's durable launcher when bound; direct calls are standalone."""
     launcher = _PROCESS_LAUNCHER.get()
     if launcher is None:  # direct library use; engine execution always binds a launcher
         return operation()
@@ -122,7 +123,7 @@ class ShellRig:
                     outcome="ok" if ok else "failed",
                 )
 
-        return _run_external(execute, self.timeout_s)
+        return run_external(execute, self.timeout_s)
 
 
 class ScriptRig:
@@ -214,7 +215,7 @@ class ScriptRig:
                 text = stdout if proc.returncode == 0 else (stderr or stdout)
                 return Result(text=text, exit_code=proc.returncode, outcome=outcome)
 
-        return _run_external(execute, self.timeout_s)
+        return run_external(execute, self.timeout_s)
 
 
 class RigRegistry:

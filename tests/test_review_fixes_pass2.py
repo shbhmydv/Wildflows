@@ -363,7 +363,7 @@ def test_shell_rig_timeout_kills_background_process_group(tmp_path: Path) -> Non
     )
     result = replay(tmp_path / "run").results[(0, "n0")]
     assert result.ok is False
-    assert "timeout" in result.text
+    assert "[timeout] command exceeded 0.4" in result.text
     time.sleep(0.2)
     child = int(pid_file.read_text().strip())
     with pytest.raises(ProcessLookupError):

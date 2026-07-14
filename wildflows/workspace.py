@@ -2042,11 +2042,19 @@ class WorkspaceEffects:
         if record is None:
             return
         leader = self._proc_identity(record.pid)
-        if leader is not None and leader == (record.start_time, leader[1], record.pgid):
+        if leader is not None:
+            if leader[0] != record.start_time:
+                # A live different generation proves the old numeric PGID was released;
+                # never apply the launch-time lower bound to this recycled group.
+                self._settle_process(record)
+                return
+            if leader[2] != record.pgid:
+                raise WorkspaceFault("recorded process leader changed process group")
             try:
-                os.getpgid(record.pid)
-            except ProcessLookupError:  # leader exited between /proc and getpgid
-                leader = None
+                if os.getpgid(record.pid) != record.pgid:
+                    raise WorkspaceFault("recorded process leader changed process group")
+            except ProcessLookupError:
+                pass  # leader exited between /proc and getpgid; enumerate/recheck below
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             members = self._group_processes(record)
@@ -2054,15 +2062,18 @@ class WorkspaceEffects:
                 self._settle_process(record)
                 return
             for pid in members:
-                current = self._proc_identity(pid)
-                if current is None or current[1] == "Z" or not (
-                    current[2] == record.pgid and current[0] >= record.start_time
-                ):
+                try:
+                    pidfd = os.pidfd_open(pid)
+                except ProcessLookupError:
                     continue
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                    current = self._proc_identity(pid)
+                    if current is not None and current[1] != "Z" and (
+                        current[2] == record.pgid and current[0] >= record.start_time
+                    ):
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                finally:
+                    os.close(pidfd)
             time.sleep(0.01)
         raise WorkspaceFault("recorded process group did not exit after SIGKILL")
 

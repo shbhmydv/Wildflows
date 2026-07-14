@@ -455,7 +455,10 @@ no engine change. The PoC ships two:
 
 A `RigRef(name, params)` in an expression names which rig and its config; the core
 resolves it through a **rig registry** at execution time. Rigs never touch integration
-git; they only write inside their `workdir`.
+git; they only write inside their `workdir`. An external-command rig routes its command
+through `rig.run_external`, which the engine binds to the durable process supervisor
+without changing the `Rig.run` protocol. Calling a rig directly outside an `Engine` is a
+standalone convenience and does not claim the engine's crash-recovery guarantee.
 
 ### The script contract — THE integration seam (grindstone-compatible by construction)
 
@@ -594,8 +597,8 @@ target-local run state, and the dashboard remain later steps.
     is node_id by construction. Revisit if step 4 names worktrees differently.
 11. **Timeout is represented as `outcome="failed"` + a `[timeout]` text marker**, not a
     fourth outcome — the caller treats a timeout like any other non-busy failure.
-    `ScriptRig` kills the direct child only (`subprocess` timeout); reaping the process
-    GROUP is a step-4 (worktree hygiene) concern.
+    `ScriptRig` kills the direct child only (`subprocess` timeout). **The historical
+    group-reaping deferral is SUPERSEDED by hand-16 entry 73's outer supervisor.**
 12. **`ScriptRig` mirrors `senior_request.sh`'s arg contract** (`--worktree`/`--log-dir`
     /`--handle-out`), NOT `planner_request.sh`'s (`--repo`/`--workdir`/`--out`). The two
     reference scripts diverge: the planner adds `--out` (a decision.json fallback read
@@ -697,9 +700,9 @@ target-local run state, and the dashboard remain later steps.
 26. **Robustness fixes.** Torn-tail load reads RAW BYTES and drops the final record only
     when it lacks a terminating newline AND fails to parse (a newline-terminated invalid
     line is corruption → raise; a mid-UTF-8 unterminated tail recovers) (SHOULD-FIX 1/B2).
-    An unknown rig name is a journalled failed result, not a crash (SHOULD-FIX 2). A
-    `ShellRig` timeout kills the process GROUP (`start_new_session` + `killpg`) so
-    backgrounded children are reaped (SHOULD-FIX 3). A blank/whitespace `Until.cmd` is
+    An unknown rig name is a journalled failed result, not a crash (SHOULD-FIX 2).
+    **Hand-16 entry 73 supersedes ShellRig's historical self-created group/`killpg` path
+    with the one outer supervisor.** A blank/whitespace `Until.cmd` is
     rejected at admission (SHOULD-FIX 5). Core integration parses changed paths NUL-
     delimited (`-z`) so whitespace filenames stay one path (SHOULD-FIX 6). A `ShellRig`
     non-zero exit sets `outcome="failed"` (SHOULD-FIX 7).
@@ -1198,7 +1201,8 @@ than patching each row. Both are the transaction model of record — not a later
     Recovery captures paths from the temporary-tree delta, resets/restores content, restores
     the exact index snapshot last, and verifies both proofs. `assume-unchanged` and
     `skip-worktree` therefore cannot hide a predicate mutation or survive its recovery.
-70. **Predicate process barrier (hand-15).** Every command predicate has a positive timeout
+70. **Predicate process barrier (hand-15; SUPERSEDED by hand-16 entry 73's general
+    barrier).** Every command predicate has a positive timeout
     and runs in a new session behind a session-leader supervisor. The effect command remains
     gated until `(pid, pgid, /proc start-time)` is atomically written and fsynced under
     `run_dir`. Normal completion and timeout SIGKILL the whole group before verification and
@@ -1236,8 +1240,10 @@ than patching each row. Both are the transaction model of record — not a later
     recovery, lease settlement, or redispatch. The reaper never touches Git or workspace
     bytes. For every recorded state, including a vanished leader with surviving members,
     it repeatedly enumerates `/proc`, selects non-zombie processes whose PGID equals the
-    record and whose start-time is at least the recorded launch start-time, SIGKILLs those
-    PIDs, and verifies that no eligible member remains before fsync-settling the record.
+    record and whose start-time is at least the recorded launch start-time, rechecks and
+    SIGKILLs each through a pidfd (closing the stat-to-signal reuse race), and verifies that
+    no eligible member remains before fsync-settling the record. An extant recorded PID
+    with a different start-time proves numeric-generation recycling and is never signalled.
     Leader `getpgid` ESRCH is an absent/recheck race, not a raw restart failure. This
     supersedes decision 70's predicate-specific mechanism and makes the M2
     `ProcessSupervisor` authority explicit while M1 execution remains serial.

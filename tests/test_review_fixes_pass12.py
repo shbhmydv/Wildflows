@@ -40,18 +40,32 @@ def _wait_for(path: Path, message: str) -> None:
         pytest.fail(message)
 
 
-def _wait_process_stopped(pid: int) -> None:
+def _kill_and_wait(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _wait_process_absent(pid: int) -> None:
     deadline = time.monotonic() + 5
     stat_path = Path(f"/proc/{pid}/stat")
-    while time.monotonic() < deadline:
-        try:
-            raw = stat_path.read_text(encoding="ascii")
-        except FileNotFoundError:
-            return
-        if raw.rpartition(")")[2].split()[0] == "Z":
-            return
+    while stat_path.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
-    pytest.fail(f"process {pid} did not stop")
+    if stat_path.exists():
+        pytest.fail(f"process {pid} did not disappear")
+
+
+def _process_is_live(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return False
+    return raw.rpartition(")")[2].split()[0] != "Z"
 
 
 def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_pipe_breaks(
@@ -74,16 +88,17 @@ def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_p
     )
 
     engine_pid = _fork_engine(run_dir, workdir, tree, RigRegistry({}))
-    _wait_for(delayed_started, "predicate did not start")
-    records = [
-        *list((run_dir / "processes").glob("*.json")),
-        *list((run_dir / "predicate-processes").glob("*.json")),
-    ]
-    assert len(records) == 1
-    supervisor_pid = int(json.loads(records[0].read_text())["pid"])
-    os.kill(engine_pid, signal.SIGKILL)
-    os.waitpid(engine_pid, 0)
-    _wait_process_stopped(supervisor_pid)  # result delivery has lost its reader
+    try:
+        _wait_for(delayed_started, "predicate did not start")
+        records = [
+            *list((run_dir / "processes").glob("*.json")),
+            *list((run_dir / "predicate-processes").glob("*.json")),
+        ]
+        assert len(records) == 1
+        supervisor_pid = int(json.loads(records[0].read_text())["pid"])
+    finally:
+        _kill_and_wait(engine_pid)
+    _wait_process_absent(supervisor_pid)  # result delivery has lost its reader
 
     Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
     assert replay(run_dir).epoch_closed(0)
@@ -94,30 +109,47 @@ def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_p
 
 
 def test_killed_engine_reaps_inflight_shell_rig_before_recovery_and_after_closure(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workdir = tmp_path / "work"
     _base_repo(workdir)
     run_dir = tmp_path / "run"
     marker = tmp_path / "first-rig-attempt"
     delayed_started = tmp_path / "rig-delayed-writer-started"
+    delayed_pid = tmp_path / "rig-delayed-writer-pid"
     command = (
         f"if test ! -e {shlex.quote(str(marker))}; then "
         f": > {shlex.quote(str(marker))}; "
         f"(: > {shlex.quote(str(delayed_started))}; sleep 1.2; "
-        f"printf ORPHAN > {shlex.quote(str(workdir / 'base.txt'))}) & sleep 20; "
+        f"printf ORPHAN > {shlex.quote(str(workdir / 'base.txt'))}) & "
+        f"echo $! > {shlex.quote(str(delayed_pid))}; sleep 20; "
         "else test \"$(cat base.txt)\" = base; fi"
     )
     tree = Do(task="mutate once", rig=RigRef(name="shell"))
     registry = RigRegistry({"shell": ShellRig(command, timeout_s=30)})
 
     engine_pid = _fork_engine(run_dir, workdir, tree, registry)
-    _wait_for(delayed_started, "shell rig did not start")
-    os.kill(engine_pid, signal.SIGKILL)
-    os.waitpid(engine_pid, 0)
+    try:
+        _wait_for(delayed_started, "shell rig did not start")
+    finally:
+        _kill_and_wait(engine_pid)
     assert (workdir / "base.txt").read_bytes() == b"base"
+    old_child = int(delayed_pid.read_text().strip())
+    original_reap = WorkspaceEffects.reap_process
+    reaped_before_recovery = False
 
+    def assert_reaped(
+        ws: WorkspaceEffects, epoch: int, node_id: str, attempt: int,
+    ) -> None:
+        nonlocal reaped_before_recovery
+        original_reap(ws, epoch, node_id, attempt)
+        if node_id == "n0" and attempt == 0:
+            assert not _process_is_live(old_child)
+            reaped_before_recovery = True
+
+    monkeypatch.setattr(WorkspaceEffects, "reap_process", assert_reaped)
     Engine(run_dir, workdir, registry).run_epoch(tree, 0)
+    assert reaped_before_recovery
     assert replay(run_dir).epoch_closed(0)
     assert (workdir / "base.txt").read_bytes() == b"base"
     time.sleep(1.4)
@@ -180,5 +212,32 @@ def test_reaper_treats_esrch_between_proc_identity_and_getpgid_as_an_absent_or_r
         raise ProcessLookupError
 
     monkeypatch.setattr(os, "getpgid", gone)
+    monkeypatch.setattr(ws, "_group_processes", lambda _record: [])
+    ws.reap_process(0, "n0", 0)
+    assert not path.exists()
+
+
+def test_reaper_never_signals_a_recycled_recorded_leader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wildflows.workspace import ProcessRecord
+
+    ws = WorkspaceEffects(tmp_path / "work", tmp_path / "run")
+    record = ProcessRecord(
+        epoch=0, node_id="n0", attempt=0, pid=4343, pgid=4343, start_time=100
+    )
+    record.integrity = ws._record_integrity(record)
+    path = ws._process_path(0, "n0", 0)
+    ws._fsync_json(path, record)
+    monkeypatch.setattr(ws, "_proc_identity", lambda _pid: (101, "R", 4343))
+
+    def must_not_open(_pid: int) -> int:
+        pytest.fail("reaper opened a recycled process generation")
+
+    monkeypatch.setattr(os, "pidfd_open", must_not_open)
+    monkeypatch.setattr(
+        ws, "_group_processes",
+        lambda _record: pytest.fail("recycled group must not be enumerated"),
+    )
     ws.reap_process(0, "n0", 0)
     assert not path.exists()
