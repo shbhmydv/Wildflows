@@ -16,6 +16,7 @@ from wildflows.engine import (
     BranchDivergedError,
     Engine,
     NodeExecutionError,
+    RepositoryTransientError,
     ResumeVerificationError,
 )
 from wildflows.events import Boundary, Event, Integrated
@@ -196,6 +197,85 @@ def test_missing_current_claimed_commit_falls_back_to_last_verified_tip(
     assert rig.calls == 2
     assert git(eng.workdir, "merge-base", "--is-ancestor", base, "HEAD") == ""
     assert git(eng.workdir, "show", "HEAD:effect") == "2"
+    assert any(
+        event.kind == "boundary"
+        and "missing current claimed commit" in (event.reason or "")
+        for event in resumed.journal.events()
+    )
+
+
+def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    git(repo, "config", "filter.slow.clean", "cat")
+    git(repo, "config", "filter.slow.smudge", "cat")
+    git(repo, "config", "filter.slow.required", "true")
+    (repo / ".gitattributes").write_text("target filter=slow\n", encoding="utf-8")
+    (repo / "target").write_text("base", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "target")
+    git(repo, "commit", "-qm", "filtered base")
+    base = git(repo, "rev-parse", "HEAD")
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="target", content="candidate")])
+    Engine(run_dir, repo, registry()).run_epoch(tree, 0)
+    missing = git(repo, "rev-parse", "HEAD")
+
+    started = tmp_path / "restore-filter-started"
+    filter_script = tmp_path / "slow-restore-smudge.sh"
+    filter_script.write_text(
+        "#!/bin/sh\n"
+        f"printf x >> {shlex.quote(str(started))}\n"
+        "sleep 1\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    filter_script.chmod(0o755)
+    git(repo, "config", "filter.slow.smudge", shlex.quote(str(filter_script)))
+    (repo / ".git" / "objects" / missing[:2] / missing[2:]).unlink()
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            Engine(run_dir, repo, registry())
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+
+    waited = False
+    try:
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            exited, _ = os.waitpid(pid, os.WNOHANG)
+            if exited:
+                waited = True
+                pytest.fail("constructor exited before missing-claim restore blocked")
+            time.sleep(0.01)
+        assert started.exists(), "restore smudge filter did not start"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        waited = True
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    finally:
+        if not waited:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            resumed = Engine(run_dir, repo, registry())
+            break
+        except RepositoryTransientError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+    assert git(repo, "rev-parse", "HEAD") == base
+    assert (repo / "target").read_text(encoding="utf-8") == "base"
+    assert git(repo, "status", "--porcelain") == ""
+    assert not (repo / ".git" / "index.lock").exists()
     assert any(
         event.kind == "boundary"
         and "missing current claimed commit" in (event.reason or "")
@@ -626,6 +706,14 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
     assert git(repo, "rev-parse", "HEAD") == base
     assert git(repo, "rev-parse", "HEAD") != candidate
     assert not any(event.kind == "integrated" for event in resumed.journal.events())
+    assert not (repo / ".git" / "index.lock").exists()
+
+    resumed.run_epoch(tree, 0)
+
+    assert (repo / "target").read_text(encoding="utf-8") == "candidate"
+    assert git(repo, "status", "--porcelain") == ""
+    assert any(event.kind == "integrated" for event in resumed.journal.events())
+    assert not (repo / ".git" / "index.lock").exists()
 
 
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:
