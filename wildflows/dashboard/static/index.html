@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>WILDFLOWS</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark">W</span><span>WILDFLOWS</span></a>
+    <div class="run-picker">
+      <label for="run-select">Run</label>
+      <select id="run-select"><option>Loading…</option></select>
+      <span id="live-dot" class="live-dot"></span>
+    </div>
+    <div class="toolbar">
+      <button id="launch-button" class="button secondary">New run</button>
+      <button id="resume-button" class="button secondary">Resume / retry</button>
+      <button id="kill-button" class="button danger">Kill expression</button>
+      <button id="token-button" class="button icon" title="Set control token">⌁</button>
+    </div>
+  </header>
+
+  <section class="run-header">
+    <div>
+      <div class="eyebrow">ACTIVE EXPRESSION</div>
+      <h1 id="run-title">Select a run</h1>
+      <p id="rationale">Journal-backed control room</p>
+    </div>
+    <div class="run-stats">
+      <div><span>Status</span><strong id="run-state">—</strong></div>
+      <div><span>Epoch</span><strong id="epoch-count">—</strong></div>
+      <div><span>Rails</span><strong id="rails">—</strong></div>
+    </div>
+  </section>
+
+  <main class="workspace">
+    <section class="panel tree-panel">
+      <div class="panel-heading">
+        <div><span class="eyebrow">CURRENT EPOCH</span><h2>Expression tree</h2></div>
+        <div class="legend">
+          <span><i class="pending"></i>Pending</span><span><i class="running"></i>Running</span>
+          <span><i class="integrated"></i>Integrated</span><span><i class="failed"></i>Failed</span>
+          <span><i class="parked-ask"></i>Ask</span>
+        </div>
+      </div>
+      <div id="tree" class="tree empty">No admitted expression</div>
+    </section>
+
+    <aside class="panel inspector-panel">
+      <div class="panel-heading"><div><span class="eyebrow">NODE</span><h2>Inspector</h2></div></div>
+      <div id="inspector" class="inspector empty">Select a node to inspect its task, result, receipts, and artifacts.</div>
+    </aside>
+
+    <section class="panel journal-panel">
+      <div class="panel-heading journal-heading">
+        <div><span class="eyebrow">APPEND ONLY</span><h2>Journal stream</h2></div>
+        <div class="stream-tabs"><button class="tab active" data-stream="journal">Events</button><button class="tab" data-stream="action">Action log</button></div>
+      </div>
+      <div id="journal" class="journal"></div>
+      <pre id="action-log" class="action-log hidden">No action launched from this dashboard.</pre>
+    </section>
+  </main>
+
+  <dialog id="token-dialog">
+    <form method="dialog" id="token-form">
+      <span class="eyebrow">LOCAL CONTROL</span><h2>Control token</h2>
+      <p>Paste the token printed by <code>wildflows dash</code>. It stays in this browser tab.</p>
+      <input id="token-input" type="password" autocomplete="off" placeholder="Control token" required>
+      <div class="dialog-actions"><button value="cancel" formnovalidate class="button secondary">Cancel</button><button value="default" class="button">Save token</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="launch-dialog">
+    <form method="dialog" id="launch-form">
+      <span class="eyebrow">NEW RUN</span><h2>Launch a workflow</h2>
+      <label>Job path<input name="job" placeholder="jobs/job.md" required></label>
+      <label>Rigs path<input name="rigs" placeholder="rigs.yaml" required></label>
+      <div class="form-row"><label>Planner rig<input name="planner_rig" value="planner"></label><label>Workers<input name="max_workers" type="number" min="1" value="1"></label></div>
+      <label>Run id <small>optional</small><input name="run_id" placeholder="generated automatically"></label>
+      <div class="dialog-actions"><button value="cancel" formnovalidate class="button secondary">Cancel</button><button id="launch-submit" value="default" class="button">Launch</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -29,11 +29,18 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--answer")
     resume.add_argument("--answer-node")
     resume.add_argument("--retry-setups", action="store_true")
+    dash = commands.add_parser("dash", help="serve the local live dashboard")
+    dash.add_argument("--repo", type=Path, required=True)
+    dash.add_argument("--port", type=int, default=8765)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "dash":
+        from wildflows.dashboard import serve
+        serve(args.repo, args.port)
+        return 0
     job: Path = args.job
     rigs: Path = args.rigs or job.parent / "rigs.yaml"
     run = Run(
