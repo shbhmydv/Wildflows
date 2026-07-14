@@ -4,22 +4,27 @@ import os
 import re
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 from wildflows.result import CommitReceipt, IntegrationReceipt
 
-_LIBC = ctypes.CDLL(None, use_errno=True)
-_PRCTL = _LIBC.prctl
-_PRCTL.argtypes = [
-    ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
-]
-_PRCTL.restype = ctypes.c_int
+_PRCTL: Callable[[int, int, int, int, int], int] | None = None
+if sys.platform == "linux":
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    _RAW_PRCTL = _LIBC.prctl
+    _RAW_PRCTL.argtypes = [
+        ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+    ]
+    _RAW_PRCTL.restype = ctypes.c_int
+    _PRCTL = _RAW_PRCTL
 _PR_SET_PDEATHSIG = 1
 
 
 def _die_with_parent(parent_pid: int) -> None:
-    if _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+    if _PRCTL is None or _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
         os._exit(127)
     if os.getppid() != parent_pid:
         os.kill(os.getpid(), signal.SIGKILL)
