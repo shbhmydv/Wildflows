@@ -73,16 +73,11 @@ juniors fan out, the senior picks up junior failures).
   (max iterations — a rail).
 - **Output:** the result of the last integrated iteration.
 - **Failure modes / D5 (SETTLED):** live loop-session state dies with the process. On
-  resume the loop **restarts its body from the last integrated iteration**, with the
-  journal tail as the briefing. No session serialization, ever. The `cap` is enforced
-  by the core regardless of what the body claims. A command predicate is a **read-only,
-  idempotent check**: it runs in a durable lease and its exit code is accepted only when
-  tracked/index and untracked state are byte-identical to the lease snapshot. Mutation is
-  captured and reverted by the standard recovery transaction, then journalled as a failed
-  evaluation and raised as a typed error. External effects cannot be mediated (the same is
-  true of rig commands), so predicate authors own their idempotence. The exact redo window
-  is **predicate-executed → `loop_iter` durable**; a crash there reruns the check while the
-  verified in-tree postcondition makes that redo harmless to the worktree.
+  resume the loop restarts at its last `loop_iter` floor; no session serialization. The
+  core enforces `cap`. A command predicate runs with a timeout in its own fresh detached
+  throwaway worktree at the run-branch tip. Its exit code is accepted and the whole
+  worktree is discarded, so tracked/index/untracked mutation has no accepted effect. A
+  crash before `loop_iter` reruns the check in another never-reused worktree.
 
 ### `inplace(edit)`
 The planner's own hands — a small fix with no sub-agent.
@@ -91,11 +86,11 @@ The planner's own hands — a small fix with no sub-agent.
   patch form is a later addition, whole-file write is the minimal core).
 - **Output:** a `Result` describing what was written; `ok` reflects whether the core's
   commit succeeded.
-- **Effects:** the **core** writes the files into the workdir and does `git add` +
-  `git commit`. The model never runs git. This is the one primitive where the "agent"
-  is the planner itself.
-- **Failure modes:** a write outside the workdir is rejected (path-escape guard); an
-  already-identical edit with nothing staged is a durable no-op result with `ok=True`.
+- **Effects:** the core writes and commits only the declared paths in a fresh node
+  worktree, validates the resulting receipt, then fast-forwards the run branch.
+- **Failure modes:** an escape, undeclared changed path, write/commit error, or failed
+  fast-forward abandons the worktree and leaves the run branch untouched. An identical
+  edit with no commit is a durable no-op.
 
 ### `ask(owner)`
 The planner pings the owner with a genuine decision; the expression **parks** until
@@ -165,14 +160,14 @@ scheduler / worktree / planner / dashboard steps each depend on one narrow seam:
 | `engine.py` | epoch lifecycle, expression traversal, primitive orchestration |
 | `admission.py` | dealias + deterministic ids + whole-tree validation (`admit_epoch`) |
 | `projection.py` | the one live journal fold (`RunProjection.apply`), resume decisions, `ExecutionOutcome`, `replay` |
-| `workspace.py` | the effect transaction (`WorkspaceEffects`: lease, git mediation, reconciliation, failure revert+capture, containment) + `CompletionRecorder` (event ordering) |
+| `workspace.py` | plain Git authority: fresh worktrees, receipts, containment, fast-forward CAS, best-effort removal |
 | `result.py` | the `Result` / `Outcome` artifact value + `CommitReceipt` / `IntegrationReceipt` effect record |
 | `journal.py` | the single append owner: seq-assign + fsync + `projection.apply` |
 
 There is exactly ONE state system: the journal's live `RunProjection`, folded by one
 `apply(event)`. Load replays the ndjson through the same `apply`, so a running
-projection and a reloaded one are bit-identical (proven by the frozen journal fixtures
-in `tests/fixtures/journals/`). Resume/durability is one decision — `resume_action` — over
+projection and a reloaded one are bit-identical (covered by journal and resume scenarios).
+Resume/durability is one decision — `resume_action` — over
 an explicit attempt/iteration `floor` (`-1` top-level, an int for a resumed-partial loop
 iteration, `None` for a fresh one) that replaces the old `_NO_RESUME` sentinel.
 
@@ -195,9 +190,9 @@ is written — a representable-but-unrunnable shape never opens an incomplete ep
 **Local Pydantic invariants** (single-model, checked at construction) carry the rest:
 lexical path guards on `Edit.path` and file `CtxRef.ref` (leading dash, absolute, `..`,
 literal `.git`), duplicate paths within one `Inplace`, positive `loop.cap`, and positive
-rig `timeout_s`. **Environment-dependent** checks stay at use time in `Workspace` (symlink
-escapes, the resolved linked-worktree gitdir, a not-yet-created ctx file, git/process
-failures, the actual `until` result) — a validator cannot resolve a symlink.
+rig `timeout_s`. **Environment-dependent** checks stay at use time in `Repository`
+(symlink escapes, a not-yet-created ctx file, Git/process failures, the actual `until`
+result) — a validator cannot resolve a symlink.
 
 ---
 
@@ -217,9 +212,9 @@ types (in `wildflows/events.py`), each a Pydantic model sharing a header
 
 | event        | emitted when                              | key fields |
 |--------------|-------------------------------------------|------------|
-| `boundary`   | an epoch opens / closes                   | `phase: opened\|closed`, `expr` (opened: the admitted tree) |
-| `dispatched` | a `do`/`combine`/`inplace`/`setup` starts | `rig`, `task`/`cmd`, `workdir` |
-| `result`     | an agent/primitive produced output        | `outcome` (source of truth; `ok` derived), `text` tail, `files` (artifacts), `exit_code?`, `loop_status?` |
+| `boundary`   | an epoch opens / closes                   | `phase`, `expr`; opened pins `run_branch`, `base_commit` |
+| `dispatched` | a `do`/`combine`/`inplace`/`setup` starts | `rig`, `task`/`cmd`, unique `workdir`, `pre_head` |
+| `result`     | an agent/primitive produced output        | `outcome`, `text`, `files`, `post_head`, `receipt_required`, `loop_status?` |
 | `integrated` | the core applied+committed a result       | `commits` (every attributed commit + its paths; `commit`/`paths` derived) |
 | `judged`     | a `do`-as-judge produced a verdict         | `verdict`, `ok`, `target_node` |
 | `loop_iter`  | a `loop` completed one iteration          | `iteration`, `commit`, `converged` (body outcome by reference, no payload) |
@@ -235,7 +230,7 @@ Notes:
 - `setup` uses `dispatched` + `result` (exit code in `result.exit_code`); no special
   event, per "one vocabulary."
 - `loop_iter` is one event per completed loop iteration, carrying the iteration index,
-  the workdir HEAD after the body integrated, and whether `until` converged. **(hand-2
+  the run-branch tip after the body integrated, and whether `until` converged. **(hand-2
   call, review pending)** — a dedicated event was chosen over an `iteration` field
   smeared across every event: the loop is the only primitive that repeats a node, so a
   per-repeat fact belongs to its own event, keeps every other event single-shot, and
@@ -247,11 +242,10 @@ Notes:
   leaf's `result` is the last one folded before the `loop_iter`, so the projection
   recovers the iteration's body from its live last-result at fold time (old journals with
   legacy `body_*` fields fold identically, since that same preceding `result` is present).
-- **Completion ordering (hand-7, item 4): ONE recorder, one order — `result` THEN
-  `integrated`, for every path** (do, inplace, reconciliation). This replaces three
-  inconsistent orderings. Result-before-integrated is the torn-tail contract: an effectful
-  result without its `integrated` reads as NOT durable (it re-runs / reconciles), never a
-  lost or duplicated effect.
+- **Completion ordering: one order — `result` THEN branch fast-forward THEN
+  `integrated`**, for do, inplace, and resume reconciliation. An effectful result without
+  its receipt is not done: exact branch position decides whether resume reconstructs the
+  landed receipt or journals a fallback and reruns.
 - `integrated` is emitted only by the **core**, never a rig — it is the mediation
   proof (invariant 1). This holds for **`do`** too (hand-4, B5): after a rig runs, the
   core stages + commits the worktree's changes (`git add -A -- .`, message keyed by
@@ -261,10 +255,9 @@ Notes:
   final sha) and `paths` (the order-preserving union — the disjoint-ownership set) are
   derived. Replay **accumulates** a node's receipts (union of commits) — no last-write-wins
   on a single `paths` list. An effectless `do` (no diff) legitimately produces no
-  `integrated`. **Result vs effect (hand-7):** `Result.files` is the AGENT ARTIFACT list
-  (== the effect paths in the shared-workdir PoC, distinct once per-node worktrees land);
-  the `IntegrationReceipt` is the ownership/commit ledger, and durability keys off the
-  receipt, not the artifact list.
+  `integrated`. **Result vs effect:** `Result.files` is the agent artifact list; the
+  `IntegrationReceipt` is the commit/path ledger. Durability keys off
+  `receipt_required` plus the later receipt, never artifact names.
 - **`result.outcome` is the single terminal-status source; `ok` is a derived convenience
   (`outcome == "ok"`)** — the ok/outcome duplication is collapsed (hand-7, item 3). A loop
   that hits its cap without converging is `outcome="failed"`. See the compatibility note (§6).
@@ -309,130 +302,88 @@ hand-4: rails deferral confirmed on owner review — do not read §4 as currentl
 
 ---
 
-## 5. Resume semantics (SETTLED invariants 2 & D5)
+## 5. Resume semantics (hand-19 worktree model)
 
-Resume = **replay the ndjson against the expression tree**. There is ONE re-entry path
-(grindstone's 76d01fe lesson): on start, `Engine` loads the journal (seq continues
-strictly-increasing across restarts, B1), folds it into per-`(epoch, node_id)` state,
-and `run_epoch` re-enters. A fully-closed epoch is a no-op; an opened-but-unclosed epoch
-resumes **without a second `boundary(opened)`**; a fresh epoch opens. Per-primitive
-replay rules:
+Resume is replay plus cheap Git verification. An opened epoch keeps its admitted tree;
+a closed epoch is a no-op. Every opened boundary pins the run ref and its base commit.
+The engine verifies each active `integrated` receipt with plain Git subprocesses: every
+SHA exists, `pre_head..commit` is the exact linear range, each changed-path claim
+matches Git, and the live run-branch tip is exactly the newest verified claim. A live
+descendant or any other unknown tip is operator activity and raises
+`BranchDivergedError`; the engine never resets an operator-owned run branch.
 
-- **`do` / `combine` / `setup`:** a node with a durable `result` is **done** — BUT a
-  node with **declared file effects** (a non-empty `result.files`) is durable only once
-  the core's `integrated` (the committed diff) is journalled; a result without its
-  `integrated` is **NOT durable** and re-runs (B5). An **effectless** node (no diff) is
-  durable on its result alone. A node `dispatched` without a `result` is **in-flight** →
-  re-dispatch (the prior worktree/process is dead; the reaper guarantees no orphan
-  mutates git). The rig's claim is never the durability record — the committed diff is.
-  **Two-boundary provenance (hand-9, §Appendix 41):** the `result` event is a SECOND
-  durable boundary carrying `post_head`; a torn result-then-integrated window reconstructs
-  the receipt from EXACTLY `pre_head..post_head` (never `..HEAD`). A dispatched-only tail has
-  no `post_head` certificate — it is ALWAYS re-run. **Quarantine, never destroy (hand-10,
-  §Appendix 47):** before the re-run, the dead attempt's tip (its mid-rig commits AND any
-  post-crash operator commit) is moved to a quarantine ref and the branch reset to the
-  DURABLE `pre_head` (loaded from the on-disk lease record, not memory); uncommitted dirt +
-  non-preexisting untracked leaks are captured to run_dir; pre-existing untracked files are
-  left in place. Because the re-run starts from `pre_head`, an idempotent rig can never
-  absorb a retained commit as unreceipted success — it must author its own effect and earn
-  its own receipt. The re-run's lease still REFUSES to open on a dirty tracked/index
-  worktree (the honest serial-M1 rule); every cleanup/rollback git op is CHECKED and a
-  failure HALTS the epoch (a `workspace_unclean` failed result), never a durable "failed"
-  that lies the effect was reverted.
-- **`inplace`:** `integrated` present → done (the commit is durable); `dispatched`
-  without `integrated` → re-apply the edits (whole-file writes are idempotent). **Durable
-  intent (hand-10, §Appendix 47):** before the first write, the per-path original content is
-  fsynced to `run_dir/intents/`; a crash mid-edit is REVERSED from that record on restart
-  (a partial write to a pre-existing — possibly untracked — file is restored, which a
-  `reset --hard` alone cannot recover) before the node re-runs. Any exception after the
-  first write (not just a symlink `ValueError` — an `OSError` too) rolls back from the same
-  record. An empty/no-diff inplace is a durable no-op.
-- **`dispatch`:** fold each child independently; integrate ready children, re-dispatch
-  in-flight ones.
-- **`loop` (D5):** live session state is gone. Find the **last integrated iteration**
-  from the journal (the count of `loop_iter` events); restart the body from the next
-  iteration with the **journal tail as briefing**. The `cap` counts integrated
-  iterations, so a resume cannot exceed it. **Partial-iteration fold rule (B4, hand-4):**
-  the resumed iteration is *partial* — some inner nodes ran before the process died.
-  Inner-node state journalled **at or before the last `loop_iter` event** belongs to a
-  COMPLETED iteration and does NOT satisfy resume for the partial one; only inner state
-  journalled **after** the last `loop_iter` is durable for the current iteration. The
-  engine implements this by passing the last `loop_iter` seq as a resume *floor* into the
-  partial iteration's body (state `seq <= floor` is stale); every subsequent fresh
-  iteration re-runs its whole body (`floor=None`, the explicit never-resume scope).
-  Predicate completion is intentionally durable only with the corresponding `loop_iter`:
-  a crash after the leased check executes but before that append reruns the idempotent
-  predicate, after recovering any unfinished predicate lease, without rerunning a durable
-  body leaf.
-- **`ask`:** `asked` without `answered` → still parked; re-surface to the owner.
-  `answered` present → the answer is durable, continue.
-- **`boundary(opened)` without `boundary(closed)`:** the epoch is incomplete; resume
-  inside it. A closed boundary means advance to the next planner re-entry.
+Leaf rules are deliberately small:
 
-No session serialization, no per-shape resume implementation. The reaper reaps
-processes only — it never mutates git or disk (grindstone's hardest-won kill-hardening
-lesson), so evidence never dies with a kill.
+- A durable successful effectless `result` is done.
+- A successful effectful `result` is done only after its later `integrated` receipt.
+- `dispatched` without `result` is an interrupted attempt: append a failed fallback
+  result and rerun in a new, uniquely named worktree.
+- In the `result`→branch-fast-forward→`integrated` crash window, branch at `post_head`
+  reconstructs and journals the receipt; branch still at `pre_head` journals a fallback
+  and reruns; any third tip is refused.
+- An unverifiable receipt is invalidated by an append-only failed `result` and rerun only
+  when the branch is still at the preceding verified tip. If its alleged effect is live,
+  the engine refuses rather than guessing.
+- A rig, timeout, path, or integration failure journals a failed result, abandons the
+  attempt worktree, leaves the epoch open, and reruns on the next `run_epoch` call.
+
+Loop replay still uses `loop_iter` floors: state at or below the last completed
+iteration is stale for a partial iteration; a fresh iteration uses `floor=None` and
+reruns its body. A predicate result without its matching `loop_iter` is evaluated again
+in another throwaway worktree. No session serialization and no worktree recovery exist.
+Leftover registered worktrees are garbage; their paths are never reused.
 
 ---
 
 ## 6. The journal (in-memory + ndjson)
 
-The journal is the run's spine. In the PoC it is both an **in-memory append-only list**
-and an **ndjson file** at `<run_dir>/events.ndjson`, written line-per-event with an
-fsync-on-append discipline. Each event is a Pydantic model serialized with its `kind`
-discriminator; loading re-parses each line back into the typed union. The journal is
-the durable state the projection/dashboard consume. Effect recovery additionally
-consumes integrity-bound lease, intent, recovery, and settled-lease records under
-`run_dir`; those records are transaction inputs/certificates, while lifecycle decisions
-still fold from the journal. Git tips and artifacts hang off node_ids recorded there.
-The journal exposes:
-`append(event) -> seq`, `events() -> list[Event]`, and `load(run_dir) -> Journal`.
+The journal remains the run spine at `<run_dir>/events.ndjson`: one typed event per line,
+one append owner, sequence assignment at append, flush + file `fsync`, and an in-memory
+`RunProjection` updated only after durability succeeds. `load` replays through the same
+fold, so running and resumed projections are identical.
 
-**Event shape versioning + compatibility (hand-7).** Item 3 changed three event shapes
-(collapsed `result.ok`→`outcome`; `integrated.commit`/`paths`→`commits`; dropped
-`loop_iter.body_*`). There is no explicit schema-version integer yet (a later dashboard
-call); instead each changed model owns a `mode="before"` **compatibility reader** so an
-OLD journal folds unchanged: a bare `ok=False` (or the old loop-cap `ok=False,
-outcome="ok"` drift line) migrates to `outcome="failed"`; a single-commit `integrated`
-migrates to a one-element `commits`; a legacy `loop_iter.body_*` payload is ignored (the
-preceding `result` reconstructs the body). The frozen `tests/fixtures/journals/*.ndjson`
-are genuinely old-shape and prove these readers on every run.
+An unterminated final record is uncertain and is durably truncated to the last newline;
+a malformed complete/middle record raises. Sequences must be contiguous from zero.
+A failed append poisons that owner; only `Journal.load` may adopt a complete residue or
+repair a torn one, and load fsyncs the accepted file and directory before returning.
+`Journal(run_dir)` is creation-only for a nonempty file; `Journal.load` is continuation.
 
-**Torn-tail tolerance (B2, hand-4):** a kill/power-loss during the final `write()` can
-leave the last ndjson line unterminated or malformed. `load` drops exactly that one
-torn FINAL record (it never durably completed, so the next append reuses its seq) and
-still raises on any malformed COMPLETE or MIDDLE record. fsync-on-append bounds the
-damage to the last line; it does not eliminate a partially written last record.
-
-**Single-writer precondition (N2, hand-4):** the journal derives `seq` as one past the
-last loaded/appended event and has **no lock or writer queue**. `Engine`-load-continues-seq (B1)
-covers **serial restarts only** — one append owner at a time. Parallel dispatch (ladder
-step 3) MUST introduce a single central append owner or an interprocess lock before any
-concurrent children/processes append; two live `Journal` instances over one run_dir
-would emit duplicate/reordered seqs. Not built this hand.
-
-**Failed-append poisoning (hand-14):** sequence assignment is serialized on a copy and
-live `_events`/projection state changes only after the line's write+flush+fsync (plus the
-first-file directory fsync) succeeds. Any durability exception leaves the live mirror at
-its prior durable prefix and permanently poisons that `Journal`; every later append raises
-`JournalPoisonedError`. Only `Journal.load` may classify the physical tail (the failed
-fsync may nevertheless have left a complete line) and create a fresh append owner. M2's
-central owner must discard, never retry through, a poisoned instance.
+Pre-worktree complete journals remain parseable through the existing `Result.outcome`
+and single-commit `Integrated` compatibility readers, but an open old epoch has no
+run-ref/base claim and is not executable by this engine. The old lease, intent,
+recovery, settlement, process, and capture files are not read. Parallel dispatch still
+requires one central append owner; execution is serial today.
 
 ---
 
-## 7. Worktree mediation & the disjoint-ownership merge (target invariant 1)
+## 7. Per-node worktrees and run-branch integration (invariant 1)
 
-**Target after worktree isolation lands:** every `do`/`dispatch` child runs in its own
-Git worktree off the run's base commit. The core integrates each child and enforces
-**disjoint ownership**: two integrated siblings may not both modify the same path.
-`inplace` and `setup` remain the exceptions.
+A run owns one existing Git branch. `run_dir` is outside the repository worktree and
+contains `events.ndjson`, result artifacts, and a run-scoped `worktrees/` directory.
+For every `do` and `inplace`, the core:
 
-**Current serial PoC:** `do` and `inplace` share the integration workdir; a rig may author
-commits there, and the core validates, attributes, receipts, or quarantines them. Worktree
-creation, disjoint merge, and discard replace this shared-workdir recovery policy at the
-later hygiene step. `Rig.run(prompt, workdir)` is the seam that isolation slots
-behind; this section's first paragraph is not a claim that isolation is implemented now.
+1. verifies the run branch at the newest journalled tip;
+2. creates a uniquely named detached `git worktree add` at that tip;
+3. runs the rig there, or applies only the declared inplace writes there;
+4. core-commits any remaining successful changes and derives the exact linear
+   `IntegrationReceipt` for `pre_head..post_head`;
+5. journals `result`, fast-forwards the run branch, then journals `integrated`; and
+6. best-effort runs `git worktree remove --force`.
+
+The fast-forward is `git merge --ff-only` when the supplied target worktree has the run
+branch checked out (keeping its files/index current), otherwise a compare-and-swap
+`git update-ref <ref> <candidate> <base>`. Cherry-pick is deliberately absent: it would
+rewrite receipt SHAs and introduce conflict/sequencer recovery. Serial `dispatch` means
+each child starts from the preceding child's landed tip; true parallel dispatch needs a
+later explicit sibling merge/disjoint-ownership protocol.
+
+A failed rig, core commit, declared-path check, or fast-forward never changes the run
+branch. Its worktree is discarded. A crash may leave a registered worktree or escaped
+process writing there, but new attempts use new paths and branch acceptance depends
+only on verified commits. Worktree isolation is an authority boundary against accidental
+writes, not a security sandbox: a same-UID rig can address the common Git directory.
+Predicates use the same fresh detached worktree and discard it after the exit code; their
+filesystem/index mutation has no accepted effect.
 
 ---
 
@@ -454,11 +405,11 @@ no engine change. The PoC ships three:
   calls in this build).
 
 A `RigRef(name, params)` in an expression names which rig and its config; the core
-resolves it through a **rig registry** at execution time. Rigs never touch integration
-git; they only write inside their `workdir`. An external-command rig routes its command
-through `rig.run_external`, which the engine binds to the durable process supervisor
-without changing the `Rig.run` protocol. Calling a rig directly outside an `Engine` is a
-standalone convenience and does not claim the engine's crash-recovery guarantee.
+resolves it through a **rig registry** at execution time. Rigs may write or commit only
+inside their detached attempt worktree; the core alone advances the run branch. Built-in
+external rigs start a process group and kill it on timeout (and quiesce ordinary
+background children on return). There are no durable process records or restart reaper:
+a crash can leave an orphan writing only a never-reused attempt path.
 
 ### The script contract — THE integration seam (grindstone-compatible by construction)
 
@@ -484,9 +435,8 @@ notes that are load-bearing:
   large prior-failure context. `ScriptRig` writes the prompt to
   `<log_dir>/<dispatch>/prompt.txt` and passes its path.
 - **Per-dispatch log dir** is `<log_dir>/<workdir.name>/`, populated with the captured
-  `agent.stdout.log` / `agent.stderr.log` (+ the prompt) so the dir is non-empty even
-  when the script writes nothing. In the real worktree seam (step 4) a `do` runs in a
-  worktree named for its node_id, so the dispatch key IS the node_id by construction.
+  `agent.stdout.log` / `agent.stderr.log` (+ the prompt). Worktree names include epoch,
+  node, attempt, and a random suffix, so retries never share logs or paths.
 - **`busy` is journalled as `ResultEvent(ok=False, outcome="busy")`** — distinct from a
   failure so a later ladder step can back off + re-enter. No backoff/retry policy is
   built in this hand.
@@ -549,10 +499,10 @@ panel macro's first live exercise):
 
 Historical build order (D7/D8, bottom-up): (1) expression PoC; (2) durability;
 (3) composition + rails; (4) worktree hygiene; (5) target-local `.wildflows/`; (6)
-dashboard. **Current status:** the serial engine has fsynced journal replay, durable
-lease/intent/recovery transactions, and executable `do`/`inplace`/`seq`/serial-`dispatch`
-/command-`loop`. `combine`, general rails, real parallel dispatch, per-node worktrees,
-target-local run state, and the dashboard remain later steps.
+dashboard. **Current status:** the serial engine has fsynced journal replay, per-node
+and predicate worktrees, exact receipt/run-tip verification, and executable
+`do`/`inplace`/`seq`/serial-`dispatch`/command-`loop`. `combine`, general rails, real
+parallel dispatch, target-local run state, and the dashboard remain later steps.
 
 ---
 
@@ -578,7 +528,7 @@ target-local run state, and the dashboard remain later steps.
 7. **`loop_iter` event** for per-iteration journalling (see §3 note): a dedicated event
    over an `iteration` field on every event, so replay folds iterations-completed + last
    commit in two lines and every other event stays single-shot.
-8. **`_commit` checks the STAGED diff only** (`git diff --cached --quiet`), not the whole
+8. (superseded by hand-19 worktree model) **`_commit` checks the STAGED diff only** (`git diff --cached --quiet`), not the whole
    working tree (`git status --porcelain`). **The predicate rationale here is REVERSED by
    hand-14 entry 67:** `until` may no longer leave untracked artifacts. Staged-only remains
    the correct "did the declared edits change anything" test and keeps `inplace` re-apply
@@ -591,7 +541,7 @@ target-local run state, and the dashboard remain later steps.
    unchanged). A `busy` (rate/session/quota) wall journals `ok=False, outcome="busy"`
    so the engine does not confuse a transport wall with a task failure — the minimal
    representation until a real backoff/re-entry ladder step is built.
-10. **`ScriptRig` per-dispatch log dir keyed by `workdir.name`**, not an explicit
+10. (superseded by hand-19 worktree model) **`ScriptRig` per-dispatch log dir keyed by `workdir.name`**, not an explicit
     node_id param — the `Rig.run(prompt, workdir)` protocol carries no node_id, and the
     real worktree seam (step 4) names each `do`'s worktree for its node_id, so the key
     is node_id by construction. Revisit if step 4 names worktrees differently.
@@ -616,7 +566,7 @@ target-local run state, and the dashboard remain later steps.
     is the committed diff the core makes (`git add -A -- .` + commit), never the rig's
     claim. Fold rule: a result with declared file effects (`files` non-empty) is durable
     only with its `integrated`; an effectless `do` stays durable on its result alone.
-15. **`inplace` commits ONLY its declared paths** (B6) via a `--`-scoped pathspec commit
+15. (superseded by hand-19 worktree model) **`inplace` commits ONLY its declared paths** (B6) via a `--`-scoped pathspec commit
     (`git commit -- <paths>`), preserving any pre-existing staged index; edit paths are
     literal (leading-dash rejected at admission), and `.git`/resolved-gitdir writes are
     refused (N1). Git failures inside integration become a journalled
@@ -655,7 +605,7 @@ target-local run state, and the dashboard remain later steps.
     deep-copies, so the caller's tree is never mutated. The reviewer's regression rides
     on top and passes.
 
-21. **`do` reconciliation rule (NB4).** Every commit the CORE makes carries a
+21. (superseded by hand-19 worktree model) **`do` reconciliation rule (NB4).** Every commit the CORE makes carries a
     machine-parsable marker `wf:<run_id>:<epoch>:<node_id>` in its message. On resume,
     before re-running an in-flight `do`/`inplace`, the core scans `git log` for that
     marker; if a matching commit exists (the commit-then-crash window: git committed but
@@ -669,7 +619,7 @@ target-local run state, and the dashboard remain later steps.
     worktree — is NOT retro-integrated; it is left to normal re-execution, never false
     durable attribution of an effect the worktree does not contain.
 
-22. **Rig-commit recording + shared-workdir reset policy (NB5).** After every `do` the
+22. (superseded by hand-19 worktree model) **Rig-commit recording + shared-workdir reset policy (NB5).** After every `do` the
     core snapshots pre-run HEAD. On SUCCESS, commits the rig itself made (`pre..HEAD` —
     the senior/script contract legitimately commits its own work) are journalled as
     `integrated` attributed to that node; the core then integrates any remaining dirty
@@ -713,7 +663,7 @@ target-local run state, and the dashboard remain later steps.
 
 ### Hand-6 calls (from the bloat audit) — an equivalence refactor
 
-28. **Authority split (hand-6, from bloat audit).** The 700-line `Engine` was split into
+28. (superseded by hand-19 worktree model) **Authority split (hand-6, from bloat audit).** The 700-line `Engine` was split into
     five homes — `engine.py` (orchestration), `admission.py`, `projection.py`,
     `workspace.py`, `result.py` — plus the journal as the single append owner (see §2
     "Code homes"). Behavior is bit-for-bit identical; tests changed only for imports and
@@ -763,7 +713,7 @@ target-local run state, and the dashboard remain later steps.
     `loop_iter` drops its `body_*` payload copy for a by-position reference to the body's
     journalled `result`.
 
-33. **Workspace effect transaction + completion recorder (item 4).** `WorkspaceEffects`
+33. (superseded by hand-19 worktree model) **Workspace effect transaction + completion recorder (item 4).** `WorkspaceEffects`
     owns the per-node-attempt lease (pre/post HEAD over the shared workdir — the seam, not
     yet a worktree), rig-commit discovery, staging/commit, failure evidence capture +
     revert, marker reconciliation, and containment; the engine issues ZERO git commands.
@@ -771,7 +721,7 @@ target-local run state, and the dashboard remain later steps.
     worktree isolation later replaces the shared-workdir revert/clean policy with
     discard-the-worktree.
 
-34. **Pass-3 defects, fixed inside 32/33.** (1) reconciliation requires the marked commit
+34. (superseded by hand-19 worktree model) **Pass-3 defects, fixed inside 32/33.** (1) reconciliation requires the marked commit
     reachable from HEAD (§5 entry 21). (2) a failed rig's OWN commits are reverted to the
     lease's pre-HEAD after capturing them as evidence (shared-workdir policy; per-worktree
     isolation later makes this discard-the-worktree). (3) failure evidence includes
@@ -780,7 +730,7 @@ target-local run state, and the dashboard remain later steps.
     (5) `ctx` file resolution rejects a symlink alias resolving into the git admin dir —
     same path-safety home (`WorkspaceEffects`) as `inplace` edit resolution.
 
-35. **Deviation (bounded item-3 scope).** `Result.files` is NOT fully divorced from the
+35. (superseded by hand-19 worktree model) **Deviation (bounded item-3 scope).** `Result.files` is NOT fully divorced from the
     effect paths this hand: in the shared-workdir PoC the committed diff IS the do's
     artifact, and the loop-artifact + resume-durability model depend on that coincidence
     (none of which are the five pass-3 defects). The receipt is the separate ownership
@@ -790,7 +740,7 @@ target-local run state, and the dashboard remain later steps.
 
 ### Hand-8 calls (from the pass-4 exit review) pending review
 
-36. **Provenance-based recovery replaces the marker scan (RECEIPT-TEAR).** `dispatched`
+36. (superseded by hand-19 worktree model) **Provenance-based recovery replaces the marker scan (RECEIPT-TEAR).** `dispatched`
     carries `pre_head` — the workdir HEAD when the attempt opened (nullable; absent on a
     pre-v1 line). On resume, a top-level `do`/`inplace` that was dispatched but is not
     durable is recovered from its OWN commit range `pre_head..HEAD`: those commits are
@@ -806,7 +756,7 @@ target-local run state, and the dashboard remain later steps.
     without integrated → journal the receipt; nothing past dispatched → journal result +
     receipt), which is the finding's real requirement (crash-recoverable receipts) with no
     collateral damage.
-37. **Lease-scoped failure transaction (FAILURE-TRANSACTION; historical, superseded by
+37. (superseded by hand-19 worktree model) **Lease-scoped failure transaction (FAILURE-TRANSACTION; historical, superseded by
     hand-12 entry 59).** (a) At this point a git failure integrating a successful rig's
     dirty state routed through the then-current `finalize_failure` (revert + capture),
     never a bare `ok=False`; `recover_lease` now owns that route. (b) The `Lease` snapshots the untracked +
@@ -825,7 +775,7 @@ target-local run state, and the dashboard remain later steps.
     (no reference) falls back to the last result before it — the documented old-journal
     semantics, scoped strictly to compatibility, not the live fold. An empty composite loop
     body (no executable `do`/`inplace` leaf) is rejected at admission.
-39. **Pre-v1 journal policy (LEGACY-COMPLETION-TAIL).** Journals are declared pre-v1 and
+39. (superseded by hand-19 worktree model) **Pre-v1 journal policy (LEGACY-COMPLETION-TAIL).** Journals are declared pre-v1 and
     unstable. A COMPLETE legacy history still folds via the compatibility readers (the
     frozen fixtures prove it), but `Journal.load` raises `JournalCompatibilityError` on an
     INTERRUPTED legacy tail — a pre-v1 event shape (a `dispatched` with no `pre_head`, a
@@ -844,7 +794,7 @@ target-local run state, and the dashboard remain later steps.
 
 ### Hand-9 calls (from the pass-5 exit review) pending review
 
-41. **Two-boundary provenance model — `pre_head..post_head` (PROVENANCE-RANGE).** The
+41. (superseded by hand-19 worktree model) **Two-boundary provenance model — `pre_head..post_head` (PROVENANCE-RANGE).** The
     completion certificate is a SECOND durable boundary: the `result` event gains
     `post_head`, the workdir HEAD at the moment the rig returned and the result was recorded
     (nullable only on a pre-v1 line or an unborn repo). Receipt reconstruction on resume uses
@@ -860,7 +810,7 @@ target-local run state, and the dashboard remain later steps.
     harmless, and identifiable via `pre_head` lineage — and are NOT silently reset away (an
     operator commit may sit above them). This SUPERSEDES hand-8's `pre_head..HEAD` recovery of
     a dispatched-only tail (which could bless a mid-rig commit or grow after death).
-42. **Clean-worktree failure lease (FAILURE-LEASE).** (a) A lease REFUSES to open on a dirty
+42. (superseded by hand-19 worktree model) **Clean-worktree failure lease (FAILURE-LEASE).** (a) A lease REFUSES to open on a dirty
     tracked/index worktree state — a durable failed result ("workdir has uncommitted tracked
     changes"), never proceed. This removes the reset-`--hard` destruction class: pre-existing
     tracked/staged user work can no longer exist at open, so failure revert (`reset --hard
@@ -885,7 +835,7 @@ target-local run state, and the dashboard remain later steps.
     fallback is killed: totality guarantees the body always has a journalled result, so the
     live engine always emits the explicit reference; the `None` fallback in the projection is
     legacy-journal-only.
-44. **Transactional inplace (INPLACE-TRANSACTIONAL).** `_exec_inplace` records every path it
+44. (superseded by hand-19 worktree model) **Transactional inplace (INPLACE-TRANSACTIONAL).** `_exec_inplace` records every path it
     writes and the content that pre-existed (None if created). On ANY failure after the first
     write — a late symlink rejection OR a failed declared commit — it ROLLS BACK
     (`workspace.rollback_inplace`): pre-existing files are restored, created files deleted,
@@ -911,7 +861,7 @@ and false-durability rows: **recovery state lived in process memory, and cleanup
 content with unchecked git ops.** Hand-10 eliminates the class with two principles rather
 than patching each row. Both are the transaction model of record — not a later refinement.
 
-47. **PRINCIPLE A — QUARANTINE, NEVER DESTROY.** No cleanup path may delete or reset-away
+47. (superseded by hand-19 worktree model) **PRINCIPLE A — QUARANTINE, NEVER DESTROY.** No cleanup path may delete or reset-away
     content irrecoverably.
     - **Dead-attempt recovery (dispatched-only tail).** SUPERSEDES hand-9's `reset --hard
       HEAD` + sweep. The current tip (dead-attempt commits AND any post-crash operator
@@ -940,7 +890,7 @@ than patching each row. Both are the transaction model of record — not a later
       on the body iterations' own `integrated` events). Ledger note on the unsafe interval:
       the rig-return-through-core-commit window is now SAFE — a crash there leaves a
       dispatched-only tail, which quarantine+reset re-runs to its own receipt.
-48. **PRINCIPLE B — DURABLE TRANSACTION INTENTS.** Any state a restart needs to finish or
+48. (superseded by hand-19 worktree model) **PRINCIPLE B — DURABLE TRANSACTION INTENTS.** Any state a restart needs to finish or
     reverse an interrupted transaction is fsynced to `run_dir` BEFORE the first mutation.
     - **Lease record.** `(pre_head, per-file preexisting untracked/ignored snapshot,
       attempt, timestamp)` is fsynced to `run_dir/leases/<epoch>-<node>-<attempt>.json` at
@@ -972,7 +922,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-11 calls (from the pass-7 correctness review) — TRANSACTION HARDENING
 
-49. **Persistent unclean recovery (hand-11).** `workspace_unclean` and its explicit
+49. (superseded by hand-19 worktree model) **Persistent unclean recovery (hand-11).** `workspace_unclean` and its explicit
     `recovery_action` (`fail|retry`) are folded into `NodeProjection`; an in-scope marker
     makes `resume_action` return `recover`, never `done`. Resume validates BOTH durable
     lease and intent records before mutation, retries intent reversal plus the checked
@@ -982,7 +932,7 @@ than patching each row. Both are the transaction model of record — not a later
     result, including across a crash between cleanup and redispatch. A legacy unclean
     marker with no disposition fails closed for manual repair rather than guessing.
 
-50. **One canonical inplace target model (hand-11).** Every edit is fully resolved at
+50. (superseded by hand-19 worktree model) **One canonical inplace target model (hand-11).** Every edit is fully resolved at
     plan time and converted back to one workdir-relative canonical target. Intent capture,
     write, rollback/unstage, staging, commit, result files, and receipt paths all use that
     target. Two declarations resolving to the same target are rejected before the first
@@ -992,7 +942,7 @@ than patching each row. Both are the transaction model of record — not a later
     stage/receipt. Modern intents preserve original bytes as base64 and the exact UTF-8
     bytes the attempt expected to write.
 
-51. **Append-only quarantine histories (hand-11).** A quarantine ref is immutable per
+51. (superseded by hand-19 worktree model) **Append-only quarantine histories (hand-11).** A quarantine ref is immutable per
     observed tip: its name includes the full tip SHA and creation uses compare-and-create.
     Dead attempts, operator tips observed on redo, and failed rigs that authored commits
     are all preserved before reset; a redo allocates a second ref rather than moving the
@@ -1000,7 +950,7 @@ than patching each row. Both are the transaction model of record — not a later
     dot-edge, and overlong forms receive a SHA-256 suffix. Thus arbitrary filesystem-valid
     run-directory names cannot make Git recovery fail solely through ref syntax.
 
-52. **Checked filesystem cleanup (hand-11).** Cleanup has no `ignore_errors`: status/diff
+52. (superseded by hand-19 worktree model) **Checked filesystem cleanup (hand-11).** Cleanup has no `ignore_errors`: status/diff
     enumeration, directory traversal, byte reads, capture publication, unlink/rmtree, and
     Git reset/ref operations are checked. Every removal has an `lexists` absence
     postcondition. The lease additionally snapshots pre-existing directories, allowing
@@ -1009,7 +959,7 @@ than patching each row. Both are the transaction model of record — not a later
     status warning or filesystem failure raises `WorkspaceFault` and enters decision 49's
     persistent halt.
 
-53. **Byte-recoverable immutable capture (hand-11).** Before any destructive reset or
+53. (superseded by hand-19 worktree model) **Byte-recoverable immutable capture (hand-11).** Before any destructive reset or
     sweep, tracked current files, untracked/ignored files, symlinks, empty directories,
     and recursively enumerated nested-repository contents are copied exactly into a unique
     `.capture/` directory. `manifest.json` records path/kind/size/SHA-256/blob; raw blobs,
@@ -1021,7 +971,7 @@ than patching each row. Both are the transaction model of record — not a later
     Retry suffixes make captures append-only. A hash summary is evidence, never the only
     retained copy.
 
-54. **Divergent intent reversal (hand-11).** Rollback first compares each canonical live
+54. (superseded by hand-19 worktree model) **Divergent intent reversal (hand-11).** Rollback first compares each canonical live
     target with BOTH the expected attempt bytes and the recorded pre-state. A third state
     (including binary post-crash operator bytes) is durably captured through decision 53
     under `intent-reversal/` before restoration. Parent directories absent at intent time
@@ -1029,7 +979,7 @@ than patching each row. Both are the transaction model of record — not a later
     changed canonical path topology (for example, an operator-installed parent symlink)
     halts without overwriting it.
 
-55. **Atomic durable-record lifecycle (hand-11).** Lease/intent and capture-manifest
+55. (superseded by hand-19 worktree model) **Atomic durable-record lifecycle (hand-11).** Lease/intent and capture-manifest
     publication is same-directory temp write → file fsync → `os.replace` → parent-directory
     fsync. Record unlink is followed by parent-directory fsync. Newly created run-directory
     components and the first `events.ndjson` entry are parent-directory-fsynced before any
@@ -1041,7 +991,7 @@ than patching each row. Both are the transaction model of record — not a later
     record is a typed `WorkspaceFault`; it is never confused with an absent legacy record
     and recovery performs no mutation after such a load failure.
 
-56. **Pass-7 crash proof (hand-11).** The transaction regressions use real `fork` plus
+56. (superseded by hand-19 worktree model) **Pass-7 crash proof (hand-11).** The transaction regressions use real `fork` plus
     `os._exit` at the record-publication, inplace-write, rig-death, quarantine-reset, and
     cleanup-before-redispatch windows. No deviation from the pass-7 intended directions:
     canonical symlink support was chosen over blanket rejection because the resolved path
@@ -1053,7 +1003,7 @@ than patching each row. Both are the transaction model of record — not a later
     claimed hard exclusion was unsound; target-repo `.wildflows/` run state waits for the
     per-node worktree authority boundary.
 
-57. **Active completion certificate (hand-11).** A successful rig's `post_head` must
+57. (superseded by hand-19 worktree model) **Active completion certificate (hand-11).** A successful rig's `post_head` must
     descend from its lease `pre_head`; backward/unrelated history movement is a failed
     transaction and cleanup restores the original tip. Torn result→integrated recovery
     additionally requires `post_head` to be an ancestor of live `HEAD` AND every receipted
@@ -1066,7 +1016,7 @@ than patching each row. Both are the transaction model of record — not a later
     pre-field result is refused as a legacy tail because absence cannot distinguish an
     effectless result from that empty-commit crash window.
 
-58. **Recovery topology containment (hand-11).** Baseline capture/restore validates every
+58. (superseded by hand-19 worktree model) **Recovery topology containment (hand-11).** Baseline capture/restore validates every
     intermediate parent against its canonical workdir location before reading or deleting.
     It preflights every manifest path and verifies every raw blob before the first deletion.
     A post-crash parent-symlink substitution or corrupt late blob therefore halts without
@@ -1074,7 +1024,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-12 calls (from the pass-8 correctness review) — ONE RECOVERY TRANSACTION
 
-59. **One lease-recovery transaction (hand-12, structural spine).** The duplicated live-
+59. (superseded by hand-19 worktree model) **One lease-recovery transaction (hand-12, structural spine).** The duplicated live-
     failure and dead-attempt cleanup state machines are deleted. `WorkspaceEffects.recover_lease`
     is the sole destructive recovery authority; live do/inplace failure, dispatched-only
     restart, inactive-certificate recovery, and persistent-unclean resume all submit a
@@ -1086,7 +1036,7 @@ than patching each row. Both are the transaction model of record — not a later
     Engine-side lease/intent loads, reversal decisions, and alternate preserve/reset paths
     are gone; non-destructive Git/path primitives remain shared helpers, not state machines.
 
-60. **End-state proof, not command success (B1).** Recovery verifies exact `HEAD == pre_head`
+60. (superseded by hand-19 worktree model) **End-state proof, not command success (B1).** Recovery verifies exact `HEAD == pre_head`
     (or both unborn), byte-mode clean tracked/index status, an empty lease-scoped attempt
     leak set (including created empty directories), and byte-equivalence of every modern
     pre-existing baseline before it can settle or clear. A successful `reset --hard` whose
@@ -1095,7 +1045,7 @@ than patching each row. Both are the transaction model of record — not a later
     cannot claim a baseline it never recorded; this exception is available only when the
     dispatch explicitly lacks the modern required-lease marker.
 
-61. **Reversal alias and portable case policy (B2/H5).** Intent validation re-stats every
+61. (superseded by hand-19 worktree model) **Reversal alias and portable case policy (B2/H5).** Intent validation re-stats every
     existing canonical target immediately before expected/pre-state classification. A
     regular file with `st_nlink != 1` is byte-captured and raises `WorkspaceFault` before
     any overwrite or unlink. Each path fsyncs `started=True` before its first write and a
@@ -1113,7 +1063,7 @@ than patching each row. Both are the transaction model of record — not a later
     would itself mutate the unleased workspace and platform case/normalization rules are
     not uniform; portable deterministic rejection is narrower and fail-safe.
 
-62. **Checked, byte-safe, object-format-aware Git reads (B3/H1/H4).** Every `rev-list` and
+62. (superseded by hand-19 worktree model) **Checked, byte-safe, object-format-aware Git reads (B3/H1/H4).** Every `rev-list` and
     `diff-tree` receipt read is checked; launch, nonzero, and decode failures become
     `WorkspaceFault` and enter the same recovery transaction, never an effectless or
     ownership-empty success. All `-z` pathname plumbing runs in bytes mode. UTF-8 paths
@@ -1125,7 +1075,7 @@ than patching each row. Both are the transaction model of record — not a later
     `rev-parse --show-object-format`; null OID width and empty-tree OID are selected for
     SHA-1 or SHA-256 rather than hard-coded to SHA-1.
 
-63. **Required modern records and settle-before-clear (H2/H3).** New `Dispatched` events
+63. (superseded by hand-19 worktree model) **Required modern records and settle-before-clear (H2/H3).** New `Dispatched` events
     carry `lease_required=True`; a planned non-empty inplace also carries
     `intent_required=True` after publishing its intent and before the dispatch. Missing
     required records fail closed; a missing current lease with neither a matching immutable
@@ -1140,7 +1090,7 @@ than patching each row. Both are the transaction model of record — not a later
     settlement certificates; garbage collection is a separate future transaction. This
     supersedes hand-11 entry 55's result-before-record-unlink ordering for recovery paths.
 
-64. **Uniform capture integrity (H6).** Baseline, failed-diff, quarantine, and intent-
+64. (superseded by hand-19 worktree model) **Uniform capture integrity (H6).** Baseline, failed-diff, quarantine, and intent-
     reversal manifests all carry a canonical outer SHA-256 digest. One checked loader
     validates manifest identity/path topology plus every file blob's size and SHA-256;
     baseline restoration and public forensic round trips share it. Atomic publication
@@ -1149,7 +1099,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-13 calls (from the pass-9 correctness review) — CLOSE THE TWO TEARS
 
-65. **Per-path sweep proof (hand-13).** Every absent-prestate inplace target receives a
+65. (superseded by hand-19 worktree model) **Per-path sweep proof (hand-13).** Every absent-prestate inplace target receives a
     signed `IntentWrite.swept=True` update, fsynced immediately before the checked leak
     unlink that covers that path. Restart accepts a disappeared started target only when
     this per-path proof (or the legacy aggregate completed-sweep proof) is durable; an
@@ -1158,7 +1108,7 @@ than patching each row. Both are the transaction model of record — not a later
     directory leak roots mark every intent target they contain. The aggregate `swept`
     marker remains the all-path completion boundary, not the only redo classifier.
 
-66. **Required-record settlement before torn integration (hand-13).** A torn OK
+66. (superseded by hand-19 worktree model) **Required-record settlement before torn integration (hand-13).** A torn OK
     `result` may reconstruct `pre_head..post_head`, but before publishing its recovered
     `Integrated` it must validate the dispatch's required lease/intent records (or an
     immutable settled/recovery replacement). It then publishes an integrity-bound,
@@ -1170,7 +1120,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-14 calls (from the pass-10 correctness review) — CLOSE THE EFFECT CHANNEL
 
-67. **Verified read-only predicates (hand-14).** Every command `until` runs under a
+67. (superseded by hand-19 worktree model) **Verified read-only predicates (hand-14).** Every command `until` runs under a
     required durable lease keyed by the loop's internal `<node_id>.until` evaluation node.
     The standard recovery postcondition proves exact HEAD, clean tracked/index state, no
     new untracked/ignored paths or directories, and byte-identical pre-existing baselines
@@ -1193,7 +1143,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-15 calls (from the pass-11 correctness review) — VERIFY AND REAP
 
-69. **Index-independent predicate verification (hand-15).** Lease open byte-snapshots the
+69. (superseded by hand-19 worktree model) **Index-independent predicate verification (hand-15).** Lease open byte-snapshots the
     real repository index and hashes actual tracked worktree content through a fresh
     temporary index seeded from `HEAD`; pre/post write-tree OIDs are compared without
     consulting live-index hints, and a raw-byte digest prevents clean filters from hiding
@@ -1201,7 +1151,7 @@ than patching each row. Both are the transaction model of record — not a later
     Recovery captures paths from the temporary-tree delta, resets/restores content, restores
     the exact index snapshot last, and verifies both proofs. `assume-unchanged` and
     `skip-worktree` therefore cannot hide a predicate mutation or survive its recovery.
-70. **Predicate process barrier (hand-15; SUPERSEDED by hand-16 entry 73's general
+70. (superseded by hand-19 worktree model) **Predicate process barrier (hand-15; SUPERSEDED by hand-16 entry 73's general
     barrier).** Every command predicate has a positive timeout
     and runs in a new session behind a session-leader supervisor. The effect command remains
     gated until `(pid, pgid, /proc start-time)` is atomically written and fsynced under
@@ -1223,7 +1173,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-16 calls (from the pass-12 correctness review) — ONE PROCESS BARRIER
 
-73. **Unified process supervision (hand-16).** The predicate-only launcher/reaper is
+73. (superseded by hand-19 worktree model) **Unified process supervision (hand-16).** The predicate-only launcher/reaper is
     deleted. Every built-in external workload command — rig command or predicate — uses
     one workspace-owned `ProcessSupervisor` seam while `Rig.run(prompt, workdir)` remains
     unchanged. A session-leader guardian first reports ready, then the parent atomically
@@ -1257,7 +1207,7 @@ than patching each row. Both are the transaction model of record — not a later
 
 ### Hand-17 call (from the pass-13 correctness review) — COMPLETE PROCESS BARRIER
 
-75. **Core Git joins the complete barrier (hand-17).** Every engine-owned external launch
+75. (superseded by hand-19 worktree model) **Core Git joins the complete barrier (hand-17).** Every engine-owned external launch
     site is now either a built-in rig/predicate operation under the hand-16 workload
     supervisor or a core Git/index command under a recorded core scope; the Git helpers
     fail closed outside that scope. One core record is shared by the whole active
@@ -1276,3 +1226,38 @@ than patching each row. Both are the transaction model of record — not a later
     complete owner generation matches the current engine, so it cannot reap/deadlock on its
     own live recovery scope. Reaping remains process-only and precedes capture, reset,
     restore, settlement, redispatch, and every other workspace mutation.
+
+
+### Hand-19 calls — per-node worktree model
+
+76. **Disposable attempt worktrees.** Every `do`, `inplace`, and command predicate starts
+    from the exact run-branch tip in a fresh uniquely named detached worktree under
+    `run_dir/worktrees/`. No path is reused. Failure and interruption abandon that tree;
+    best-effort `git worktree remove --force` is garbage collection, never recovery.
+77. **Linear fast-forward integration.** Successful node commits must be one linear
+    descendant range. The core journals `result`, advances the run branch by checked-out
+    `merge --ff-only` or un-checked-out `update-ref` CAS, then journals every commit/path in
+    `integrated`. Cherry-pick is excluded because rewritten SHAs and conflict state would
+    recreate recovery machinery. Actual dispatch remains serial.
+78. **Exact-tip resume verification.** Opened boundaries pin run ref/base. Resume verifies
+    commit existence, exact ranges, paths, and newest tip with plain subprocess Git. A
+    result/fast-forward tear is reconciled only at exact base or candidate. Unverifiable
+    inactive claims append a failed fallback and rerun; an unknown/live unverified tip
+    raises a typed error. Operator activity is never reset or quarantined.
+79. **Small process and path boundary.** Built-in external commands use only an in-process
+    process group with timeout kill; no durable process record, guardian, reaper, or core
+    Git scope remains. Escaped orphans can write only abandoned worktrees. Receipt paths
+    are ordinary UTF-8 strings; the arbitrary-byte wire codec and transaction records are
+    gone. `inplace` still validates lexical/runtime containment and declared commit paths.
+80. **Deliberately dropped scenario families.** The rewritten suite removes shared-workdir
+    quarantine refs/reset histories; lease/baseline/capture manifests and failed-diff
+    forensics; durable inplace intents/reversal, index snapshots, hard-link/case/topology
+    recovery; `workspace_unclean` halt/settlement states; smudge-filter and hook-in-core-
+    commit recovery; durable process records/guardian/reaper/core scopes; predicate
+    index/read-only mutation proofs; marker scans; and arbitrary-byte path encoding. These
+    test implementation machinery that no longer exists, not current behavior.
+81. **Retained scenario corpus.** Admission/dealias/upstream/totality rules, torn-tail
+    repair and append poisoning, result→integrated crash windows, receipt verification,
+    loop caps/floors/nesting, retry in a new path, orphan-write harmlessness, exact
+    run-branch ownership, Script/Shell busy+timeout contracts, and result artifacts remain
+    executable regressions.

@@ -27,9 +27,9 @@ expressions that act as nudges to the planner.
 
 Multi-CLI orchestrators exist. wildflows is built for **survivability**:
 
-- **Core-accounted effects** — the serial PoC verifies and receipts commits in a
-  shared workdir; per-node worktree mediation is the next isolation boundary.
-  Crashes/OOMs/SIGTERMs retain accepted work or quarantine incomplete work.
+- **Core-accounted effects** — every `do`, `inplace`, and predicate gets a fresh,
+  never-reused detached worktree. Successful commit ranges fast-forward onto the run
+  branch; failed/interrupted worktrees are abandoned, so there is nothing to undo.
 - **One journal, one event vocabulary** — resume = replay the event log against
   the expression tree. No per-shape resume code.
 - **Core-enforced rails direction** — loop caps are live now; budget and deadline
@@ -43,11 +43,11 @@ macro is not part of the serial PoC yet.
 
 ## Status
 
-Serial proof-of-concept: fsynced journal/replay plus crash-safe workspace
-transactions; executable `do`, `inplace`, `seq`, serial `dispatch`, and command
-`loop`; and `EchoRig`, `ShellRig`, and `ScriptRig` seams. Parallel dispatch,
-per-node worktrees, general rails, planner macros, and the dashboard remain on the
-build ladder. See [`docs/DESIGN.md`](docs/DESIGN.md).
+Serial proof-of-concept: fsynced journal/replay, per-node worktree execution, exact
+receipt/run-branch verification, executable `do`, `inplace`, `seq`, serial `dispatch`,
+and command `loop`, plus `EchoRig`, `ShellRig`, and `ScriptRig`. Parallel dispatch,
+general rails, planner macros, and the dashboard remain on the build ladder. See
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Develop
 
@@ -57,8 +57,8 @@ pytest
 mypy
 ```
 
-The current shared-workdir PoC requires run state outside the target workdir.
-Target-local `.wildflows/` state lands with per-node worktree isolation (build step 5).
+Run state (journal, artifacts, and disposable worktrees) must live outside the target
+repository worktree. Target-local `.wildflows/` state remains a later authority step.
 
 ## Topics
 
