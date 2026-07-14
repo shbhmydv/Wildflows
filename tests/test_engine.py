@@ -11,6 +11,7 @@ from wildflows.engine import (
     Engine,
     NodeExecutionError,
     PredicateEvaluationError,
+    SetupResumeRequired,
     replay,
 )
 from wildflows.expr import Ask, CtxRef, Do, Edit, Inplace, Loop, RigRef, Seq, Setup, Until
@@ -268,3 +269,22 @@ def test_setup_success_and_failure_are_journalled_and_retryable(tmp_path: Path) 
         event for event in Journal.load(retry.run_dir).events()
         if event.kind == "dispatched" and event.node_id == "n0"
     ]) == 2
+
+
+def test_non_idempotent_setup_requires_explicit_resume(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
+    setup = Setup(
+        cmd=("if [ ! -f host-effect ]; then touch host-effect; "
+             "printf failed >&2; exit 3; fi; printf recovered"),
+        idempotent=False,
+    )
+    with pytest.raises(NodeExecutionError):
+        eng.run_epoch(setup, 0)
+
+    with pytest.raises(SetupResumeRequired):
+        Engine(eng.run_dir, eng.workdir, registry()).run_epoch(setup, 0)
+
+    Engine(eng.run_dir, eng.workdir, registry()).run_epoch(
+        setup, 0, retry_setups=True
+    )
+    assert replay(eng.run_dir).results[(0, "n0")].text == "recovered"

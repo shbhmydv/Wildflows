@@ -88,3 +88,7 @@ run.resume(answer_file=Path("owner-answer.txt"), answer_node="n0.0")
 
 The durable `answered` event projects directly to that Ask node's `Result`; downstream
 node context reads the owner text exactly as it reads any other node result.
+
+A setup with `idempotent: false` that was dispatched but did not succeed is surfaced as
+`SetupResumeRequired`, never silently repeated. After inspecting the host, the owner can
+make the retry explicit with `run.resume(retry_setups=True)`.

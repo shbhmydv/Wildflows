@@ -2,14 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from wildflows.events import (
-    Answered,
-    Asked,
-    Boundary,
-    Dispatched,
-    Event,
-    Integrated,
-    LoopIter,
-    ResultEvent,
+    Answered, Asked, Boundary, Dispatched, Event, Integrated, LoopIter, ResultEvent,
 )
 from wildflows.planner import OwnerQuestion, Rails
 from wildflows.result import IntegrationReceipt, Result

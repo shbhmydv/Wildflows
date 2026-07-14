@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_engine import init_repo
-from wildflows.planner import PlannerFailure, RailStop
+from wildflows.planner import AwaitingOwner, PlannerFailure, RailStop
 from wildflows.result import Result
 from wildflows.rig import EchoRig, RigRegistry
 from wildflows.run import Run, RunCompleted
@@ -110,6 +110,34 @@ def test_malformed_planner_decision_is_typed_and_retryable(tmp_path: Path) -> No
     assert planner.calls == 2
 
 
+def test_ending_decision_rejects_ignored_expression(tmp_path: Path) -> None:
+    planner = CannedPlanner([decision(
+        {"kind": "inplace", "edits": []}, end=True, final_summary="not valid"
+    )])
+    with pytest.raises(PlannerFailure, match="expression=null"):
+        make_run(tmp_path, planner).run()
+
+
+def test_run_resume_answer_file_completes_ask_without_replanning_epoch(
+    tmp_path: Path,
+) -> None:
+    planner = CannedPlanner([
+        decision({"kind": "ask", "question": "Proceed?"}),
+        decision(None, end=True, final_summary="owner answered"),
+    ])
+    run = make_run(tmp_path, planner, run_id="ask-run")
+    with pytest.raises(AwaitingOwner):
+        run.run()
+    assert planner.calls == 1
+
+    answer = tmp_path / "answer.txt"
+    answer.write_text("yes", encoding="utf-8")
+    resumed = make_run(tmp_path, planner, run_id="ask-run")
+    assert resumed.resume(answer_file=answer).summary == "owner answered"
+    assert planner.calls == 2
+    assert resumed.engine.journal.projection.results[(0, "n0")].text == "yes"
+
+
 def test_macro_names_and_descriptions_reach_planner_input(tmp_path: Path) -> None:
     planner = CannedPlanner([decision(None, end=True, final_summary="done")])
     run = make_run(tmp_path, planner)
@@ -129,6 +157,7 @@ def test_macro_names_and_descriptions_reach_planner_input(tmp_path: Path) -> Non
     assert "A project-specific nudge." in prompt
     assert "senior-loop" in prompt
     assert "swarm-judge" in prompt
+    assert '"path":' in prompt
 
 
 def test_max_epochs_rail_stops_and_replays_without_planner_call(tmp_path: Path) -> None:
@@ -143,6 +172,7 @@ def test_max_epochs_rail_stops_and_replays_without_planner_call(tmp_path: Path) 
     assert first.value.epoch == 1
     assert planner.calls == 1
 
+    run = make_run(tmp_path, planner)
     with pytest.raises(RailStop) as resumed:
         run.resume()
     assert resumed.value.epoch == 1
@@ -167,6 +197,7 @@ def test_deadline_stops_open_epoch_and_resume_keeps_same_expression(tmp_path: Pa
     assert (run.workdir / "setup-ready").read_text(encoding="utf-8") == "ready"
     assert planner.calls == 1
 
+    run = make_run(tmp_path, planner)
     with pytest.raises(RailStop):
         run.resume()
     assert planner.calls == 1
@@ -199,6 +230,11 @@ def test_real_process_crash_resumes_open_expression_before_planning_again(
         def run(self, prompt: str, workdir: Path) -> Result:
             os._exit(77)
 
+    class ResumedRig:
+        def run(self, prompt: str, workdir: Path) -> Result:
+            (workdir / "resumed-effect").write_text("ran", encoding="utf-8")
+            return Result(text="resumed")
+
     pid = os.fork()
     if pid == 0:
         child = Run(
@@ -217,10 +253,11 @@ def test_real_process_crash_resumes_open_expression_before_planning_again(
     resumed = Run(
         workdir=repo,
         job_spec="crash recovery",
-        registry=RigRegistry({"planner": FilePlanner(), "worker": EchoRig()}),
+        registry=RigRegistry({"planner": FilePlanner(), "worker": ResumedRig()}),
         planner_rig="planner",
         run_id="crash-run",
     )
     assert resumed.resume().epochs == 1
+    assert (repo / "resumed-effect").read_text(encoding="utf-8") == "ran"
     # One call emitted epoch zero; the second is the normal planner re-entry that ends.
     assert calls.read_text(encoding="utf-8") == "2"

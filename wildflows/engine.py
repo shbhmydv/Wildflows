@@ -8,17 +8,13 @@ import time
 from typing import NoReturn
 from wildflows.admission import admit_epoch
 from wildflows.events import (
-    Answered,
-    Asked,
-    Boundary,
-    Dispatched,
-    Integrated,
-    LoopIter,
-    ResultEvent,
+    Answered, Asked, Boundary, Dispatched, Integrated, LoopIter, ResultEvent,
 )
 from wildflows.expr import Ask, CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Setup, Until
 from wildflows.journal import Journal
-from wildflows.planner import AwaitingOwner, OwnerQuestion, RailStop, Rails
+from wildflows.planner import (
+    AwaitingOwner, OwnerQuestion, RailStop, Rails, SetupResumeRequired,
+)
 from wildflows.projection import ExecutionOutcome, Floor, NodeKey, RunProjection, replay
 from wildflows.result import IntegrationReceipt, Result
 from wildflows.rig import RigRegistry, run_shell
@@ -34,6 +30,7 @@ __all__ = [
     "Engine",
     "AwaitingOwner",
     "RailStop",
+    "SetupResumeRequired",
     "NodeExecutionError",
     "SiblingOwnershipError",
     "PredicateEvaluationError",
@@ -82,6 +79,7 @@ class Engine:
         self._deadline_at: float | None = None
         self._active_rails = Rails()
         self._active_epoch = 0
+        self._retry_setups = False
         with self.repo.integration_guard():
             self.journal = Journal.load(self.run_dir)
             for epoch in self.journal.projection.epochs.values():
@@ -99,6 +97,11 @@ class Engine:
     @property
     def _proj(self) -> RunProjection:
         return self.journal.projection
+    def refresh(self) -> None:
+        """Adopt durable state after another serialized Run owner completed."""
+        with self.repo.integration_guard():
+            self.journal = Journal.load(self.run_dir)
+            self._verify_resume_claims()
     def run_epoch(
         self,
         tree: Expr,
@@ -107,8 +110,10 @@ class Engine:
         rails: Rails | None = None,
         rationale: str | None = None,
         deadline_at: float | None = None,
+        retry_setups: bool = False,
     ) -> None:
         self._deadline_at = deadline_at
+        self._retry_setups = retry_setups
         self._active_rails = rails or Rails()
         self._active_epoch = epoch
         try:
@@ -119,6 +124,7 @@ class Engine:
                 self._run_epoch(tree, epoch, rationale)
         finally:
             self._deadline_at = None
+            self._retry_setups = False
     def answer(self, answer: str, *, epoch: int | None = None, node_id: str | None = None) -> None:
         """Durably answer one currently pending Ask; the answer is its projected result."""
         with self.repo.integration_guard():
@@ -504,6 +510,14 @@ class Engine:
         ),))
     def _exec_setup(self, node: Setup, epoch: int) -> ExecutionOutcome:
         key = (epoch, node.node_id)
+        state = self._proj.node(key)
+        if (
+            not node.idempotent
+            and state.dispatch_count
+            and (state.result is None or not state.result.ok)
+            and not self._retry_setups
+        ):
+            raise SetupResumeRequired(epoch, node.node_id)
         base = self.repo.branch_tip()
         self.journal.append(Dispatched(
             run_id=self.run_id,
@@ -553,6 +567,7 @@ class Engine:
         ))
         return _Attempt(node, key, base, worktree)
     def _build_candidate(self, attempt: _Attempt) -> _Candidate:
+        self._check_deadline()
         node = attempt.node
         if isinstance(node, Do):
             assert attempt.prompt is not None
@@ -643,6 +658,7 @@ class Engine:
         owned_paths: set[str] = set()
         try:
             for child in node.children:
+                self._check_deadline()
                 assert isinstance(child, (Do, Inplace))
                 key = (epoch, child.node_id)
                 if self._proj.resume_action(key, floor) == "done":
@@ -838,6 +854,7 @@ class Engine:
         assert until.cmd is not None
         return until.cmd
     def _exec_predicate(self, node: Loop, epoch: int) -> bool:
+        self._check_deadline()
         key = (epoch, f"{node.node_id}.until")
         self._verify_resume_claims()
         base = self.repo.branch_tip()

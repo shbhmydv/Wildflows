@@ -1421,8 +1421,9 @@ than patching each row. Both are the transaction model of record — not a later
     open, and raises `AwaitingOwner`; `answered` projects directly into the Ask node's
     result with no duplicate `result` event. Setup appends host-marked `dispatched` plus a
     bounded-tail `result`, runs through the existing supervised shell path at repository
-    root, and never uses a node worktree. A failed setup remains an ordinary retryable
-    failed node.
+    root, and never uses a node worktree. A failed idempotent setup is an ordinary
+    retryable node; an interrupted/failed non-idempotent setup raises
+    `SetupResumeRequired` until the owner explicitly approves its retry.
 
 93. **Bounded planner digest and artifact reference.** The next prompt contains latest
     effective per-node results from only the immediately preceding epoch. Text, paths, and
