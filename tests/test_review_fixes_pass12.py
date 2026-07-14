@@ -99,8 +99,8 @@ def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_p
     try:
         _wait_for(delayed_started, "predicate did not start")
         records = [
-            *list((run_dir / "processes").glob("*.json")),
-            *list((run_dir / "predicate-processes").glob("*.json")),
+            path for path in (run_dir / "processes").glob("*.json")
+            if json.loads(path.read_text()).get("kind", "workload") == "workload"
         ]
         assert len(records) == 1
         supervisor_pid = int(json.loads(records[0].read_text())["pid"])

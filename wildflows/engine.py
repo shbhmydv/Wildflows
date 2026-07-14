@@ -67,6 +67,7 @@ class Engine:
         self.journal = Journal.load(self.run_dir)
         self.run_id = self.run_dir.name
         self.ws = WorkspaceEffects(resolved_workdir, self.run_dir)
+        self.ws.reap_prior_processes()  # journal adopted; before Git/byte recovery
         self.rec = CompletionRecorder(self.journal, self.run_id)
 
     @property
@@ -93,7 +94,8 @@ class Engine:
                 run_id=self.run_id, epoch=epoch, node_id=tree.node_id,
                 phase="opened", expr=tree.model_dump(),
             ))
-        self._exec(tree, epoch)
+        with self.ws.core_process_scope(epoch, tree.node_id):
+            self._exec(tree, epoch)
         self.journal.append(Boundary(
             run_id=self.run_id, epoch=epoch, node_id=tree.node_id, phase="closed", reason="done",
         ))

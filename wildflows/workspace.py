@@ -15,7 +15,8 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -147,8 +148,23 @@ class ProcessRecord(BaseModel):
     pid: int
     pgid: int
     start_time: int
+    kind: Literal["workload", "core"] = "workload"
+    scope_id: str | None = None
+    owner_pid: int | None = None
+    owner_start_time: int | None = None
     integrity: str | None = None
 
+
+class GitRequest(BaseModel):
+    args_b64: list[str]
+    env: dict[str, str] | None = None
+    input_b64: str | None = None
+
+class GitResponse(BaseModel):
+    returncode: int
+    stdout_b64: str = ""
+    stderr_b64: str = ""
+    error: str | None = None
 
 @dataclass
 class Lease:
@@ -203,6 +219,7 @@ class WorkspaceEffects:
     def __init__(self, workdir: Path, run_dir: Path) -> None:
         self.workdir = Path(workdir)
         self.run_dir = Path(run_dir)
+        self._core_scope: tuple[int, int] | None = None
 
     @staticmethod
     def encode_path(rel: str) -> str:
@@ -314,9 +331,12 @@ class WorkspaceEffects:
 
     @staticmethod
     def _record_integrity(model: BaseModel) -> str:
+        excluded = {"integrity"}
+        if isinstance(model, ProcessRecord) and model.owner_pid is None:
+            excluded.update({"kind", "scope_id", "owner_pid", "owner_start_time"})
         payload = json.dumps(
-            model.model_dump(mode="json", exclude={"integrity"}),
-            sort_keys=True, separators=(",", ":"),
+            model.model_dump(mode="json", exclude=excluded), sort_keys=True,
+            separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
@@ -562,6 +582,7 @@ class WorkspaceEffects:
         """
         epoch, node_id = request.node_key
         self.reap_process(epoch, node_id, request.attempt)
+        self.reap_prior_processes()  # excludes this engine's live core/recovery scope
         receipt = self._load_recovery_record(epoch, node_id, request.attempt)
         settlement = self._load_completion_settlement(epoch, node_id, request.attempt)
         if settlement is not None and settlement.pre_head != request.expected_pre_head:
@@ -1737,33 +1758,25 @@ class WorkspaceEffects:
     def _git_index(
         self, env: dict[str, str], *args: str
     ) -> subprocess.CompletedProcess[bytes]:
-        try:
-            return subprocess.run(
-                ["git", *args], cwd=self.workdir, capture_output=True, env=env
-            )
-        except OSError as exc:
-            raise WorkspaceFault(f"cannot launch temporary-index git: {exc}") from exc
+        override = ({"GIT_INDEX_FILE": env["GIT_INDEX_FILE"]} if "GIT_INDEX_FILE" in env else None)
+        return self._run_git(args, override)
 
     # -- git plumbing --------------------------------------------------------
 
     def git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        proc = self._run_git(args)
         try:
-            return subprocess.run(
-                ["git", *args], cwd=self.workdir, capture_output=True, text=True,
-                encoding="utf-8", errors="strict",
+            return subprocess.CompletedProcess(
+                proc.args, proc.returncode, proc.stdout.decode("utf-8"),
+                proc.stderr.decode("utf-8"),
             )
-        except (OSError, UnicodeError) as exc:
-            raise WorkspaceFault(f"cannot launch/decode git {' '.join(args)}: {exc}") from exc
+        except UnicodeError as exc:
+            raise WorkspaceFault(f"cannot decode git {' '.join(args)}: {exc}") from exc
 
     def git_bytes(
         self, *args: str, input_data: bytes | None = None
     ) -> subprocess.CompletedProcess[bytes]:
-        try:
-            return subprocess.run(
-                ["git", *args], cwd=self.workdir, capture_output=True, input=input_data,
-            )
-        except OSError as exc:
-            raise WorkspaceFault(f"cannot launch git {' '.join(args)}: {exc}") from exc
+        return self._run_git(args, input_data=input_data)
 
     @staticmethod
     def _output(raw: bytes) -> str:
@@ -1978,6 +1991,11 @@ class WorkspaceEffects:
     def _process_path(self, epoch: int, node_id: str, attempt: int) -> Path:
         return self._record_path("processes", epoch, node_id, attempt)
 
+    def _record_process_path(self, record: ProcessRecord) -> Path:
+        return (self._process_path(record.epoch, record.node_id, record.attempt)
+                if record.scope_id is None else
+                self.run_dir / "processes" / f"{record.scope_id}.json")
+
     @staticmethod
     def _proc_identity(pid: int) -> tuple[int, str, int] | None:
         try:
@@ -1995,16 +2013,13 @@ class WorkspaceEffects:
         except ValueError as exc:
             raise WorkspaceFault(f"malformed process identity for pid {pid}") from exc
 
-    def _load_process(self, epoch: int, node_id: str, attempt: int) -> ProcessRecord | None:
-        path = self._process_path(epoch, node_id, attempt)
-        if not os.path.lexists(path):
-            return None
+    def _load_process_at(self, path: Path) -> ProcessRecord:
         try:
             if not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
                 raise WorkspaceFault(f"process record is not regular: {path}")
             record = ProcessRecord.model_validate_json(path.read_bytes())
             self._verify_record_integrity(record, path)
-            if (record.epoch, record.node_id, record.attempt) != (epoch, node_id, attempt):
+            if self._record_process_path(record) != path:
                 raise WorkspaceFault(f"process record identity mismatch: {path}")
             return record
         except WorkspaceFault:
@@ -2012,54 +2027,39 @@ class WorkspaceEffects:
         except (OSError, ValidationError) as exc:
             raise WorkspaceFault(f"process record is corrupt: {path}: {exc}") from exc
 
+    def _load_process(self, epoch: int, node_id: str, attempt: int) -> ProcessRecord | None:
+        path = self._process_path(epoch, node_id, attempt)
+        return self._load_process_at(path) if os.path.lexists(path) else None
+
     def _group_processes(self, record: ProcessRecord) -> list[tuple[int, int]]:
-        members: list[tuple[int, int]] = []
         try:
             entries = list(Path("/proc").iterdir())
         except OSError as exc:
             raise WorkspaceFault(f"cannot enumerate process group {record.pgid}: {exc}") from exc
+        members: list[tuple[int, int]] = []
         for entry in entries:
-            if not entry.name.isdigit():
-                continue
-            identity = self._proc_identity(int(entry.name))
-            if identity is not None and identity[1] != "Z" and (
-                identity[2] == record.pgid and identity[0] >= record.start_time
-            ):
-                members.append((int(entry.name), identity[0]))
+            if entry.name.isdigit():
+                identity = self._proc_identity(int(entry.name))
+                if identity is not None and identity[1] != "Z" and (
+                    identity[2] == record.pgid and identity[0] >= record.start_time
+                ):
+                    members.append((int(entry.name), identity[0]))
         return members
 
     def _settle_process(self, record: ProcessRecord) -> None:
-        path = self._process_path(record.epoch, record.node_id, record.attempt)
+        path = self._record_process_path(record)
         try:
             path.unlink(missing_ok=True)
             self._fsync_dir(path.parent)
         except OSError as exc:
             raise WorkspaceFault(f"cannot settle process record: {exc}") from exc
 
-    def reap_process(self, epoch: int, node_id: str, attempt: int) -> None:
-        """Kill only recorded-group members launched no earlier than its guardian."""
-        record = self._load_process(epoch, node_id, attempt)
-        if record is None:
-            return
-        leader = self._proc_identity(record.pid)
-        if leader is not None:
-            if leader[0] != record.start_time:
-                # A live different generation proves the old numeric PGID was released;
-                # never apply the launch-time lower bound to this recycled group.
-                self._settle_process(record)
-                return
-            if leader[2] != record.pgid:
-                raise WorkspaceFault("recorded process leader changed process group")
-            try:
-                if os.getpgid(record.pid) != record.pgid:
-                    raise WorkspaceFault("recorded process leader changed process group")
-            except ProcessLookupError:
-                pass  # leader exited between /proc and getpgid; enumerate/recheck below
+    def _kill_group_members(self, record: ProcessRecord, exclude: int | None = None) -> None:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            members = self._group_processes(record)
+            members = [(pid, start) for pid, start in self._group_processes(record)
+                       if pid != exclude]
             if not members:
-                self._settle_process(record)
                 return
             for pid, observed_start in members:
                 try:
@@ -2079,6 +2079,37 @@ class WorkspaceEffects:
                     os.close(pidfd)
             time.sleep(0.01)
         raise WorkspaceFault("recorded process group did not exit after SIGKILL")
+
+    def _reap_record(self, record: ProcessRecord) -> None:
+        leader = self._proc_identity(record.pid)
+        if leader is not None and leader[1] != "Z":
+            if leader[0] != record.start_time:
+                self._settle_process(record)
+                return  # numeric PID/PGID generation was recycled; never signal it
+            if leader[2] != record.pgid:
+                raise WorkspaceFault("recorded process leader changed process group")
+            try:
+                if os.getpgid(record.pid) != record.pgid:
+                    raise WorkspaceFault("recorded process leader changed process group")
+            except ProcessLookupError:
+                pass
+        self._kill_group_members(record)
+        self._settle_process(record)
+
+    def reap_process(self, epoch: int, node_id: str, attempt: int) -> None:
+        """Kill only recorded-group members launched no earlier than its guardian."""
+        record = self._load_process(epoch, node_id, attempt)
+        if record is not None:
+            self._reap_record(record)
+
+    def reap_prior_processes(self) -> None:
+        """Kill every prior engine owner's scope; never reap this owner's live scope."""
+        owner = self._proc_identity(os.getpid())
+        owner_start = None if owner is None else owner[0]
+        for path in sorted((self.run_dir / "processes").glob("*.json")):
+            record = self._load_process_at(path)
+            if (record.owner_pid, record.owner_start_time) != (os.getpid(), owner_start):
+                self._reap_record(record)
 
     @staticmethod
     def _write_all(fd: int, data: bytes) -> None:
@@ -2134,6 +2165,142 @@ class WorkspaceEffects:
             data.extend(chunk)
         return bytes(data)
 
+    @staticmethod
+    def _read_blocking(fd: int, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = os.read(fd, size - len(data))
+            if not chunk:
+                raise BrokenPipeError("process-scope control pipe closed")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _core_scope_child(
+        self, gate_r: int, ready_w: int, request_r: int, result_w: int
+    ) -> None:
+        try:
+            os.setsid()
+            self._write_all(ready_w, b"1"); os.close(ready_w)
+            if not os.read(gate_r, 1):
+                os._exit(125)
+            os.close(gate_r)
+            identity = self._proc_identity(os.getpid())
+            if identity is None:
+                raise WorkspaceFault("core process scope has no identity")
+            group = ProcessRecord(
+                epoch=0, node_id="core", attempt=0, pid=os.getpid(),
+                pgid=identity[2], start_time=identity[0], kind="core",
+            )
+            while True:
+                size = int.from_bytes(self._read_blocking(request_r, 8), "big")
+                request = GitRequest.model_validate_json(self._read_blocking(request_r, size))
+                try:
+                    proc = subprocess.run(
+                        [b"git", *[base64.b64decode(arg) for arg in request.args_b64]],
+                        cwd=self.workdir, capture_output=True,
+                        input=(None if request.input_b64 is None else
+                               base64.b64decode(request.input_b64, validate=True)),
+                        env=(None if request.env is None else {**os.environ, **request.env}),
+                        timeout=290,
+                    )
+                    response = GitResponse(
+                        returncode=proc.returncode,
+                        stdout_b64=base64.b64encode(proc.stdout).decode("ascii"),
+                        stderr_b64=base64.b64encode(proc.stderr).decode("ascii"),
+                    )
+                except (OSError, ValueError, binascii.Error, subprocess.TimeoutExpired) as exc:
+                    response = GitResponse(returncode=126, error=f"{type(exc).__name__}: {exc}")
+                self._kill_group_members(group, exclude=os.getpid())
+                payload = response.model_dump_json().encode("utf-8")
+                self._write_all(result_w, len(payload).to_bytes(8, "big") + payload)
+        except BaseException:
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            finally:
+                os._exit(126)
+
+    @contextmanager
+    def core_process_scope(self, epoch: int, node_id: str) -> Iterator[None]:
+        """One recorded private group shared by all core Git in this invocation."""
+        gate_r, gate_w = os.pipe(); ready_r, ready_w = os.pipe()
+        request_r, request_w = os.pipe(); result_r, result_w = os.pipe()
+        fds = (gate_r, gate_w, ready_r, ready_w, request_r, request_w, result_r, result_w)
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            for fd in fds:
+                os.close(fd)
+            raise WorkspaceFault(f"cannot launch core process scope: {exc}") from exc
+        if pid == 0:
+            os.close(gate_w); os.close(ready_r); os.close(request_w); os.close(result_r)
+            self._core_scope_child(gate_r, ready_w, request_r, result_w)
+            os._exit(127)
+        os.close(gate_r); os.close(ready_w); os.close(request_r); os.close(result_w)
+        record: ProcessRecord | None = None
+        try:
+            self._read_exact(ready_r, 1, time.monotonic() + 5)
+            identity = self._proc_identity(pid)
+            owner = self._proc_identity(os.getpid())
+            if identity is None or identity[2] != pid or owner is None:
+                raise WorkspaceFault("core process scope exited before identity publication")
+            scope_id = f"core-{os.getpid()}-{owner[0]}-{time.time_ns()}"
+            record = ProcessRecord(
+                epoch=epoch, node_id=node_id, attempt=0, pid=pid, pgid=identity[2],
+                start_time=identity[0], kind="core", scope_id=scope_id,
+                owner_pid=os.getpid(), owner_start_time=owner[0],
+            )
+            record.integrity = self._record_integrity(record)
+            self._fsync_json(self._record_process_path(record), record)
+            self._core_scope = (request_w, result_r)
+            self._write_all(gate_w, b"1")
+            yield
+        finally:
+            self._core_scope = None
+            for fd in (gate_w, ready_r, request_w, result_r):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if record is not None and os.path.lexists(self._record_process_path(record)):
+                self._reap_record(record)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
+    def _run_git(
+        self, args: tuple[str, ...], env: dict[str, str] | None = None,
+        input_data: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        scope = self._core_scope
+        if scope is None:
+            raise WorkspaceFault("core Git launch attempted outside a recorded process scope")
+        request_fd, result_fd = scope
+        request = GitRequest(
+            args_b64=[base64.b64encode(os.fsencode(arg)).decode("ascii") for arg in args],
+            env=env, input_b64=(None if input_data is None else
+                               base64.b64encode(input_data).decode("ascii")),
+        ).model_dump_json().encode("utf-8")
+        self._write_all(request_fd, len(request).to_bytes(8, "big") + request)
+        deadline = time.monotonic() + 300
+        size = int.from_bytes(self._read_exact(result_fd, 8, deadline), "big")
+        if size > 1024 * 1024 * 1024:
+            raise WorkspaceFault("core Git result exceeds 1 GiB")
+        response = GitResponse.model_validate_json(
+            self._read_exact(result_fd, size, deadline)
+        )
+        if response.error is not None:
+            raise WorkspaceFault("cannot launch core Git: " + response.error)
+        return subprocess.CompletedProcess(
+            ["git", *args], response.returncode,
+            base64.b64decode(response.stdout_b64), base64.b64decode(response.stderr_b64),
+        )
+
     def run_process(
         self, lease: Lease, operation: Callable[[], bytes], timeout_s: float
     ) -> bytes:
@@ -2163,9 +2330,13 @@ class WorkspaceEffects:
                 raise WorkspaceFault("process supervisor exited before identity publication")
             if os.path.lexists(path):
                 raise WorkspaceFault(f"active process record already exists: {path}")
+            owner = self._proc_identity(os.getpid())
+            if owner is None:
+                raise WorkspaceFault("process owner exited before identity publication")
             record = ProcessRecord(
                 epoch=epoch, node_id=node_id, attempt=lease.attempt, pid=pid,
-                pgid=identity[2], start_time=identity[0],
+                pgid=identity[2], start_time=identity[0], owner_pid=os.getpid(),
+                owner_start_time=owner[0],
             )
             record.integrity = self._record_integrity(record)
             self._fsync_json(path, record)

@@ -1,6 +1,7 @@
 """Pass-13 regression: core Git commands share the durable process barrier."""
 from __future__ import annotations
 
+import ast
 import os
 import shlex
 import stat
@@ -19,6 +20,41 @@ from tests.test_review_fixes_pass12 import (
     _wait_for,
 )
 from tests.test_review_fixes_pass5 import _base_repo
+
+
+def test_engine_process_launch_sites_are_all_explicitly_supervised() -> None:
+    roots = [Path("wildflows") / name for name in (
+        "workspace.py", "engine.py", "journal.py", "rig.py"
+    )]
+    sites: set[tuple[str, str]] = set()
+
+    class LaunchVisitor(ast.NodeVisitor):
+        def __init__(self, module: str) -> None:
+            self.scope = [module]
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.scope.append(node.name); self.generic_visit(node); self.scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.scope.append(node.name); self.generic_visit(node); self.scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name = ast.unparse(node.func)
+            if name in {"subprocess.run", "subprocess.Popen", "os.fork", "os.system"} \
+                    or name.startswith(("os.exec", "os.spawn", "os.posix_spawn")):
+                sites.add((".".join(self.scope), name))
+            self.generic_visit(node)
+
+    for path in roots:
+        LaunchVisitor(path.stem).visit(ast.parse(path.read_text(encoding="utf-8")))
+    assert sites == {
+        ("rig.ShellRig.run.execute", "subprocess.run"),
+        ("rig.ScriptRig.run.execute", "subprocess.run"),
+        ("workspace.WorkspaceEffects._core_scope_child", "subprocess.run"),
+        ("workspace.WorkspaceEffects.core_process_scope", "os.fork"),
+        ("workspace.WorkspaceEffects.run_process", "os.fork"),
+        ("workspace.WorkspaceEffects.run_predicate.execute", "subprocess.run"),
+    }
 
 
 def test_engine_crash_mid_core_git_hook_reaps_same_group_before_recovery_and_prevents_post_close_write(

@@ -1254,3 +1254,25 @@ than patching each row. Both are the transaction model of record — not a later
     After parsing and any torn-tail truncation, a fresh owner unconditionally fsyncs every
     accepted existing `events.ndjson` (including an empty file) and then its directory
     before returning. A sync failure returns no owner and no accepted durability fact.
+
+### Hand-17 call (from the pass-13 correctness review) — COMPLETE PROCESS BARRIER
+
+75. **Core Git joins the complete barrier (hand-17).** Every engine-owned external launch
+    site is now either a built-in rig/predicate operation under the hand-16 workload
+    supervisor or a core Git/index command under a recorded core scope; the Git helpers
+    fail closed outside that scope. One core record is shared by the whole active
+    `run_epoch` invocation rather than written per Git command. Its private session-leader
+    guardian accepts a fixed framed Git protocol, and after each command it pidfd-kills and
+    verifies the absence of every same-PGID descendant before replying, so a hook/filter
+    cannot mutate between Git completion and integration. The scope is reaped and settled
+    before `boundary(closed)`.
+
+    Recovery uses that invocation's live core scope as its recovery scope. After fresh
+    journal adoption, engine construction kill-only reaps every prior-owner process record
+    before any Git/byte recovery is reachable; `recover_lease` repeats the prior-attempt
+    workload reap plus the prior-owner sweep before loading recovery inputs. `ProcessRecord`
+    now distinguishes `workload|core`, carries an opaque core `scope_id`, and records the
+    owner's PID plus `/proc` start-time. The prior-owner sweep excludes only records whose
+    complete owner generation matches the current engine, so it cannot reap/deadlock on its
+    own live recovery scope. Reaping remains process-only and precedes capture, reset,
+    restore, settlement, redispatch, and every other workspace mutation.
