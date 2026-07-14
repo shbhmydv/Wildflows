@@ -9,6 +9,25 @@ from wildflows.rigconfig import load_rigs
 from wildflows.run import Run
 
 
+def _save_operator_config(
+    run: Run,
+    rigs: Path,
+    planner_rig: str,
+    max_workers: int,
+    run_branch: str | None,
+) -> None:
+    directory = run.run_dir / "control"
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / ".config.json.tmp"
+    temporary.write_text(json.dumps({
+        "rigs": str(rigs.resolve()),
+        "planner_rig": planner_rig,
+        "max_workers": max_workers,
+        "run_branch": run_branch,
+    }, sort_keys=True), encoding="utf-8")
+    temporary.replace(directory / "config.json")
+
+
 def _common(parser: argparse.ArgumentParser, *, resume: bool) -> None:
     parser.add_argument("job", type=Path)
     parser.add_argument("--repo", type=Path, required=True)
@@ -38,7 +57,14 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "dash":
-        from wildflows.dashboard import serve
+        try:
+            from wildflows.dashboard.app import serve
+        except ModuleNotFoundError as exc:
+            if exc.name in {"fastapi", "starlette"}:
+                raise RuntimeError(
+                    "dashboard dependencies missing; install wildflows[dash]"
+                ) from exc
+            raise
         serve(args.repo, args.port)
         return 0
     job: Path = args.job
@@ -51,6 +77,9 @@ def main(argv: list[str] | None = None) -> int:
         run_id=args.run_id,
         run_branch=args.run_branch,
         max_workers=args.max_workers,
+    )
+    _save_operator_config(
+        run, rigs, args.planner_rig, args.max_workers, args.run_branch
     )
     print(f"wildflows run_id={run.run_id}")
     if args.command == "resume":

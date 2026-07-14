@@ -63,6 +63,10 @@ fi
     )
     assert parked.returncode != 0
     assert "AwaitingOwner" in parked.stderr
+    operator = json.loads((
+        repo / ".wildflows" / "runs" / "cli-run" / "control" / "config.json"
+    ).read_text(encoding="utf-8"))
+    assert operator["rigs"] == str(config.resolve())
 
     resumed = subprocess.run(
         [sys.executable, "-m", "wildflows", "resume", *common, "--answer", "yes"],

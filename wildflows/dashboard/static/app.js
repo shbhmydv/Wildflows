@@ -149,10 +149,11 @@ function pre(value) { const node = document.createElement("pre"); node.textConte
 function renderInspector() {
   const target = $("#inspector"); target.replaceChildren();
   if (!state.selected || !state.run.nodes[state.selected]) {
-    target.className = "inspector empty";
-    target.textContent = "Select a node to inspect its task, result, receipts, and artifacts.";
+    target.className = "inspector";
+    target.append(pre("Select a node to inspect its task, result, receipts, and artifacts."));
     const ask = state.run.pending_questions[0];
     if (ask) target.append(renderAsk(ask));
+    if (state.run.files.length) target.append(section("Run artifacts & decisions", renderArtifacts(state.run.files)));
     return;
   }
   target.className = "inspector";
@@ -165,6 +166,9 @@ function renderInspector() {
   if (node.loop_status) target.append(section("Loop", pre(`${node.loop_status}\n${node.loop_iterations} iteration(s)`)));
   if (node.receipts.length) target.append(section("Integration receipts", pre(JSON.stringify(node.receipts, null, 2))));
   if (node.artifacts.length) target.append(section("Artifacts", renderArtifacts(node.artifacts)));
+  const nodePaths = new Set(node.artifacts.map(item => item.path));
+  const runFiles = state.run.files.filter(item => !nodePaths.has(item.path));
+  if (runFiles.length) target.append(section("Run artifacts & decisions", renderArtifacts(runFiles)));
   const ask = state.run.pending_questions.find(item => item.node_id === node.node_id);
   if (ask) target.append(renderAsk(ask));
 }

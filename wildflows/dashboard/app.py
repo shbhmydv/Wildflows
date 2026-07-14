@@ -73,7 +73,7 @@ class ActionManager:
         directory.mkdir(parents=True, exist_ok=True)
         log_path = directory / f"{action_id}.log"
         stream: BinaryIO = open(log_path, "ab", buffering=0)
-        stream.write(("$ " + " ".join(command) + "\n").encode("utf-8", "replace"))
+        stream.write(f"$ wildflows dashboard action: {kind}\n".encode("utf-8"))
         try:
             process = subprocess.Popen(
                 command,
@@ -426,10 +426,11 @@ class Dashboard:
             "--max-workers", str(workers),
         ]
         projection, _ = self.snapshot(run_dir)
+        branch: object = config.get("run_branch")
         if projection.epochs:
-            branch = projection.epochs[max(projection.epochs)].run_branch
-            if branch:
-                command.extend(["--run-branch", branch])
+            branch = projection.epochs[max(projection.epochs)].run_branch or branch
+        if isinstance(branch, str) and branch:
+            command.extend(["--run-branch", branch])
         if body.retry_setups:
             command.append("--retry-setups")
         return command
@@ -639,7 +640,13 @@ def create_app(repo: Path, token: str | None = None) -> FastAPI:
     def file(run_id: str, relative: str) -> FileResponse:
         run_dir = dashboard.run_dir(run_id)
         path = dashboard.public_file(run_dir, relative)
-        return FileResponse(path, filename=None, content_disposition_type="inline")
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if mime == "text/html":
+            headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        return FileResponse(
+            path, filename=None, content_disposition_type="inline", headers=headers
+        )
 
     @app.get("/api/actions/{action_id}")
     def action_status(action_id: str) -> Json:
