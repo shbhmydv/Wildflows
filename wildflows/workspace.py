@@ -234,10 +234,8 @@ class Repository:
         flags = os.O_RDONLY | (getattr(os, "O_DIRECTORY", 0) if directory else 0)
         try:
             descriptor = os.open(path, flags)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            try: os.fsync(descriptor)
+            finally: os.close(descriptor)
         except OSError as exc:
             raise RepositoryTransientError(f"could not sync recovered path: {exc}") from exc
     def _lock_path(self, name: str) -> Path:
@@ -277,6 +275,8 @@ class Repository:
         return cleaned
     def _matches_resume_tree(self, base: str, candidate: str, path: str) -> bool:
         literal = ["--literal-pathspecs"]
+        target = self.root / path
+        if target.parent.resolve() != target.parent: return False
         status = self.git([*literal, "status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", path]).stdout
         if not status: return True
         index_states = [self.git([
@@ -284,8 +284,7 @@ class Repository:
         ], check=False).returncode for tree in (base, candidate)]
         if 0 not in index_states: return False
         entry = self.git([*literal, "ls-tree", candidate, "--", path]).stdout.split()
-        target = self.root / path
-        if not entry and not os.path.lexists(target): return True
+        if not os.path.lexists(target): return True
         if len(entry) >= 2 and entry[0] == "040000" and target.is_dir(): return True
         if len(entry) >= 3 and entry[0] == "120000" and target.is_symlink():
             if os.readlink(target) == self.git(["cat-file", "blob", entry[2]]).stdout: return True
@@ -317,12 +316,15 @@ class Repository:
         if any(not self._matches_resume_tree(base, candidate, path) for path in paths):
             raise RepositoryTransientError("run worktree changed outside the interrupted integration")
         if not paths: return cleaned
+        self.ensure_tip(base)
         reset = self._move_ref(["--literal-pathspecs", "reset", "-q", base, "--", *paths], cwd=self.root)
         if reset.returncode != 0: raise RepositoryTransientError("could not restore interrupted integration index")
         base_paths = [path for path in paths if self.git(
             ["--literal-pathspecs", "ls-tree", base, "--", path]).stdout]
         for path in set(paths) - set(base_paths):
             target = self.root / path
+            if target.parent.resolve() != target.parent:
+                raise RepositoryTransientError("interrupted integration path gained a symlink parent")
             if os.path.lexists(target):
                 try:
                     target.unlink()
@@ -348,17 +350,16 @@ class Repository:
     def restore_missing_claim(self, missing: str, fallback: str) -> bool:
         owners = self._branch_worktrees()
         other = [owner for owner in owners if owner != self.root]
-        if other:
-            raise IntegrationError(
-                f"run branch {self.branch!r} is checked out in linked worktree {other[0]}"
-            )
+        if other: raise IntegrationError(f"run branch {self.branch!r} is checked out in linked worktree {other[0]}")
         cleaned = self.recover_interrupted_locks()
         if self.root in owners:
+            before = self._paths(["ls-files", "-z"], cwd=self.root)
             tree = self._move_ref(["read-tree", "--reset", "-u", fallback], cwd=self.root)
             if tree.returncode != 0:
                 detail = tree.stderr.strip() or tree.stdout.strip() or "index update refused"
                 raise RepositoryTransientError(f"could not restore checked-out run tree; retry: {detail}")
-            self._sync_checkout(self._paths(["ls-files", "-z"], cwd=self.root))
+            after = self._paths(["ls-files", "-z"], cwd=self.root)
+            self._sync_checkout(list(dict.fromkeys([*before, *after])))
         proc = self._move_ref(["update-ref", self.ref, fallback, missing], cwd=self.root)
         actual = self.branch_claim()
         if actual == fallback:
@@ -366,9 +367,7 @@ class Repository:
             return cleaned
         detail = proc.stderr.strip() or proc.stdout.strip() or "compare-and-swap refused"
         if actual == missing:
-            raise RepositoryTransientError(
-                f"could not restore missing run-branch claim; retry: {detail}"
-            )
+            raise RepositoryTransientError(f"could not restore missing run-branch claim; retry: {detail}")
         raise BranchDivergedError(f"could not restore missing run-branch claim: {detail}")
     def integrate(self, base: str, candidate: str) -> None:
         """Fast-forward the run branch, or leave it exactly at ``base``."""

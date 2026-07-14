@@ -1028,6 +1028,15 @@ def test_interrupted_integration_restores_file_directory_transition(
     assert expected.read_text(encoding="utf-8") == "base"
     assert git(repo, "status", "--porcelain") == ""
 
+    if switch.is_dir():
+        (switch / "child").unlink()
+        switch.rmdir()
+    else:
+        switch.unlink()
+    assert engine.repo.restore_interrupted_integration(base, candidate) is False
+    assert expected.read_text(encoding="utf-8") == "base"
+    assert git(repo, "status", "--porcelain") == ""
+
 
 def test_interrupted_integration_restores_candidate_symlink_addition(
     tmp_path: Path,
@@ -1046,6 +1055,29 @@ def test_interrupted_integration_restores_candidate_symlink_addition(
 
     assert not os.path.lexists(repo / "link")
     assert git(repo, "status", "--porcelain") == ""
+
+
+def test_interrupted_integration_preserves_candidate_path_with_symlink_parent(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    (repo / "dir").mkdir()
+    (repo / "dir" / "child").write_text("candidate", encoding="utf-8")
+    git(repo, "add", "dir/child")
+    git(repo, "commit", "-qm", "nested candidate")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "child").write_text("candidate", encoding="utf-8")
+    (repo / "dir").symlink_to(external, target_is_directory=True)
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    with pytest.raises(RepositoryTransientError, match="changed outside"):
+        engine.repo.restore_interrupted_integration(base, candidate)
+
+    assert (external / "child").read_text(encoding="utf-8") == "candidate"
 
 
 def test_interrupted_integration_preserves_changed_ignored_addition(
@@ -1078,6 +1110,7 @@ def test_missing_claim_ref_is_resynced_before_repeated_fallback(
     init_repo(repo)
     run_dir = tmp_path / "run"
     tree = Inplace(edits=[Edit(path="target", content="candidate")])
+    base = git(repo, "rev-parse", "HEAD")
     engine = Engine(run_dir, repo, registry())
     engine.run_epoch(tree, 0)
     missing = git(repo, "rev-parse", "HEAD")
@@ -1089,6 +1122,7 @@ def test_missing_claim_ref_is_resynced_before_repeated_fallback(
     def count_sync(self: Repository) -> None:
         nonlocal calls
         calls += 1
+        assert self.branch_claim() == base
         sync(self)
 
     def crash_before_fallback(

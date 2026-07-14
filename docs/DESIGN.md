@@ -1315,8 +1315,11 @@ than patching each row. Both are the transaction model of record — not a later
     must match either the verified base or the interrupted candidate; a third state is
     preserved with a typed transient refusal. Receipts disable rename collapsing so both
     sides are restored; ignored additions and candidate file mode/type/blob (including
-    symlinks) are verified before removal, and file↔directory transitions remove only
-    verified candidate leaves/empty collision directories. Parent-bound, path-scoped Git reset/restore then
+    symlinks) are verified before removal, symlinked parent paths are refused, and
+    file↔directory transitions remove only verified candidate leaves/empty collision
+    directories. A missing path with the index already at base is an idempotent
+    restoration-in-progress state, so a second constructor can finish after another kill.
+    Parent-bound, path-scoped Git reset/restore then
     returns those paths to the base and removes only verified candidate additions, so a
     mid-checkout kill cannot leave unjournalled candidate files behind and unrelated
     worktree state is untouched. The restored index, files, deletions, and containing
@@ -1327,8 +1330,10 @@ than patching each row. Both are the transaction model of record — not a later
     A killed constructor therefore cannot leave a live orphan index writer. Resume applies
     rule 83 to any dead child's residue before retrying; a live/uncertain owner, failed
     index update, or unchanged claim after failed CAS is a typed transient retry rather
-    than a raw Git `RepositoryError`. Restored tracked state and the CAS-updated ref are
-    fsynced before fallback publication; every fallback also re-syncs the current run ref,
+    than a raw Git `RepositoryError`. Pre/post restore index paths are unioned when fsyncing,
+    so removed candidate additions' parent directories are covered. Restored tracked state
+    and the CAS-updated ref are fsynced before fallback publication; every fallback also
+    re-syncs the current run ref,
     covering a crash after CAS but before its first sync. A different live claim remains
     typed divergence.
 
@@ -1337,6 +1342,7 @@ than patching each row. Both are the transaction model of record — not a later
     crash-residue story: exact journal evidence authorizes only ownerless-lock removal;
     every live or uncertain lock is preserved for retry. Disposable attempt-worktree locks
     remain harmless because paths are never reused. This adds no lease, intent, quarantine,
-    process record, or new integration transaction, and does not close hand-20's documented
-    worktree-ownership scan-to-ref-move TOCTOU; M2 still needs explicit coordination before
-    concurrent integration or operator-facing worktrees.
+    process record, or new integration transaction. It does not serialize an operator who
+    starts new Git work after the liveness scan, nor close hand-20's worktree-ownership
+    scan-to-ref-move TOCTOU; M1's operator model remains activity between runs, and M2 still
+    needs explicit coordination before concurrent integration or operator-facing worktrees.
