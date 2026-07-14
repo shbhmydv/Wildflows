@@ -679,11 +679,15 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
     git(repo, "config", "filter.slow.smudge", shlex.quote(str(filter_script)))
     git(repo, "config", "filter.slow.required", "true")
     (repo / ".gitattributes").write_text("target filter=slow\n", encoding="utf-8")
-    git(repo, "add", ".gitattributes")
+    (repo / "first").write_text("base", encoding="utf-8")
+    git(repo, "add", ".gitattributes", "first")
     git(repo, "commit", "-qm", "configure slow filter")
     base = git(repo, "rev-parse", "HEAD")
     run_dir = tmp_path / "run"
-    tree = Inplace(edits=[Edit(path="target", content="candidate")])
+    tree = Inplace(edits=[
+        Edit(path="first", content="candidate-first"),
+        Edit(path="target", content="candidate"),
+    ])
 
     pid = os.fork()
     if pid == 0:
@@ -713,6 +717,7 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
             os.waitpid(pid, 0)
 
     assert git(repo, "rev-parse", "HEAD") == base
+    assert (repo / "first").read_text(encoding="utf-8") == "candidate-first"
     try:
         deadline = time.monotonic() + 5
         while True:
@@ -734,6 +739,8 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
         )
         assert not finished.exists(), "replacement waited for an unbound ref mover"
         assert git(repo, "rev-parse", "HEAD") == base
+        assert (repo / "first").read_text(encoding="utf-8") == "base"
+        assert git(repo, "status", "--porcelain") == ""
         assert git(repo, "rev-parse", "HEAD") != candidate
         assert not any(event.kind == "integrated" for event in resumed.journal.events())
         assert not (repo / ".git" / "index.lock").exists()
@@ -747,6 +754,7 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
 
     resumed.run_epoch(tree, 0)
 
+    assert (repo / "first").read_text(encoding="utf-8") == "candidate-first"
     assert (repo / "target").read_text(encoding="utf-8") == "candidate"
     assert git(repo, "status", "--porcelain") == ""
     assert any(event.kind == "integrated" for event in resumed.journal.events())
@@ -906,6 +914,25 @@ def test_interrupted_index_lock_is_preserved_after_branch_becomes_unowned(
 
     assert lock.exists()
     lock.unlink()
+
+
+def test_interrupted_integration_preserves_third_state_worktree_edit(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    (repo / "seed").write_text("candidate", encoding="utf-8")
+    git(repo, "add", "seed")
+    git(repo, "commit", "-qm", "candidate")
+    candidate = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", base)
+    (repo / "seed").write_text("operator", encoding="utf-8")
+    engine = Engine(tmp_path / "run", repo, registry())
+
+    with pytest.raises(RepositoryTransientError, match="changed outside"):
+        engine.repo.restore_interrupted_integration(base, candidate)
+
+    assert (repo / "seed").read_text(encoding="utf-8") == "operator"
 
 
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:

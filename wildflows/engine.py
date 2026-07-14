@@ -219,7 +219,7 @@ class Engine:
                 return True
             if live == expected:
                 assert dispatch is not None
-                cleaned = self.repo.recover_interrupted_locks()
+                cleaned = self.repo.restore_interrupted_integration(expected, candidate)
                 reason = "resume fallback: result was journalled but its commits did not land"
                 if cleaned:
                     reason += "; removed ownerless interrupted Git lock residue"
