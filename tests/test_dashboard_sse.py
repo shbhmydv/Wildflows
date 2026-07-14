@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -24,7 +25,9 @@ def _record(seq: int, text: str) -> bytes:
 
 
 def _payload(message: str) -> dict[str, object]:
-    return json.loads(message.split("data: ", maxsplit=1)[1])
+    decoded = json.loads(message.split("data: ", maxsplit=1)[1])
+    assert isinstance(decoded, dict)
+    return cast(dict[str, object], decoded)
 
 
 def test_tail_emits_only_complete_validated_records(tmp_path: Path) -> None:

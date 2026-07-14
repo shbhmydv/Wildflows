@@ -35,9 +35,10 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--answer")
     resume.add_argument("--answer-frame")
     resume.add_argument("--answer-call", type=int)
-    dash = commands.add_parser("dash", help="serve the local v2 journal stub")
-    dash.add_argument("--repo", type=Path, required=True)
-    dash.add_argument("--port", type=int, default=8765)
+    dash = commands.add_parser("dash", help="serve the v2 frame-call-stack console")
+    dash.add_argument("--repo", type=Path, action="append", default=[])
+    dash.add_argument("--watchlist", type=Path)
+    dash.add_argument("--port", type=int, default=8181)
     return parser
 
 
@@ -52,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
                     "dashboard dependencies missing; install wildflows[dash]"
                 ) from exc
             raise
-        serve(args.repo, args.port)
+        serve(args.repo, args.port, watchlist=args.watchlist)
         return 0
 
     if (

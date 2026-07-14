@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>WILDFLOWS — frame console</title>
+  <script>
+    (() => {
+      const query = new URLSearchParams(location.search).get("theme");
+      const saved = localStorage.getItem("wf-theme");
+      const theme = query === "light" || query === "dark" ? query : saved;
+      if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="window-zone" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="topbar-main">
+        <label class="run-picker" for="run-picker"><span>run</span><b>/</b><select id="run-picker" aria-label="Run picker"><option>Loading…</option></select></label>
+        <div class="top-actions">
+          <span class="connection"><i id="connection-dot" class="status-dot muted"></i><span id="connection-copy">connecting</span></span>
+          <button id="theme-toggle" class="icon-button" type="button" aria-label="Switch theme" title="Switch theme">☾</button>
+          <button id="token-open" class="icon-button" type="button" aria-label="Set control token" title="Set control token">⌁</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="body-grid">
+      <aside class="sidebar">
+        <a class="brand" href="/" aria-label="Wildflows home">
+          <svg width="24" height="20" viewBox="0 0 24 20" fill="none" aria-hidden="true"><path d="M2 4.5C4.5 4.5 4.1 15.5 7 15.5C9.6 15.5 9.1 4.5 12 4.5C14.7 4.5 14.5 15.5 17 15.5C19.4 15.5 19.6 8.2 22 8.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M20 5.8L22.4 8.1L20 10.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>wildflows</span>
+        </a>
+        <nav aria-label="Console sections">
+          <a class="nav-item active" href="#canvas-panel">Call stack</a>
+          <a class="nav-item" href="#journal-panel">Journal</a>
+          <a class="nav-item" href="#artifacts">Artifacts</a>
+        </nav>
+        <section class="live-section" aria-labelledby="live-title">
+          <h2 id="live-title" class="micro-label">Live now</h2>
+          <div id="live-list" class="live-list"><p class="empty-copy">Loading watched repositories…</p></div>
+        </section>
+        <div class="sidebar-foot">
+          <span id="repo-count">0 repositories</span>
+          <span id="run-count">0 runs</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section class="run-header" aria-labelledby="run-title">
+          <div class="heading-row">
+            <h1 id="run-title">run <span>/</span> <b id="run-id">select a run</b></h1>
+            <span id="run-state" class="state-pill"><i class="status-dot muted"></i>ready</span>
+          </div>
+          <div class="state-line"><span class="micro-label">Current state</span><strong id="state-copy">No run selected</strong></div>
+          <div id="cap-list" class="cap-list" aria-label="Run rails and caps"></div>
+        </section>
+
+        <div class="console-grid">
+          <section id="canvas-panel" class="panel canvas-panel" aria-labelledby="canvas-title">
+            <header class="panel-head">
+              <div><span class="zone-title violet" id="canvas-title">Frame call stack</span><span id="frame-count" class="count-chip">0 frames</span></div>
+              <nav id="canvas-breadcrumb" class="canvas-breadcrumb" aria-label="Canvas root"></nav>
+            </header>
+            <div id="canvas" class="canvas"><div class="empty-state">Select a run to inspect its call stack.</div></div>
+          </section>
+
+          <section id="journal-panel" class="panel journal-panel" aria-labelledby="journal-title">
+            <header class="panel-head">
+              <div><span class="zone-title blue" id="journal-title">Journal</span><span id="event-count" class="count-chip blue">0 events</span></div>
+              <span id="stream-state" class="stream-state"><i class="status-dot muted"></i>SSE offline</span>
+            </header>
+            <div id="journal" class="journal"><div class="empty-state">Journal events appear here.</div></div>
+          </section>
+        </div>
+
+        <footer class="statusbar">
+          <span id="status-summary">wildflows / local</span>
+          <span id="status-path">—</span>
+          <span id="status-clock">—</span>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="token-dialog" aria-labelledby="token-title">
+    <form id="token-form" method="dialog">
+      <span class="micro-label">Existing control seam</span>
+      <h2 id="token-title">Control token</h2>
+      <p>The server only accepts owner answers with its startup token. The value stays in this browser tab.</p>
+      <label for="token-input">Token</label>
+      <input id="token-input" type="password" autocomplete="off" required>
+      <div class="dialog-actions"><button class="button" value="cancel" formnovalidate>Cancel</button><button class="button primary" value="save">Save</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

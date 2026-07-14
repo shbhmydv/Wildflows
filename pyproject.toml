@@ -22,7 +22,7 @@ dev = [
 include = ["wildflows*"]
 
 [tool.setuptools.package-data]
-wildflows = ["skills/*.md"]
+wildflows = ["skills/*.md", "dashboard/static/*"]
 
 [tool.mypy]
 python_version = "3.12"

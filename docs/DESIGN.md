@@ -1702,3 +1702,50 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      durable frontier. A live retry preserves `(frame, index, canonical hash)` and
      joins the engine's existing single flight. Distinct concurrent later indexes
      wait behind an earlier in-flight index even before its called event is durable.
+
+### Hand-31 calls — frame-call-stack operator console
+
+122. **The dashboard is a journal projection, not a second state machine.** It reads
+     only complete newline-terminated v2 records, validates contiguous sequence and
+     the typed event vocabulary, then folds the existing `RunProjection`. Frame and
+     call display states (running leaf, banked caller, parked ask, terminal outcome)
+     are derived from that fold. An unterminated tail is ignored in place; the
+     dashboard never invokes journal repair or writes watched run state.
+
+123. **Canvas geometry follows discovered calls.** A frame is rendered before its
+     calls. Dispatch calls stack vertically by call index; one call's parallel tasks
+     occupy one horizontal sibling row. A completed dispatch return is the single
+     collapse trigger for the whole sibling row, never an individual child's exit.
+     The first five slots plus a counted ghost bound broad rows. Nesting stops after
+     three relative levels and a visible drill-in action rebases that frame as the
+     canvas root, with ancestor breadcrumbs to climb back.
+
+124. **Run identity is repository-qualified.** One dashboard watches a deduplicated
+     ordered set from repeatable `--repo` flags and/or a line-oriented watchlist.
+     Public identity is `(repo_id, run_id)`, so equal run ids in different targets
+     remain distinct in APIs, the picker, LIVE NOW, SSE, and artifact routes. Port
+     8181 is the fixed default. SSE resumes strictly after sequence ids and sends
+     idle comments without becoming another event vocabulary.
+
+125. **No new control surface is implied by an operator console.** The only mutation
+     route is an owner answer delegated to the existing
+     `Run.deliver_live_answer` seam and guarded by a startup token. It targets the
+     exact `(frame_id, call_index)` pending ask. The console deliberately provides
+     no launch, pause, kill, or retry API.
+
+126. **The approved v1 visual tokens survive the v2 topology.** Both exact light and
+     dark token sets are declared and selected by `data-theme`; light ground remains
+     cool white `#fbfcfd`. Dot grid is canvas-only, zone color sits on components,
+     and panes remain neutral. Cards have no left-edge accent bar. A running leaf
+     alone breathes on a slow two-second cycle; reduced-motion replaces animation
+     with a strong static violet outline. Banked violet, parked amber, failed red,
+     collapsed grey/green, and queued muted states stay distinguishable without
+     relying on motion.
+
+127. **Journal language is operator-facing.** Frame ids display as breadcrumb paths;
+     a gate return says `gate: PASS/FAIL (exit N)` and expands both captured streams.
+     Running durations tick from push time while terminal durations stop at exit.
+     Result prose clamps to two lines until expanded, event kinds use the approved
+     palette, and dispatch calls/returns carry explicit request/result margin refs.
+     The tracked synthetic repository exercises failure, owner parking, a 20-slot
+     fan-out, whole-call collapse, a two-stream failed gate, and depth four.

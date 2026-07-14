@@ -63,11 +63,19 @@ python3 -m wildflows resume job.md --repo /path/to/target \
 A live parked ask can be answered by adding `--answer '...'`; the resident engine
 observes the durable answer file and resumes the blocked tool call.
 
-The optional dashboard currently exposes a v2 journal/status stub:
+The optional dashboard renders the live v2 frame call stack and journal. It watches
+multiple repositories on fixed port 8181; `--repo` is repeatable and `--watchlist`
+accepts a file with one repository path per line:
 
 ```bash
-python3 -m wildflows dash --repo /path/to/target
+python3 -m wildflows dash \
+  --repo /path/to/target \
+  --repo /path/to/another-target
+# http://127.0.0.1:8181
 ```
+
+See [docs/DASHBOARD.md](docs/DASHBOARD.md) for deep links, the synthetic visual fixture,
+and the token-guarded owner-answer seam.
 
 ## Develop
 
