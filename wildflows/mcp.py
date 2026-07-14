@@ -477,10 +477,18 @@ class MCPServer:
                     "properties": {
                         "tasks": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "pattern": r".*\S.*",
+                            },
                             "minItems": 1,
                         },
-                        "rig": {"type": "string", "minLength": 1},
+                        "rig": {
+                            "type": "string",
+                            "minLength": 1,
+                            "pattern": r".*\S.*",
+                        },
                         "parallel": {"type": "boolean", "default": False},
                     },
                     "required": ["tasks", "rig"],
@@ -492,7 +500,13 @@ class MCPServer:
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": False,
-                    "properties": {"cmd": {"type": "string", "minLength": 1}},
+                    "properties": {
+                        "cmd": {
+                            "type": "string",
+                            "minLength": 1,
+                            "pattern": r".*\S.*",
+                        }
+                    },
                     "required": ["cmd"],
                 },
             },
@@ -503,7 +517,11 @@ class MCPServer:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "question": {"type": "string", "minLength": 1}
+                        "question": {
+                            "type": "string",
+                            "minLength": 1,
+                            "pattern": r".*\S.*",
+                        }
                     },
                     "required": ["question"],
                 },

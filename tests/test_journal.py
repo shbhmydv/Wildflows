@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from wildflows.admission import AdmissionPolicy
+from wildflows.engine import Engine
 from wildflows.events import RunFinished, RunOpened
 from wildflows.journal import IncompatibleJournalError, Journal
+from wildflows.rig import EchoRig, RigRegistry
 
 
 def _opened(run_id: str = "run") -> RunOpened:
@@ -79,6 +81,26 @@ def test_load_durably_drops_any_unterminated_tail(tmp_path: Path) -> None:
     loaded = Journal.load(tmp_path / "run")
     assert loaded.n_events == 1
     assert path.read_bytes().endswith(b"\n")
+
+
+def test_engine_treats_torn_first_run_opened_as_no_durable_run(
+    repo: Path, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events.ndjson").write_bytes(b'{"version":2,"seq":0')
+    engine = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"echo": EchoRig()}),
+        run_id="fresh-after-tear",
+        root_rig="echo",
+        root_prompt="job",
+        worktrees_root=tmp_path / "worktrees",
+    )
+    assert engine.projection.opened is not None
+    assert engine.projection.opened.run_id == "fresh-after-tear"
+    assert engine.journal.events()[0].seq == 0
 
 
 def test_parallel_append_owner_assigns_contiguous_sequences(tmp_path: Path) -> None:

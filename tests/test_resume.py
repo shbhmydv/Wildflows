@@ -8,13 +8,39 @@ from typing import cast
 import pytest
 
 from wildflows.engine import Engine
-from wildflows.events import DispatchCalled, DispatchReturned, FramePushed
+from wildflows.events import (
+    DispatchCalled,
+    DispatchReturned,
+    FrameIntegrated,
+    FrameIntegrating,
+    FramePushed,
+)
 from wildflows.frame import FrameResult, FrameRuntime
 from wildflows.rig import RigRegistry
 
 
 class SimulatedKill(BaseException):
     pass
+
+
+class IntegrationTear(BaseException):
+    pass
+
+
+class CountRig:
+    timeout_s = 30.0
+
+    def __init__(self, counter: Path) -> None:
+        self.counter = counter
+
+    def run(
+        self, prompt: str, workdir: Path, runtime: FrameRuntime
+    ) -> FrameResult:
+        del prompt, runtime
+        count = int(self.counter.read_text(encoding="utf-8")) if self.counter.exists() else 0
+        self.counter.write_text(str(count + 1), encoding="utf-8")
+        (workdir / "root-effect.txt").write_text("durable\n", encoding="utf-8")
+        return FrameResult(text="root done", exit_code=0)
 
 
 class ReplayRig:
@@ -66,6 +92,61 @@ class ReplayRig:
             raise SimulatedKill()
         (workdir / "root.txt").write_text("resumed\n", encoding="utf-8")
         return FrameResult(text="root resumed", exit_code=0)
+
+
+def test_resume_reconciles_ref_move_after_frame_integrating_tear(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "tear-run"
+    counter = tmp_path / "root-executions"
+    first = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"count": CountRig(counter)}),
+        run_id="integration-tear",
+        root_rig="count",
+        root_prompt="root job",
+        worktrees_root=tmp_path / "tear-worktrees",
+    )
+    advance = first.repository.advance
+
+    def tear_after_move(
+        target_ref: str,
+        base: str,
+        candidate: str,
+        *,
+        target_worktree: Path | None,
+    ) -> None:
+        advance(
+            target_ref,
+            base,
+            candidate,
+            target_worktree=target_worktree,
+        )
+        raise IntegrationTear()
+
+    monkeypatch.setattr(first.repository, "advance", tear_after_move)
+    with pytest.raises(IntegrationTear):
+        first.run()
+    assert counter.read_text(encoding="utf-8") == "1"
+    assert any(isinstance(event, FrameIntegrating) for event in first.journal.events())
+    assert not any(isinstance(event, FrameIntegrated) for event in first.journal.events())
+
+    resumed = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"count": CountRig(counter)}),
+        run_id="integration-tear",
+        root_rig="count",
+        root_prompt="root job",
+    )
+    assert resumed.run().outcome == "ok"
+    assert counter.read_text(encoding="utf-8") == "1"
+    assert (repo / "root-effect.txt").read_text(encoding="utf-8") == "durable\n"
+    assert len([
+        event for event in resumed.journal.events()
+        if isinstance(event, FrameIntegrated)
+    ]) == 1
 
 
 def test_resume_replays_stack_and_memoizes_completed_dispatch(

@@ -1616,3 +1616,32 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      `resume` replays that root stack. The dashboard backend is deliberately a
      compiling v2 journal/status stub; a frame-stack UI is the next phase, as
      allowed by §10/§12.
+
+114. **The run capability is attenuated per active frame.** The endpoint owns a
+     random run secret, but each frame attempt receives a separate random
+     bearer registered to exactly its engine-owned frame id. The claimed frame
+     header is checked against that binding, so a child cannot spend through a
+     blocked parent's worktree. Capabilities are revoked on frame exit. This is
+     attenuation of the required per-run authenticated endpoint, not a second
+     endpoint or agent-owned identity channel.
+
+115. **Memoization and subtree admission are single-flight reservations.** A
+     condition-guarded leader owns each `(frame, call_index)` from identity
+     check through durable return; exact followers wait and receive that one
+     result, conflicting content is a typed protocol error, and later indexes
+     cannot pass a pending earlier call. Dispatch admission atomically reserves
+     frame/spend units against the caller AND every ancestor subtree. Each
+     `frame_pushed` consumes one reservation into the durable descendant fold;
+     unlaunched residue is released. Parallel source-path ownership is derived
+     from durable sibling integrations on replay and updated under the same
+     serialized integration lock as overlap checking.
+
+116. **Answers and process death are first-writer/fail-closed boundaries.** An
+     owner answer is fsynced to a private temp and published with no-replace
+     link semantics; a second answer is refused, while a crash after publication
+     leaves the same complete answer for replay. A live CLI answer uses a
+     read-only complete-record snapshot and never invokes journal torn-tail
+     repair beside the resident append owner. External workloads use a
+     parent-death-bound leader plus same-process-group watchdog, so supervisor
+     death kills ordinary descendants while abandoned worktree paths remain
+     never reused.

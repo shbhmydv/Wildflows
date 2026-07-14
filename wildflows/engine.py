@@ -87,6 +87,12 @@ class Engine:
         self._active: dict[str, FrameWorktree] = {}
         self._active_lock = threading.RLock()
         self._integration_lock = threading.RLock()
+        self._admission_lock = threading.RLock()
+        self._reservation_frames: dict[str, int] = {}
+        self._reservation_spend: dict[str, float] = {}
+        self._dispatch_reservations: dict[
+            tuple[str, int], tuple[list[str], int, float]
+        ] = {}
         self._answer_condition = threading.Condition(threading.RLock())
         self._call_condition = threading.Condition(threading.RLock())
         self._inflight_calls: dict[tuple[str, int], tuple[ToolName, str]] = {}
@@ -94,6 +100,10 @@ class Engine:
         continuing = journal_path.exists() and journal_path.stat().st_size > 0
         self.journal = Journal.load(self.run_dir) if continuing else Journal(self.run_dir)
         opened = self.journal.projection.opened
+        if continuing and opened is None and self.journal.n_events == 0:
+            # The only record was an uncertain torn run_opened. Repair accepted
+            # no durable run identity or effect, so this run id is fresh again.
+            continuing = False
         if continuing:
             if opened is None:
                 raise RuntimeError("v2 journal has no run_opened event")
@@ -320,18 +330,17 @@ class Engine:
             self.repository.ensure_clean(worktree.path, frame.branch)
         else:
             caller_head = self.repository.ensure_clean(worktree.path, frame.branch)
-            descendants = self.journal.projection.descendants(frame.frame_id)
-            spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
             try:
-                admit_dispatch(
-                    request,
-                    caller_depth=frame.depth,
-                    subtree_frames=len(descendants),
-                    subtree_spend=spend,
-                    subtree_deadline=frame.subtree_deadline,
-                    policy=self.policy,
-                    registry=self.registry,
-                )
+                with self._admission_lock:
+                    self._admit_and_reserve(frame, call_index, request)
+                    self.journal.append(DispatchCalled(
+                        run_id=self.run_id,
+                        frame_id=frame.frame_id,
+                        call_index=call_index,
+                        call_hash=digest,
+                        request=request,
+                        caller_head=caller_head,
+                    ))
             except AdmissionError as exc:
                 self.journal.append(DispatchCalled(
                     run_id=self.run_id,
@@ -354,20 +363,16 @@ class Engine:
                     result=refused,
                 ))
                 return refused
-            self.journal.append(DispatchCalled(
-                run_id=self.run_id,
-                frame_id=frame.frame_id,
-                call_index=call_index,
-                call_hash=digest,
-                request=request,
-                caller_head=caller_head,
-            ))
 
-        results = (
-            self._parallel_children(frame, worktree, call_index, request)
-            if request.parallel and len(request.tasks) > 1
-            else self._serial_children(frame, worktree, call_index, request)
-        )
+        try:
+            results = (
+                self._parallel_children(frame, worktree, call_index, request)
+                if request.parallel and len(request.tasks) > 1
+                else self._serial_children(frame, worktree, call_index, request)
+            )
+        finally:
+            if not replaying:
+                self._clear_dispatch_reservation(frame.frame_id, call_index)
         outcome: FrameOutcome = (
             "ok" if all(result.outcome == "ok" for result in results) else "failed"
         )
@@ -380,6 +385,89 @@ class Engine:
             result=returned,
         ))
         return returned
+
+    def _ancestor_ids(self, frame: FrameProjection) -> list[str]:
+        ancestors: list[str] = []
+        current: FrameProjection | None = frame
+        while current is not None:
+            ancestors.append(current.frame_id)
+            current = (
+                None
+                if current.parent_frame_id is None
+                else self.journal.projection.frame(current.parent_frame_id)
+            )
+        return ancestors
+
+    def _admit_and_reserve(
+        self,
+        frame: FrameProjection,
+        call_index: int,
+        request: DispatchRequest,
+    ) -> None:
+        ancestors = self._ancestor_ids(frame)
+        for ancestor_id in ancestors:
+            ancestor = self.journal.projection.frame(ancestor_id)
+            descendants = self.journal.projection.descendants(ancestor_id)
+            spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
+            admit_dispatch(
+                request,
+                caller_depth=frame.depth,
+                subtree_frames=(
+                    len(descendants) + self._reservation_frames.get(ancestor_id, 0)
+                ),
+                subtree_spend=(
+                    spend + self._reservation_spend.get(ancestor_id, 0.0)
+                ),
+                subtree_deadline=ancestor.subtree_deadline,
+                policy=self.policy,
+                registry=self.registry,
+            )
+        frames = len(request.tasks)
+        spend = frames * self.policy.rig_cost(request.rig)
+        for ancestor_id in ancestors:
+            self._reservation_frames[ancestor_id] = (
+                self._reservation_frames.get(ancestor_id, 0) + frames
+            )
+            self._reservation_spend[ancestor_id] = (
+                self._reservation_spend.get(ancestor_id, 0.0) + spend
+            )
+        self._dispatch_reservations[(frame.frame_id, call_index)] = (
+            ancestors, frames, spend
+        )
+
+    def _consume_dispatch_reservation(
+        self, frame_id: str, call_index: int, rig: str
+    ) -> None:
+        with self._admission_lock:
+            key = (frame_id, call_index)
+            reservation = self._dispatch_reservations.get(key)
+            if reservation is None:
+                return
+            ancestors, frames, spend = reservation
+            unit = self.policy.rig_cost(rig)
+            for ancestor_id in ancestors:
+                self._reservation_frames[ancestor_id] -= 1
+                self._reservation_spend[ancestor_id] -= unit
+            remaining_frames = frames - 1
+            remaining_spend = spend - unit
+            if remaining_frames <= 0:
+                self._dispatch_reservations.pop(key, None)
+            else:
+                self._dispatch_reservations[key] = (
+                    ancestors, remaining_frames, remaining_spend
+                )
+
+    def _clear_dispatch_reservation(self, frame_id: str, call_index: int) -> None:
+        with self._admission_lock:
+            reservation = self._dispatch_reservations.pop(
+                (frame_id, call_index), None
+            )
+            if reservation is None:
+                return
+            ancestors, frames, spend = reservation
+            for ancestor_id in ancestors:
+                self._reservation_frames[ancestor_id] -= frames
+                self._reservation_spend[ancestor_id] -= spend
 
     def _serial_children(
         self,
@@ -437,8 +525,6 @@ class Engine:
                     result = self._finish_child(
                         child, parent, parent_worktree, owned=owned
                     )
-                    if result.outcome == "ok":
-                        owned.update(path for commit in result.commits for path in commit.paths)
                 except Exception as exc:
                     frame_id = self._child_id(parent.frame_id, call_index, task_index)
                     result = ChildResult(
@@ -500,13 +586,19 @@ class Engine:
             self._pop_once(child, child.outcome or "failed")
             return self._child_result(child, [])
         try:
-            integrated = child.integrated
-            if integrated is None:
-                integrated = self._integrate_frame(
-                    child.frame_id,
-                    target_frame_id=parent.frame_id,
-                    owned=owned,
-                    target_worktree=parent_worktree.path,
+            with self._integration_lock:
+                integrated = child.integrated
+                if integrated is None:
+                    integrated = self._integrate_frame(
+                        child.frame_id,
+                        target_frame_id=parent.frame_id,
+                        owned=owned,
+                        target_worktree=parent_worktree.path,
+                    )
+                owned.update(
+                    path
+                    for commit in integrated.source_commits
+                    for path in commit.paths
                 )
             self._pop_once(child, "ok")
             return self._child_result(child, integrated.landed_commits)
@@ -565,6 +657,10 @@ class Engine:
             worktree=str(worktree.path),
             subtree_deadline=subtree_deadline,
         ))
+        if parent_frame_id is not None and parent_call_index is not None:
+            self._consume_dispatch_reservation(
+                parent_frame_id, parent_call_index, rig
+            )
         with self._active_lock:
             self._active[frame_id] = worktree
         capability = self.server.register_frame(frame_id)
@@ -841,7 +937,9 @@ class Engine:
         path = self._answer_path(call.frame_id, call.call_index)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path.parent, 0o700)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         descriptor = os.open(
             temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
         )
@@ -850,10 +948,17 @@ class Engine:
                 stream.write(answer)
                 stream.flush()
                 os.fsync(stream.fileno())
-        except BaseException:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as exc:
+                raise ValueError("owner question already has an answer") from exc
+        finally:
             temporary.unlink(missing_ok=True)
-            raise
-        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         with self._answer_condition:
             self._answer_condition.notify_all()
         return call.frame_id, call.call_index

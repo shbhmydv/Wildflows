@@ -141,15 +141,22 @@ class Run:
                 os.chmod(answers, 0o700)
                 safe = call.frame_id.replace("/", "-")
                 path = answers / f"{safe}-{call.call_index}.txt"
-                temporary = answers / f".{path.name}.{os.getpid()}.tmp"
+                temporary = answers / f".{path.name}.{uuid4().hex}.tmp"
                 descriptor_out = os.open(
                     temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
                 )
-                with os.fdopen(descriptor_out, "w", encoding="utf-8") as stream:
-                    stream.write(answer)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
+                try:
+                    with os.fdopen(descriptor_out, "w", encoding="utf-8") as stream:
+                        stream.write(answer)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    try:
+                        os.link(temporary, path)
+                    except FileExistsError as exc:
+                        raise ValueError("owner question already has an answer") from exc
+                finally:
+                    temporary.unlink(missing_ok=True)
+                _sync_dir(answers)
                 return True
             else:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)

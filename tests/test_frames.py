@@ -110,6 +110,16 @@ elif mode == "kill-resume":
         counter.write_text(str(count + 1))
         (cwd / "child.txt").write_text("paid once\n")
         print("paid child complete")
+elif mode in ("rail-frames", "rail-spend"):
+    if frame == "f0":
+        call(0, "dispatch", {"tasks": ["nested rail child"], "rig": "fake", "parallel": False})
+        print("rail root complete")
+    elif frame.count(".c") == 1:
+        result = call(0, "dispatch", {"tasks": ["grand 1", "grand 2"], "rig": "fake", "parallel": False})
+        (cwd / "nested-admission.json").write_text(json.dumps(result["structuredContent"]))
+        print("nested refusal observed")
+    else:
+        raise SystemExit("nested rail unexpectedly launched a grandchild")
 elif mode == "admission":
     if frame == "f0":
         result = call(0, "dispatch", {"tasks": ["denied"], "rig": "fake", "parallel": False})
@@ -132,6 +142,8 @@ def _engine(
     mode: str,
     *,
     max_depth: int = 4,
+    max_subtree_frames: int = 64,
+    max_subtree_spend: float = 64.0,
 ) -> Engine:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -147,7 +159,11 @@ def _engine(
         run_id=f"test-{mode}",
         root_rig="fake",
         root_prompt="root job",
-        policy=AdmissionPolicy(max_depth=max_depth),
+        policy=AdmissionPolicy(
+            max_depth=max_depth,
+            max_subtree_frames=max_subtree_frames,
+            max_subtree_spend=max_subtree_spend,
+        ),
         worktrees_root=tmp_path / f"worktrees-{mode}",
     )
 
@@ -187,6 +203,39 @@ def test_dispatch_admission_refusal_is_typed_and_has_no_child(
     assert returned[0].result.outcome == "refused"
 
 
+@pytest.mark.parametrize(
+    ("mode", "frame_cap", "spend_cap", "code"),
+    [
+        ("rail-frames", 2, 64.0, "subtree_frame_cap"),
+        ("rail-spend", 64, 2.0, "subtree_spend_cap"),
+    ],
+)
+def test_nested_dispatch_is_charged_to_every_ancestor_subtree(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    frame_cap: int,
+    spend_cap: float,
+    code: str,
+) -> None:
+    engine = _engine(
+        repo,
+        tmp_path,
+        monkeypatch,
+        mode,
+        max_subtree_frames=frame_cap,
+        max_subtree_spend=spend_cap,
+    )
+    assert engine.run().outcome == "ok"
+    payload = json.loads(
+        (repo / "nested-admission.json").read_text(encoding="utf-8")
+    )
+    assert payload["outcome"] == "refused"
+    assert payload["error_code"] == code
+    assert len(engine.projection.frames) == 2
+
+
 def test_duplicate_live_call_is_single_flight_and_memoized(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -214,6 +263,8 @@ def test_ask_parks_until_owner_answer(
     assert isinstance(pending, AskRequest)
     assert pending.question == "ship it?"
     engine.answer("yes")
+    with pytest.raises(ValueError):
+        engine.answer("no")
     thread.join(timeout=10)
     assert not thread.is_alive()
     assert (repo / "answer.txt").read_text(encoding="utf-8") == "yes"
