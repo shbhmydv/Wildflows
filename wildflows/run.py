@@ -30,6 +30,7 @@ def _sync_dir(path: Path) -> None:
         os.close(descriptor)
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _sync_dir(path.parent.parent)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     with open(temporary, "wb") as stream:
         stream.write(data); stream.flush(); os.fsync(stream.fileno())
@@ -54,10 +55,12 @@ class Run:
         ).stdout.strip()
         self.workdir = Path(root).resolve()
         self.run_id = run_id or uuid4().hex
-        if not self.run_id or Path(self.run_id).name != self.run_id:
+        if not self.run_id or self.run_id in (".", "..") or Path(self.run_id).name != self.run_id:
             raise ValueError("run_id must be one path component")
-        self.run_dir = self.workdir / ".wildflows" / "runs" / self.run_id
-        if not self.run_dir.resolve(strict=False).is_relative_to(self.workdir):
+        runs_dir = self.workdir / ".wildflows" / "runs"
+        self.run_dir = runs_dir / self.run_id
+        if (not runs_dir.resolve(strict=False).is_relative_to(self.workdir)
+                or not self.run_dir.resolve(strict=False).is_relative_to(runs_dir.resolve(strict=False))):
             raise ValueError("target-local run_dir escapes through a symlink")
         self.registry = registry
         self.planner_rig = planner_rig

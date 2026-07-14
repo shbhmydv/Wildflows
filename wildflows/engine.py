@@ -950,11 +950,12 @@ class Engine:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        for synced in (directory, directory.parent, self.run_dir):
+            descriptor = os.open(synced, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         return path.relative_to(self.run_dir).as_posix()
     def _record_failed_result(self, key: NodeKey, base: str, result: Result) -> NoReturn:
         self.repo.ensure_tip(base)

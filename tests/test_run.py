@@ -65,6 +65,24 @@ def make_run(
     )
 
 
+def test_run_dir_rejects_dotdot_and_symlink_escape(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    planner = CannedPlanner([])
+    registry = RigRegistry({"planner": planner})
+    with pytest.raises(ValueError, match="path component"):
+        Run(
+            workdir=repo, job_spec="x", registry=registry,
+            planner_rig="planner", run_id="..",
+        )
+    (repo / ".wildflows").symlink_to(tmp_path / "outside", target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes"):
+        Run(
+            workdir=repo, job_spec="x", registry=registry,
+            planner_rig="planner", run_id="safe",
+        )
+
+
 def test_scripted_planner_runs_two_epochs_then_ends(tmp_path: Path) -> None:
     planner = CannedPlanner([
         decision({
