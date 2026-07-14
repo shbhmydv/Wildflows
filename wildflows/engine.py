@@ -87,6 +87,7 @@ class Engine:
         self._active: dict[str, FrameWorktree] = {}
         self._active_lock = threading.RLock()
         self._integration_lock = threading.RLock()
+        self._workspace_lock = threading.RLock()
         self._admission_lock = threading.RLock()
         self._reservation_frames: dict[str, int] = {}
         self._reservation_spend: dict[str, float] = {}
@@ -155,6 +156,7 @@ class Engine:
                 started_at=started,
                 policy=self.policy,
             ))
+        self._restore_dispatch_reservations()
         self.server = MCPServer(self)
 
     @property
@@ -398,6 +400,38 @@ class Engine:
             )
         return ancestors
 
+    def _restore_dispatch_reservations(self) -> None:
+        """Rebuild unconsumed admission reservations from durable pending calls."""
+        for call in self.journal.projection.calls.values():
+            if call.completed or call.tool != "dispatch":
+                continue
+            request = call.request
+            if not isinstance(request, DispatchRequest):
+                raise RuntimeError("dispatch call projection has the wrong request type")
+            launched = {
+                child.task_index
+                for child in self.journal.projection.frames.values()
+                if child.parent_frame_id == call.frame_id
+                and child.parent_call_index == call.call_index
+                and child.task_index is not None
+            }
+            remaining = len(request.tasks) - len(launched)
+            if remaining <= 0:
+                continue
+            frame = self.journal.projection.frame(call.frame_id)
+            ancestors = self._ancestor_ids(frame)
+            spend = remaining * self.policy.rig_cost(request.rig)
+            for ancestor_id in ancestors:
+                self._reservation_frames[ancestor_id] = (
+                    self._reservation_frames.get(ancestor_id, 0) + remaining
+                )
+                self._reservation_spend[ancestor_id] = (
+                    self._reservation_spend.get(ancestor_id, 0.0) + spend
+                )
+            self._dispatch_reservations[(call.frame_id, call.call_index)] = (
+                ancestors, remaining, spend
+            )
+
     def _admit_and_reserve(
         self,
         frame: FrameProjection,
@@ -487,6 +521,23 @@ class Engine:
             ))
         return results
 
+    def _parallel_owned_paths(
+        self, parent_frame_id: str, call_index: int
+    ) -> set[str]:
+        owned: set[str] = set()
+        for child in self.journal.projection.frames.values():
+            if (
+                child.parent_frame_id != parent_frame_id
+                or child.parent_call_index != call_index
+            ):
+                continue
+            claim = child.integrated or child.integrating
+            if claim is not None:
+                owned.update(
+                    path for commit in claim.source_commits for path in commit.paths
+                )
+        return owned
+
     def _parallel_children(
         self,
         parent: FrameProjection,
@@ -496,15 +547,8 @@ class Engine:
     ) -> list[ChildResult]:
         base = self.repository.branch_tip(parent.branch)
         by_index: dict[int, ChildResult] = {}
-        owned: set[str] = {
-            path
-            for child in self.journal.projection.frames.values()
-            if child.parent_frame_id == parent.frame_id
-            and child.parent_call_index == call_index
-            and child.integrated is not None
-            for commit in child.integrated.source_commits
-            for path in commit.paths
-        }
+        owned = self._parallel_owned_paths(parent.frame_id, call_index)
+        start_barrier = threading.Barrier(len(request.tasks))
         with ThreadPoolExecutor(max_workers=len(request.tasks)) as executor:
             futures: dict[Future[FrameProjection], int] = {}
             for task_index, task in enumerate(request.tasks):
@@ -516,6 +560,7 @@ class Engine:
                     task,
                     request.rig,
                     base_commit=base,
+                    start_barrier=start_barrier,
                 )
                 futures[future] = task_index
             for future in as_completed(futures):
@@ -544,6 +589,7 @@ class Engine:
         rig: str,
         *,
         base_commit: str,
+        start_barrier: threading.Barrier | None = None,
     ) -> FrameProjection:
         frame_id = self._child_id(parent.frame_id, call_index, task_index)
         existing = self.journal.projection.frames.get(frame_id)
@@ -568,6 +614,7 @@ class Engine:
             prompt=task,
             base_commit=existing.base_commit if existing is not None else base_commit,
             subtree_deadline=parent.subtree_deadline,
+            start_barrier=start_barrier,
         )
 
     @staticmethod
@@ -634,13 +681,15 @@ class Engine:
         prompt: str,
         base_commit: str,
         subtree_deadline: float,
+        start_barrier: threading.Barrier | None = None,
     ) -> FrameProjection:
         existing = self.journal.projection.frames.get(frame_id)
         branch = existing.branch if existing is not None else self.repository.frame_branch(frame_id)
         resume = existing is not None or self.repository.ref_exists(branch)
-        worktree = self.repository.create_frame_worktree(
-            frame_id, branch, base_commit, resume=resume
-        )
+        with self._workspace_lock:
+            worktree = self.repository.create_frame_worktree(
+                frame_id, branch, base_commit, resume=resume
+            )
         attempt = 0 if existing is None else existing.push_count
         self.journal.append(FramePushed(
             run_id=self.run_id,
@@ -657,7 +706,11 @@ class Engine:
             worktree=str(worktree.path),
             subtree_deadline=subtree_deadline,
         ))
-        if parent_frame_id is not None and parent_call_index is not None:
+        if (
+            existing is None
+            and parent_frame_id is not None
+            and parent_call_index is not None
+        ):
             self._consume_dispatch_reservation(
                 parent_frame_id, parent_call_index, rig
             )
@@ -665,6 +718,8 @@ class Engine:
             self._active[frame_id] = worktree
         capability = self.server.register_frame(frame_id)
         try:
+            if start_barrier is not None:
+                start_barrier.wait(timeout=30)
             runtime_dir = self.run_dir / "runtime" / frame_id / f"attempt-{attempt}"
             runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(runtime_dir, 0o700)
@@ -742,7 +797,8 @@ class Engine:
             self.server.revoke_frame(capability)
             with self._active_lock:
                 self._active.pop(frame_id, None)
-            self.repository.remove_worktree(worktree)
+            with self._workspace_lock:
+                self.repository.remove_worktree(worktree)
 
     def _frame_prompt(self, frame_id: str, original: str) -> str:
         digest = self.journal.projection.resume_digest(frame_id)

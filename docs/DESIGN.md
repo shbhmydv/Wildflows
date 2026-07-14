@@ -1580,8 +1580,9 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      `frame_integrating` records `(target, base, candidate, source, landed)`
      before the ref move. Resume accepts only target-at-base or
      target-at-candidate and then appends `frame_integrated`; a third tip is
-     divergence. Serial children fast-forward. Parallel siblings start at one
-     caller tip, intersect exact source path ownership, and cherry-pick a
+     divergence. A pending integration intent already reserves its source path
+     ownership during parallel replay. Serial children fast-forward. Parallel
+     siblings start at one caller tip, intersect exact source path ownership, and cherry-pick a
      disjoint later source through a throwaway external integrator worktree;
      only landed SHAs enter the parent history.
 
@@ -1632,7 +1633,9 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      cannot pass a pending earlier call. Dispatch admission atomically reserves
      frame/spend units against the caller AND every ancestor subtree. Each
      `frame_pushed` consumes one reservation into the durable descendant fold;
-     unlaunched residue is released. Parallel source-path ownership is derived
+     unlaunched residue is released. Resume reconstructs the still-unlaunched
+     reservation of every durable pending dispatch before a child can call.
+     Parallel source-path ownership is derived
      from durable sibling integrations on replay and updated under the same
      serialized integration lock as overlap checking.
 
