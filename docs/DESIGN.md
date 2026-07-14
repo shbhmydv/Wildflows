@@ -147,9 +147,9 @@ resume = "replay the log against the tree." A rails block will ride alongside th
 expression, not inside it (§4, deferred).
 
 One expression tree = one **epoch** = one planner re-entry point + one durability
-point (§3). The tree is validated by Pydantic on admission; `do`, `inplace`, `seq`, `dispatch`, and
-`loop` (with a `cmd` predicate) are *executable* in the PoC, but all eight kinds are
-*representable* so the journal vocabulary and the model are proven complete from day one.
+point (§3). The tree is validated by Pydantic on admission; `do`, `inplace`, `ask`,
+`setup`, `seq`, `dispatch`, and `loop` (with a `cmd` predicate) are executable. `combine`
+remains representable but is not yet admitted.
 
 ### Code homes (hand-6 authority split, from the bloat audit)
 
@@ -164,6 +164,8 @@ scheduler / worktree / planner / dashboard steps each depend on one narrow seam:
 | `workspace.py` | plain Git authority: fresh worktrees, receipts, containment, fast-forward CAS, best-effort removal |
 | `result.py` | the `Result` / `Outcome` artifact value + `CommitReceipt` / `IntegrationReceipt` effect record |
 | `journal.py` | the single append owner: seq-assign + fsync + `projection.apply` |
+| `planner.py` | hard planner-decision/rails models and typed parked states |
+| `run.py` | planner prompt/digest, decision durability, rails, and epoch run loop |
 
 There is exactly ONE state system: the journal's live `RunProjection`, folded by one
 `apply(event)`. Load replays the ndjson through the same `apply`, so a running
@@ -181,7 +183,7 @@ rejection it raises **`AdmissionError`** (a `ValueError` subclass) and NO journa
 is written — a representable-but-unrunnable shape never opens an incomplete epoch, so
 `NotImplementedError` after a durable boundary is gone. Admission rejects:
 
-- **executor capability** — `combine` / `ask` / `setup`, and `loop` with a `flag`
+- **executor capability** — `combine`, non-root `setup.cwd`, and `loop` with a `flag`
   predicate (representable, not yet executable);
 - **unknown rig names** — every rig-bearing node's `rig.name` must resolve in the registry;
 - **ctx node refs** — a `CtxRef(kind="node")` must name a node in the epoch tree;
@@ -213,9 +215,9 @@ types (in `wildflows/events.py`), each a Pydantic model sharing a header
 
 | event        | emitted when                              | key fields |
 |--------------|-------------------------------------------|------------|
-| `boundary`   | an epoch opens / closes                   | `phase`, `expr`; opened pins `run_branch`, `base_commit` |
+| `boundary`   | an epoch opens / closes                   | `phase`, `expr`; opened pins `run_branch`, `base_commit`, typed `rails`, `rationale` |
 | `dispatched` | a `do`/`combine`/`inplace`/`setup` starts | `rig`, `task`/`cmd`, unique `workdir`, `pre_head` |
-| `result`     | an agent/primitive produced output        | `outcome`, `text`, `files`, `post_head`, `receipt_required`, `loop_status?` |
+| `result`     | an agent/primitive produced output        | `outcome`, `text`, `files`, `artifact`, `post_head`, `receipt_required`, `loop_status?` |
 | `integrated` | the core applied+committed a result       | `commits` (every attributed commit + its paths; `commit`/`paths` derived) |
 | `judged`     | a `do`-as-judge produced a verdict         | `verdict`, `ok`, `target_node` |
 | `loop_iter`  | a `loop` completed one iteration          | `iteration`, `commit`, `converged` (body outcome by reference, no payload) |
@@ -277,29 +279,23 @@ or gates — those are the mind's choices, not invariants.
 
 ---
 
-## 4. Rails (SETTLED invariant 3) — DEFERRED to ladder step 4
+## 4. Rails (SETTLED invariant 3)
 
-The planner will declare rails **up front** with each epoch and the **core will
-enforce** them — a confidently-wrong mind needs a wall. The intended shape:
+`PlannerDecision.rails` is a strict block riding each admitted opened boundary:
 
 ```
-Rails: budget_usd: float | None      # cumulative rig spend cap
-       deadline_s:  float | None      # wall-clock from epoch open
-       iter_cap:    int  | None       # loop iteration ceiling (per loop node)
+Rails: deadline_s: float | None       # run wall-clock from durable creation
+       max_epochs: int | None         # number of executable expression epochs
+       budget_notes: str | None       # prompt context only; no token accounting yet
 ```
 
-**Rails are NOT admitted, recorded, or enforced yet.** Rails admission (a validated
-block riding the `boundary(opened)` event) and enforcement land **together at ladder
-step 4** (worktree hygiene), so the executor never records a rail it cannot enforce
-nor enforces one it never admitted. The speculative `Boundary.rails: dict|None`
-placeholder field was DELETED in hand-6 (an un-admitted, un-enforced raw dict is the
-opposite of §4's rule); the typed rails block is added when admission + enforcement land
-together. Until then, **the only live rail is the executable `loop`'s `cap`** — a `loop` cannot exceed `node.cap` (core-enforced; cap-exhaustion is
-an `ok=False` result, never a crash). Budget, deadline, and `iter_cap` refusal
-semantics do not exist in the current engine. When they land, the chosen semantics are
-*refuse-to-start* (a node that would breach a rail is refused and the epoch closes with
-`boundary(closed, reason=...)`); an in-flight deadline kill is a step-4 concern. **(SF4,
-hand-4: rails deferral confirmed on owner review — do not read §4 as currently enforced.)**
+The planner declares deadline/max epochs on its first expression and may update them on
+later re-entries. A deadline may only move downward. `Run` checks both rails before a
+planner re-entry and expression open; `Engine` also checks deadline before each node, so
+the policy is refuse-to-start rather than an in-flight kill. A hit raises typed
+`RailStop`. An open epoch remains open with its exact durable expression, making restart
+repeat the same stop without replanning or dishonestly closing unfinished work. Loop
+`cap` remains the existing per-loop core rail. Token/cost accounting is deferred.
 
 ---
 
@@ -366,8 +362,10 @@ appends results, moves the ref, and appends integration facts.
 
 ## 7. Per-node worktrees and run-branch integration (invariant 1)
 
-A run owns one existing Git branch. `run_dir` is outside the repository worktree and
-contains `events.ndjson`, result artifacts, and a run-scoped `worktrees/` directory.
+A run owns one existing Git branch. `Run` places `run_dir` at target-local
+`.wildflows/runs/<run-id>/`; direct `Engine` callers may still choose another path. It
+contains `events.ndjson`, verbatim planner decisions, result artifacts, and a run-scoped
+`worktrees/` directory.
 For every `do` and `inplace`, the core:
 
 1. verifies the run branch at the newest journalled tip;
@@ -513,9 +511,10 @@ panel macro's first live exercise):
 Historical build order (D7/D8, bottom-up): (1) expression PoC; (2) durability;
 (3) composition + rails; (4) worktree hygiene; (5) target-local `.wildflows/`; (6)
 dashboard. **Current status:** the engine has fsynced journal replay, per-node and
-predicate worktrees, exact receipt/run-tip verification, and executable
-`do`/`inplace`/`seq`/bounded-`dispatch`/command-`loop`. `combine`, general rails,
-target-local run state, and the dashboard remain later steps.
+predicate worktrees, exact receipt/run-tip verification, executable
+`do`/`inplace`/`ask`/`setup`/`seq`/bounded-`dispatch`/command-`loop`, and a
+planner-rig run loop with deadline/max-epoch rails and target-local run state. `combine`,
+a real model planner rig, and the dashboard remain later steps.
 
 ---
 
@@ -1403,3 +1402,34 @@ than patching each row. Both are the transaction model of record — not a later
     classifier remains live because checked-out integration remains supported. This hand
     spends its line budget only on sibling execution/combine/resume and the small advisory
     coordination boundary; CAS-only integration remains a separable future raze.
+
+### Hand-23 calls — planner integration and run loop
+
+90. **Planner output durability and admission.** A strict `PlannerDecision` carries an
+    expression (or an ending summary), typed deadline/max-epoch rails, rationale, and end
+    flag. Raw rig stdout is atomically retained verbatim before parsing. Expression parsing
+    plus the existing admission pass remain the hard no-effect boundary; rejection is a
+    retryable typed `PlannerFailure`. Opened boundaries add validated rails/rationale.
+
+91. **Open epoch outranks planner invocation.** `Run` first replays the journal. If an
+    epoch is open, it executes that boundary's exact expression and never invokes the
+    planner for it. Only a closed epoch permits the next prompt. This is the crash rule for
+    planner-output-through-mid-epoch death and keeps the epoch boundary both re-entry and
+    durability point.
+
+92. **Ask and setup use the existing vocabulary.** Ask appends `asked`, leaves the epoch
+    open, and raises `AwaitingOwner`; `answered` projects directly into the Ask node's
+    result with no duplicate `result` event. Setup appends host-marked `dispatched` plus a
+    bounded-tail `result`, runs through the existing supervised shell path at repository
+    root, and never uses a node worktree. A failed setup remains an ordinary retryable
+    failed node.
+
+93. **Bounded planner digest and artifact reference.** The next prompt contains latest
+    effective per-node results from only the immediately preceding epoch. Text, paths, and
+    node count are deterministically capped with explicit original counts/truncation
+    markers. Ordinary result events add a run-relative path to their already-fsynced full
+    JSON artifact; fallback-invalidated raw history is excluded.
+
+94. **Macros remain data.** Builtin and run-adjacent JSON macros expose only name,
+    description, and source path to the prompt. Placeholder substitution/expansion is not
+    core behavior: the planner reads a fitting template and emits normal expression JSON.

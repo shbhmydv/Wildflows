@@ -32,8 +32,8 @@ Multi-CLI orchestrators exist. wildflows is built for **survivability**:
   branch; failed/interrupted worktrees are abandoned, so there is nothing to undo.
 - **One journal, one event vocabulary** — resume = replay the event log against
   the expression tree. No per-shape resume code.
-- **Core-enforced rails direction** — loop caps are live now; budget and deadline
-  rails land with the later composition/worktree steps.
+- **Core-enforced rails** — planner-declared run deadlines, maximum epochs, and
+  expression loop caps stop work at deterministic start boundaries.
 - **Multi-harness rigs** — `claude -p`, `pi`, local Qwen, `codex` all plug in
   behind one prompt-in / files-out seam.
 
@@ -44,10 +44,12 @@ macro is not part of the core yet.
 ## Status
 
 Current core: fsynced journal/replay, per-node worktree execution, exact
-receipt/run-branch verification, executable `do`, `inplace`, `seq`, bounded `dispatch`,
-and command `loop`, plus `EchoRig`, `ShellRig`, and `ScriptRig`. General rails,
-planner macros, and the dashboard remain on the build ladder. See
-[`docs/DESIGN.md`](docs/DESIGN.md).
+receipt/run-branch verification, executable `do`, `inplace`, `ask`, `setup`, `seq`,
+bounded `dispatch`, and command `loop`. A registered rig now drives the durable
+planner/run loop; deadline/max-epoch rails and planner-nudge macro listings are live.
+`combine`, a real picodex planner script, and the dashboard remain on the build ladder.
+See [`docs/DESIGN.md`](docs/DESIGN.md) and
+[`docs/PLANNER-RIG.md`](docs/PLANNER-RIG.md).
 
 ## Develop
 
@@ -57,8 +59,9 @@ pytest
 mypy
 ```
 
-Run state (journal, artifacts, and disposable worktrees) must live outside the target
-repository worktree. Target-local `.wildflows/` state remains a later authority step.
+`Run` stores state at `.wildflows/runs/<run-id>/` in the target repository: the
+journal, verbatim planner decisions, bounded-result artifacts, and disposable worktrees.
+Add `.wildflows/runs/` to the target project's ignore rules when needed.
 
 ## Topics
 
