@@ -39,9 +39,10 @@ One agent, one task, in a fresh worktree.
 
 ### `dispatch(tasks)`
 Parallel `do()`s — **unordered by contract**. One worktree per child; children are
-disjoint by construction and may run concurrently (real parallelism is ladder step 3;
-the PoC executes them serially, but that order is an implementation detail, never a
-contract). When execution order matters, wrap the steps in `seq`, not `dispatch`.
+disjoint by construction and run through a bounded executor. Every sibling in one
+concurrent leaf group starts from the same run-tip snapshot; completion and integration
+order are implementation details, never a contract. When execution order matters, wrap
+the steps in `seq`, not `dispatch`.
 - **Inputs:** a list of `do` (or any) sub-expressions.
 - **Output:** a list of results, positionally aligned with the inputs.
 - **Failure modes:** per-child, as `do`. A child BACKOFF does not fail its siblings;
@@ -307,8 +308,10 @@ hand-4: rails deferral confirmed on owner review — do not read §4 as currentl
 Resume is replay plus cheap Git verification. An opened epoch keeps its admitted tree;
 a closed epoch is a no-op. Every opened boundary pins the run ref and its base commit.
 The engine verifies each active `integrated` receipt with plain Git subprocesses: every
-SHA exists, `pre_head..commit` is the exact linear range, each changed-path claim
-matches Git, and the live run-branch tip is exactly the newest verified claim. A live
+SHA exists, its recorded integration base through `commit` is the exact linear range,
+each changed-path claim matches Git, and the live run-branch tip is exactly the newest
+verified claim. The integration base defaults to `dispatched.pre_head` for serial and
+legacy events; a rewritten sibling records the moving tip explicitly. A live
 descendant or any other unknown tip is operator activity and raises
 `BranchDivergedError`; the engine never resets an operator-owned run branch.
 
@@ -316,8 +319,11 @@ Leaf rules are deliberately small:
 
 - A durable successful effectless `result` is done.
 - A successful effectful `result` is done only after its later `integrated` receipt.
-- `dispatched` without `result` is an interrupted attempt: append a fallback boundary
-  that invalidates the attempt tail and rerun in a new, uniquely named worktree.
+- `dispatched` without `result` is an interrupted attempt. A serial attempt appends the
+  existing tail-invalidating fallback. An interleaved sibling whose shared base is an
+  earlier verified tip gets a serialized failed result instead, preserving siblings
+  already integrated later in the stream; only that non-integrated node reruns from the
+  current tip in a new uniquely named worktree.
 - In the `result`→branch-fast-forward→`integrated` crash window, branch at `post_head`
   reconstructs and journals the receipt; branch still at `pre_head` journals a fallback
   and reruns; any third tip is refused.
@@ -352,8 +358,9 @@ repair a torn one, and load fsyncs the accepted file and directory before return
 Pre-worktree complete journals remain parseable through the existing `Result.outcome`
 and single-commit `Integrated` compatibility readers, but an open old epoch has no
 run-ref/base claim and is not executable by this engine. The old lease, intent,
-recovery, settlement, process, and capture files are not read. Parallel dispatch still
-requires one central append owner; execution is serial today.
+recovery, settlement, process, and capture files are not read. Parallel dispatch has one
+central append owner: worker threads return candidates only; the coordinator alone
+appends results, moves the ref, and appends integration facts.
 
 ---
 
@@ -373,10 +380,15 @@ For every `do` and `inplace`, the core:
 
 The fast-forward is `git merge --ff-only` when the supplied target worktree has the run
 branch checked out (keeping its files/index current), otherwise a compare-and-swap
-`git update-ref <ref> <candidate> <base>`. Cherry-pick is deliberately absent: it would
-rewrite receipt SHAs and introduce conflict/sequencer recovery. Serial `dispatch` means
-each child starts from the preceding child's landed tip; true parallel dispatch needs a
-later explicit sibling merge/disjoint-ownership protocol.
+`git update-ref <ref> <candidate> <base>`. A serial node lands its original candidate.
+For a concurrent sibling built on the group's older shared base, the sole integrator
+cherry-picks its verified linear commit chain in a fresh disposable worktree at the
+moving run tip, validates that the rewritten per-commit path lists are unchanged, then
+fast-forwards that rewritten candidate. Conflict/sequencer state is discarded with the
+throwaway tree; only the landing SHAs enter `integrated`. Before reapply, the source
+receipt paths must be disjoint from every sibling already landed in this group. Exact
+path overlap fails the later lander without moving the ref; a retry is a fresh attempt
+from the new tip and is no longer part of the old concurrent ownership group.
 
 A failed rig, core commit, declared-path check, or fast-forward never changes the run
 branch. Its worktree is discarded. A crash may leave a registered worktree or escaped
@@ -500,10 +512,10 @@ panel macro's first live exercise):
 
 Historical build order (D7/D8, bottom-up): (1) expression PoC; (2) durability;
 (3) composition + rails; (4) worktree hygiene; (5) target-local `.wildflows/`; (6)
-dashboard. **Current status:** the serial engine has fsynced journal replay, per-node
-and predicate worktrees, exact receipt/run-tip verification, and executable
-`do`/`inplace`/`seq`/serial-`dispatch`/command-`loop`. `combine`, general rails, real
-parallel dispatch, target-local run state, and the dashboard remain later steps.
+dashboard. **Current status:** the engine has fsynced journal replay, per-node and
+predicate worktrees, exact receipt/run-tip verification, and executable
+`do`/`inplace`/`seq`/bounded-`dispatch`/command-`loop`. `combine`, general rails,
+target-local run state, and the dashboard remain later steps.
 
 ---
 
@@ -1346,3 +1358,47 @@ than patching each row. Both are the transaction model of record — not a later
     starts new Git work after the liveness scan, nor close hand-20's worktree-ownership
     scan-to-ref-move TOCTOU; M1's operator model remains activity between runs, and M2 still
     needs explicit coordination before concurrent integration or operator-facing worktrees.
+
+### Hand-22 calls — bounded sibling concurrency
+
+86. **One coordinator, bounded workers.** `Engine.max_workers` defaults to one, preserving
+    the M1 traversal exactly. At values above one, a `Dispatch` leaf group is opened at one
+    verified run tip: the coordinator creates and journals every fresh detached attempt at
+    that same tip, worker threads run rigs and build candidate receipts only, and the
+    coordinator consumes completions. No worker appends the journal or moves the run ref.
+    Results stay keyed by input position (`ExecutionOutcome.children`); a loop always emits
+    the explicit `body_result_seq`, so completion order cannot select its body artifact.
+    Recursive `seq` and `loop` traversal still gates downstream groups on integrated
+    upstream work; nested Dispatch groups parallelize whenever that leaf frontier is
+    reached. Composite siblings not themselves representing one worktree continue through
+    the same serial recursive traversal rather than introducing a second execution engine.
+
+87. **Disjoint reapply combine.** Siblings in one group own the exact union of paths in
+    their source receipts. The first completion with a successful effect lands normally.
+    Before every later landing, the coordinator re-verifies its source receipt and rejects
+    any intersection with paths already landed by that group. It then cherry-picks the
+    source's linear commits, one by one with empty commits retained, into a fresh detached
+    throwaway worktree at the moving tip. The throwaway is discarded on conflict; no
+    sequencer recovery exists. The resulting commit count/per-commit paths must equal the
+    source receipt, and only those rewritten SHAs are fast-forwarded and journalled. The
+    result records `integration_base`, additive and legacy-defaulting to `pre_head`, so
+    replay verifies the actual landing range rather than the shared source range.
+
+88. **Interleaved resume and ownership boundary.** The append stream remains serialized.
+    A crash can therefore leave at most one successful result awaiting its ref move; its
+    fallback starts at that result when it used a moving integration base, retaining prior
+    sibling integrations and dispatch facts. Dispatched-only siblings based on an earlier
+    verified group tip receive a failed interruption result on resume instead of a global
+    tail rewind, then rerun individually from the current verified tip. An advisory
+    common-Git-dir `flock`, keyed by run ref and held across constructor reconciliation or
+    an epoch execution, serializes cooperating Wildflows owners; raw Git mutation during an
+    active run remains outside the operator-between-runs contract and CAS/ownership checks
+    still fail closed where observable.
+
+89. **Checked-out merge trim deferred.** The owner-endorsed CAS-only simplification was
+    considered and not taken in M2. Refusing a checked-out run branch would change the M1
+    public/default path and force broad fixture migration; a final root sync would recreate
+    the index/filter crash boundary it aimed to delete. The already-tested hand-21 restore
+    classifier remains live because checked-out integration remains supported. This hand
+    spends its line budget only on sibling execution/combine/resume and the small advisory
+    coordination boundary; CAS-only integration remains a separable future raze.

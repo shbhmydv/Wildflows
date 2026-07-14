@@ -25,6 +25,7 @@ class OrderedRig:
         self.overlap = overlap
         self.active = 0
         self.max_active = 0
+        self.calls = 0
         self.lock = threading.Lock()
 
     def run(self, prompt: str, workdir: Path) -> Result:
@@ -32,7 +33,10 @@ class OrderedRig:
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
-        self.barrier.wait(timeout=5)
+            self.calls += 1
+            call = self.calls
+        if call <= self.barrier.parties:
+            self.barrier.wait(timeout=5)
         time.sleep((2 - index) * 0.04)
         path = "shared" if self.overlap else f"file-{index}"
         (workdir / path).write_text(f"value-{index}", encoding="utf-8")
@@ -93,6 +97,10 @@ def test_overlapping_later_lander_is_a_typed_failed_attempt(tmp_path: Path) -> N
     assert state.results[(0, "n0.1")].ok
     assert state.results[(0, "n0.0")].outcome == "failed"
     assert not state.epoch_closed(0)
+
+    engine.run_epoch(tree, 0)
+    assert git(repo, "show", "HEAD:shared") == "value-1"
+    assert engine.journal.projection.epoch_closed(0)
 
 
 def test_loop_uses_positional_dispatch_result_not_last_completion(
@@ -198,9 +206,13 @@ def test_sigkill_mid_group_resume_reruns_only_unintegrated_siblings(
                     json.loads(line)
                     for line in (run_dir / "events.ndjson").read_text(encoding="utf-8").splitlines()
                 ]
-                if any(
-                    record["kind"] == "integrated" and record["node_id"] == "n0.0"
-                    for record in records
+                invoked = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+                if (
+                    {"fast", "slow-a", "slow-b"}.issubset(invoked)
+                    and any(
+                        record["kind"] == "integrated" and record["node_id"] == "n0.0"
+                        for record in records
+                    )
                 ):
                     break
             exited, _ = os.waitpid(pid, os.WNOHANG)

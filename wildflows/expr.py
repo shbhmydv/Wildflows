@@ -106,9 +106,9 @@ class Do(BaseModel):
 class Dispatch(BaseModel):
     """Parallel `do()`s — children are unordered and disjoint by construction.
 
-    Dispatch declares *no* ordering: siblings may run concurrently (real parallelism
-    is ladder step 3; the PoC executes them serially but the semantics are
-    unordered-parallel). For strictly ordered execution use `Seq`.
+    Dispatch declares *no* ordering: executable leaf siblings run through the bounded
+    scheduler and the semantics are unordered-parallel. For strictly ordered execution
+    use `Seq`.
     """
 
     kind: Literal["dispatch"] = "dispatch"

@@ -39,14 +39,14 @@ Multi-CLI orchestrators exist. wildflows is built for **survivability**:
 
 The design's eventual default macro is a **BUILD** run followed by a spec-unbound
 **AUDIT** run (an expert panel judges the artifact, not the tasks); that planner
-macro is not part of the serial PoC yet.
+macro is not part of the core yet.
 
 ## Status
 
-Serial proof-of-concept: fsynced journal/replay, per-node worktree execution, exact
-receipt/run-branch verification, executable `do`, `inplace`, `seq`, serial `dispatch`,
-and command `loop`, plus `EchoRig`, `ShellRig`, and `ScriptRig`. Parallel dispatch,
-general rails, planner macros, and the dashboard remain on the build ladder. See
+Current core: fsynced journal/replay, per-node worktree execution, exact
+receipt/run-branch verification, executable `do`, `inplace`, `seq`, bounded `dispatch`,
+and command `loop`, plus `EchoRig`, `ShellRig`, and `ScriptRig`. General rails,
+planner macros, and the dashboard remain on the build ladder. See
 [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Develop
