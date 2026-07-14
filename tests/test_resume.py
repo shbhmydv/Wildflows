@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -12,6 +15,7 @@ from tests.test_engine import git, init_repo, registry
 from wildflows.engine import (
     BranchDivergedError,
     Engine,
+    NodeExecutionError,
     ResumeVerificationError,
 )
 from wildflows.events import Boundary, Event, Integrated
@@ -150,6 +154,94 @@ def test_operator_commit_on_run_branch_is_refused(tmp_path: Path) -> None:
     (eng.workdir / "operator").write_text("mine", encoding="utf-8")
     git(eng.workdir, "add", "operator")
     git(eng.workdir, "commit", "-qm", "operator activity")
+
+    with pytest.raises(BranchDivergedError, match="operator commits"):
+        Engine(eng.run_dir, eng.workdir, registry(count=rig))
+
+
+def test_exact_verified_prefix_rewind_falls_back_and_reruns_tail(
+    tmp_path: Path,
+) -> None:
+    rig = CountingRig()
+    eng, tree = setup(tmp_path, rig)
+    base = git(eng.workdir, "rev-parse", "HEAD")
+    eng.run_epoch(tree, 0)
+
+    git(eng.workdir, "reset", "--hard", base)
+    resumed = Engine(eng.run_dir, eng.workdir, registry(count=rig))
+    resumed.run_epoch(tree, 0)
+
+    assert rig.calls == 2
+    assert git(eng.workdir, "show", "HEAD:effect") == "2"
+    assert any(
+        event.kind == "boundary"
+        and (event.reason or "").startswith("resume fallback: exact verified prefix")
+        for event in resumed.journal.events()
+    )
+
+
+def test_missing_current_claimed_commit_falls_back_to_last_verified_tip(
+    tmp_path: Path,
+) -> None:
+    rig = CountingRig()
+    eng, tree = setup(tmp_path, rig)
+    base = git(eng.workdir, "rev-parse", "HEAD")
+    eng.run_epoch(tree, 0)
+    missing = git(eng.workdir, "rev-parse", "HEAD")
+    (eng.workdir / ".git" / "objects" / missing[:2] / missing[2:]).unlink()
+
+    resumed = Engine(eng.run_dir, eng.workdir, registry(count=rig))
+    resumed.run_epoch(tree, 0)
+
+    assert rig.calls == 2
+    assert git(eng.workdir, "merge-base", "--is-ancestor", base, "HEAD") == ""
+    assert git(eng.workdir, "show", "HEAD:effect") == "2"
+    assert any(
+        event.kind == "boundary"
+        and "missing current claimed commit" in (event.reason or "")
+        for event in resumed.journal.events()
+    )
+
+
+def test_exact_verified_prefix_rewind_reruns_only_two_node_suffix(
+    tmp_path: Path,
+) -> None:
+    rig = CountingRig()
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    run_dir = tmp_path / "run"
+    tree = Seq(children=[
+        Do(task="first", rig=RigRef(name="count")),
+        Do(task="second", rig=RigRef(name="count")),
+    ])
+    eng = Engine(run_dir, repo, registry(count=rig))
+    eng.run_epoch(tree, 0)
+    first_tip = next(
+        event.commit
+        for event in eng.journal.events()
+        if event.kind == "integrated" and event.node_id == "n0.0"
+    )
+
+    git(repo, "reset", "--hard", first_tip)
+    resumed = Engine(run_dir, repo, registry(count=rig))
+    resumed.run_epoch(tree, 0)
+
+    assert rig.calls == 3
+    assert resumed.journal.projection.results[(0, "n0.0")].text == "call 1"
+    assert resumed.journal.projection.results[(0, "n0.1")].text == "call 3"
+
+
+def test_unknown_tip_after_verified_prefix_still_raises_typed_refusal(
+    tmp_path: Path,
+) -> None:
+    rig = CountingRig()
+    eng, tree = setup(tmp_path, rig)
+    base = git(eng.workdir, "rev-parse", "HEAD")
+    eng.run_epoch(tree, 0)
+    git(eng.workdir, "reset", "--hard", base)
+    (eng.workdir / "operator").write_text("mine", encoding="utf-8")
+    git(eng.workdir, "add", "operator")
+    git(eng.workdir, "commit", "-qm", "unknown side tip")
 
     with pytest.raises(BranchDivergedError, match="operator commits"):
         Engine(eng.run_dir, eng.workdir, registry(count=rig))
@@ -466,6 +558,76 @@ def test_integrated_claim_must_match_successful_result_certificate(
         Engine(eng.run_dir, eng.workdir, registry(count=rig))
 
 
+def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    started = tmp_path / "filter-started"
+    filter_script = tmp_path / "slow-smudge.sh"
+    filter_script.write_text(
+        "#!/bin/sh\n"
+        f"printf started > {shlex.quote(str(started))}\n"
+        "sleep 1\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    filter_script.chmod(0o755)
+    git(repo, "config", "filter.slow.clean", "cat")
+    git(repo, "config", "filter.slow.smudge", shlex.quote(str(filter_script)))
+    git(repo, "config", "filter.slow.required", "true")
+    (repo / ".gitattributes").write_text("target filter=slow\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-qm", "configure slow filter")
+    base = git(repo, "rev-parse", "HEAD")
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="target", content="candidate")])
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            Engine(run_dir, repo, registry()).run_epoch(tree, 0)
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+
+    waited = False
+    try:
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            exited, _ = os.waitpid(pid, os.WNOHANG)
+            if exited:
+                waited = True
+                pytest.fail("engine exited before the checked-out fast-forward blocked")
+            time.sleep(0.01)
+        assert started.exists(), "smudge filter did not start"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        waited = True
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    finally:
+        if not waited:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    assert git(repo, "rev-parse", "HEAD") == base
+    resumed = Engine(run_dir, repo, registry())
+    fallback = [
+        event for event in resumed.journal.events()
+        if event.kind == "boundary" and event.fallback_from is not None
+    ]
+    assert fallback
+    candidate = next(
+        event.post_head for event in resumed.journal.events()
+        if event.kind == "result" and event.receipt_required
+    )
+
+    time.sleep(1.2)
+    assert git(repo, "rev-parse", "HEAD") == base
+    assert git(repo, "rev-parse", "HEAD") != candidate
+    assert not any(event.kind == "integrated" for event in resumed.journal.events())
+
+
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     init_repo(repo)
@@ -476,3 +638,22 @@ def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:
     assert git(repo, "show", "workflow:effect") == "1"
     assert git(repo, "branch", "--show-current") == "run"
     assert not (repo / "effect").exists()
+
+
+def test_named_run_branch_checked_out_in_other_worktree_is_updated_or_refused_cleanly(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    git(repo, "branch", "workflow")
+    owner = tmp_path / "workflow-owner"
+    git(repo, "worktree", "add", str(owner), "workflow")
+    before = git(repo, "rev-parse", "workflow")
+    eng = Engine(tmp_path / "run", repo, registry(), "workflow")
+
+    with pytest.raises(NodeExecutionError, match="checked out in linked worktree"):
+        eng.run_epoch(Inplace(edits=[Edit(path="owned", content="new")]), 0)
+
+    assert git(repo, "rev-parse", "workflow") == before
+    assert git(owner, "status", "--porcelain") == ""
+    assert not (owner / "owned").exists()
