@@ -2002,7 +2002,7 @@ class WorkspaceEffects:
     def _proc_identity(pid: int) -> tuple[int, str, int] | None:
         try:
             raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return None
         except OSError as exc:
             raise WorkspaceFault(f"cannot inspect process {pid}: {exc}") from exc

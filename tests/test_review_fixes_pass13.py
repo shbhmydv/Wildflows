@@ -76,6 +76,18 @@ def test_engine_process_launch_sites_are_all_explicitly_supervised() -> None:
     ]
 
 
+def test_process_identity_treats_proc_esrch_race_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = WorkspaceEffects(tmp_path / "work", tmp_path / "run")
+
+    def vanished(_path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(Path, "read_text", vanished)
+    assert ws._proc_identity(12345) is None
+
+
 def test_dead_core_scope_protocol_is_a_typed_workspace_fault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
