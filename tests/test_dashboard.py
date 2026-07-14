@@ -173,8 +173,16 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
 
     assert detail_response.status_code == 200
     detail = _json_object(detail_response)
+    events = _objects(detail["events"])
     assert detail["state"] == "parked"
-    assert len(_objects(detail["events"])) == 49
+    assert len(events) == 49
+    assert {event["version"] for event in events} == {2}
+    gate_event = next(event for event in events if event["kind"] == "gate_returned")
+    assert _object(gate_event["result"]) == {
+        "exit_code": 2,
+        "stdout": "19 checks collected; 18 passed\n",
+        "stderr": "contract snapshot differs at route /settings\n",
+    }
     assert journal.read_bytes() == before
 
     pending_questions = _objects(detail["pending_questions"])
@@ -212,7 +220,9 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
     assert fanout["parallel"] is True
     assert fanout["requested"] == 20
     assert fanout["queued"] == 15
-    assert set(_text(value) for value in fanout["children"] if isinstance(value, str)) == {
+    children = fanout["children"]
+    assert isinstance(children, list)
+    assert {_text(value) for value in children} == {
         "f0.c2.t0",
         "f0.c2.t1",
         "f0.c2.t2",
@@ -259,8 +269,8 @@ def test_artifacts_are_listed_and_contained_inside_the_run(tmp_path: Path) -> No
     assert client.get(f"{base}/artifacts/%2e%2e/%2e%2e/private.txt").status_code == 404
 
 
-def test_static_assets_are_local_and_keep_exact_theme_tokens() -> None:
-    client = TestClient(create_app(Path(".")))
+def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
     index_response = client.get("/")
     css_response = client.get("/static/style.css")
     js_response = client.get("/static/app.js")
