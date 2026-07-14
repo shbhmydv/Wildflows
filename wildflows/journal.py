@@ -173,8 +173,6 @@ class Journal:
         if not j.path.exists():
             return j
         raw = j.path.read_bytes()
-        if not raw:
-            return j
         complete_end = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
         records = raw[:complete_end].split(b"\n")[:-1] if complete_end else []
         raws: list[dict[str, object]] = []
@@ -200,12 +198,15 @@ class Journal:
             raws.append(data)
             j.projection.apply(event)
         _refuse_legacy_interrupted_tail(raws)
-        if complete_end != len(raw):
-            fd = os.open(j.path, os.O_RDWR)
-            try:
+        # A fresh owner cannot know whether a complete physical tail came from an append
+        # whose file or first-file directory fsync failed.  Establish durability for every
+        # accepted existing file (including empty files) before returning ownership.
+        fd = os.open(j.path, os.O_RDWR)
+        try:
+            if complete_end != len(raw):
                 os.ftruncate(fd, complete_end)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            _fsync_directory(j.run_dir)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_directory(j.run_dir)
         return j
