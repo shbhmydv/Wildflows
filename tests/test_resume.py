@@ -224,11 +224,12 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
 
     started = tmp_path / "restore-filter-started"
     finished = tmp_path / "restore-filter-finished"
+    gate = tmp_path / "finish-restore-filter"
     filter_script = tmp_path / "slow-restore-smudge.sh"
     filter_script.write_text(
         "#!/bin/sh\n"
         f"printf x >> {shlex.quote(str(started))}\n"
-        "sleep 2\n"
+        f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.01; done\n"
         "cat\n"
         f"printf done > {shlex.quote(str(finished))}\n",
         encoding="utf-8",
@@ -265,34 +266,36 @@ def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
             os.waitpid(pid, 0)
 
     git(repo, "config", "filter.slow.smudge", "cat")
-    deadline = time.monotonic() + 5
-    while True:
-        try:
-            resumed = Engine(run_dir, repo, registry())
-            break
-        except RepositoryTransientError:
-            if time.monotonic() >= deadline:
-                raise
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                resumed = Engine(run_dir, repo, registry())
+                break
+            except RepositoryTransientError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+
+        assert not finished.exists(), "replacement waited for an unbound restore writer"
+        assert git(repo, "rev-parse", "HEAD") == base
+        assert (repo / "target").read_text(encoding="utf-8") == "base"
+        assert git(repo, "status", "--porcelain") == ""
+        assert not (repo / ".git" / "index.lock").exists()
+        assert any(
+            event.kind == "boundary"
+            and "missing current claimed commit" in (event.reason or "")
+            for event in resumed.journal.events()
+        )
+
+        resumed.run_epoch(tree, 0)
+        assert (repo / "target").read_text(encoding="utf-8") == "candidate"
+        assert git(repo, "status", "--porcelain") == ""
+    finally:
+        gate.write_text("finish", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        while not finished.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
-
-    assert not finished.exists(), "replacement waited for an unbound restore writer"
-    assert git(repo, "rev-parse", "HEAD") == base
-    assert (repo / "target").read_text(encoding="utf-8") == "base"
-    assert git(repo, "status", "--porcelain") == ""
-    assert not (repo / ".git" / "index.lock").exists()
-    assert any(
-        event.kind == "boundary"
-        and "missing current claimed commit" in (event.reason or "")
-        for event in resumed.journal.events()
-    )
-
-    resumed.run_epoch(tree, 0)
-    assert (repo / "target").read_text(encoding="utf-8") == "candidate"
-    assert git(repo, "status", "--porcelain") == ""
-
-    deadline = time.monotonic() + 5
-    while not finished.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
     assert finished.exists(), "original filter did not exit after its Git parent died"
 
 
@@ -786,6 +789,23 @@ def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
         writer.wait(timeout=5)
 
     assert not (repo / ".git" / "index.lock").exists()
+
+
+def test_interrupted_index_lock_is_preserved_after_branch_becomes_unowned(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    git(repo, "branch", "workflow")
+    engine = Engine(tmp_path / "run", repo, registry(), "workflow")
+    lock = repo / ".git" / "index.lock"
+    lock.touch()
+
+    with pytest.raises(RepositoryTransientError, match="no longer owns"):
+        engine.repo.recover_interrupted_index_lock()
+
+    assert lock.exists()
+    lock.unlink()
 
 
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:

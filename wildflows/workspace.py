@@ -219,7 +219,11 @@ class Repository:
         procfs = Path("/proc")
         if not procfs.is_dir():
             return True
-        for process in procfs.iterdir():
+        try:
+            processes = list(procfs.iterdir())
+        except OSError:
+            return True
+        for process in processes:
             if not process.name.isdigit():
                 continue
             try:
@@ -229,7 +233,7 @@ class Repository:
                 command = (process / "comm").read_text(encoding="utf-8").strip()
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            except PermissionError:
+            except (OSError, UnicodeError):
                 return True
             if (
                 len(fields) > 2 and fields[2] != "Z"
@@ -237,18 +241,31 @@ class Repository:
             ):
                 return True
         return False
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise RepositoryTransientError(f"could not sync run index directory: {exc}") from exc
     def recover_interrupted_index_lock(self) -> bool:
         """Remove only an ownerless root index lock at a proven resume tear."""
-        if self.root not in self._branch_worktrees():
-            return False
         raw = self.git(["rev-parse", "--git-path", "index.lock"]).stdout.strip()
         lock = Path(raw) if Path(raw).is_absolute() else self.root / raw
         try:
             observed = lock.stat()
         except FileNotFoundError:
+            self._sync_directory(lock.parent)
             return False
         except OSError as exc:
             raise RepositoryTransientError(f"could not inspect run index lock: {exc}") from exc
+        if self.root not in self._branch_worktrees():
+            raise RepositoryTransientError(
+                "run worktree no longer owns the branch with the interrupted index lock"
+            )
         if observed.st_uid != os.geteuid() or self._git_writer_is_live(observed.st_uid):
             raise RepositoryTransientError("run worktree index is owned by a live writer")
         try:
@@ -257,9 +274,11 @@ class Repository:
                 raise RepositoryTransientError("run worktree index lock changed during recovery")
             lock.unlink()
         except FileNotFoundError:
+            self._sync_directory(lock.parent)
             return False
         except OSError as exc:
             raise RepositoryTransientError(f"could not remove run index lock: {exc}") from exc
+        self._sync_directory(lock.parent)
         return True
     def restore_missing_claim(self, missing: str, fallback: str) -> bool:
         owners = self._branch_worktrees()
