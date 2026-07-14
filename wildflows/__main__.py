@@ -55,6 +55,25 @@ def main(argv: list[str] | None = None) -> int:
         serve(args.repo, args.port)
         return 0
 
+    if (
+        args.command == "resume"
+        and args.answer is not None
+        and Run.deliver_live_answer(
+            args.repo,
+            args.run_id,
+            args.answer,
+            frame_id=args.answer_frame,
+            call_index=args.answer_call,
+        )
+    ):
+        print(f"wildflows run_id={args.run_id}")
+        print(json.dumps({
+            "summary": "owner answer delivered; resident run continues",
+            "frames": 0,
+            "outcome": "ok",
+        }))
+        return 0
+
     job: Path = args.job
     rigs: Path = args.rigs or job.parent / "rigs.yaml"
     policy = AdmissionPolicy(

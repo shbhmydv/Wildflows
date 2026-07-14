@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from wildflows.result import CommitReceipt
 
@@ -23,7 +23,11 @@ class FrameResult(BaseModel):
     stderr: str = ""
 
 
-class DispatchRequest(BaseModel):
+class _ToolRequestBase(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+
+class DispatchRequest(_ToolRequestBase):
     tasks: list[str] = Field(min_length=1)
     rig: str = Field(min_length=1)
     parallel: bool = False
@@ -36,7 +40,7 @@ class DispatchRequest(BaseModel):
         return values
 
 
-class GateRequest(BaseModel):
+class GateRequest(_ToolRequestBase):
     cmd: str = Field(min_length=1)
 
     @field_validator("cmd")
@@ -47,7 +51,7 @@ class GateRequest(BaseModel):
         return value
 
 
-class AskRequest(BaseModel):
+class AskRequest(_ToolRequestBase):
     question: str = Field(min_length=1)
 
     @field_validator("question")

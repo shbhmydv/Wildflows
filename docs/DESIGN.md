@@ -1545,3 +1545,74 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
     viewport matrix 4/4, rc=0). Both failures in the run were engine, not
     model: the stdout-only false-red gate (§101) and the cold re-dispatch of
     a fresh senior with an identical prompt (§98 exists to delete this).
+
+### Hand-29 calls
+
+106. **V2 is one hard vocabulary cut.** `events.ndjson` now accepts only
+     `version: 2` records. The vocabulary is run-open/finish, frame
+     push/exit/integrating/integrated/pop, and typed dispatch/gate/ask
+     call/return facts. The fsynced append owner, torn-tail repair, contiguous
+     sequence rule, and one live/replayed projection remain; all v1
+     epoch/node/expression readers are deleted and a v1 stream raises
+     `IncompatibleJournalError`.
+
+107. **Logical call identity is transport metadata, not model convention.** The
+     generated Pi shim supplies a hidden monotonic call index in MCP `_meta`;
+     the engine computes the canonical content hash after typed validation.
+     Completed calls join on `(frame_id, call_index, content_hash)`. On replay
+     the shim receives prior exact calls so an accidental exact reissue can
+     reclaim its old index, while the ordinary next index starts after the
+     durable prefix. A reused index with different content fails typed at the
+     call boundary and never executes.
+
+108. **Root gets the same stacked-branch contract as every child.** The run ref
+     is the owner-selected existing branch; `f0` works on
+     `wildflows/<run-id>/f0`, and every deterministic child branch is cut from
+     its caller's current frame tip. Child integration advances only the
+     caller branch. The run ref advances only from the root unwind. Branches
+     remain as durability evidence; attempt worktrees are unique, disposable,
+     and rooted under a repository-hashed system-temp directory (or an
+     explicit external root), with containment rejection/fallback if that
+     path would be inside the target repository.
+
+109. **Frame integration has a durable pre-move intent.** A verified source
+     receipt is converted to the exact landed candidate, then
+     `frame_integrating` records `(target, base, candidate, source, landed)`
+     before the ref move. Resume accepts only target-at-base or
+     target-at-candidate and then appends `frame_integrated`; a third tip is
+     divergence. Serial children fast-forward. Parallel siblings start at one
+     caller tip, intersect exact source path ownership, and cherry-pick a
+     disjoint later source through a throwaway external integrator worktree;
+     only landed SHAs enter the parent history.
+
+110. **Admission uses declared per-rig reservation units.** The call boundary
+     enforces depth, immediate breadth, descendant-frame count, inherited
+     subtree deadline, registry allowlist, and cumulative subtree spend. Until
+     rigs report trusted token/cost telemetry, one child reserves one unit by
+     default and `AdmissionPolicy.rig_costs` may assign a different positive
+     declared unit. Refusals are memoizable `dispatch_returned(outcome=
+     "refused", error_code=...)` tool results and allocate no frame/worktree.
+
+111. **A clean caller is the durable call floor.** Dispatch, gate, and ask
+     require the caller frame branch/worktree to be clean before the call, so
+     ancestor state survives replay as commits. `gate` runs in that exact
+     worktree, returns/journals full stdout and stderr independently, and a
+     nonzero exit remains data rather than an MCP transport error. An
+     interrupted gate is deterministically rerun; a completed gate is
+     memoized. `ask` appends the question, blocks the resident request, and
+     observes an atomically published answer file; the ask handler appends the
+     answer before returning it, so the same file also feeds a replayed ask.
+
+112. **Pi is a generated per-attempt adapter, not the supervisor.** The engine
+     binds one authenticated `127.0.0.1` ephemeral JSON-RPC/MCP endpoint and
+     writes a mode-0600 TypeScript extension in run runtime state with URL,
+     token, frame id, and replay index data baked in. `worker-picodex.sh` loads
+     it with `pi -e`; `worker-local.sh` remains a no-tool one-shot leaf. No
+     extension, `.pi/`, or engine runtime file is created in a frame worktree.
+
+113. **The v1 raze includes owner surfaces.** Planner decisions, expression
+     models/admission/traversal, macros, planner adapter/docs, and epoch CLI
+     flags are removed. `run` starts the root rig directly from `job.md`, and
+     `resume` replays that root stack. The dashboard backend is deliberately a
+     compiling v2 journal/status stub; a frame-stack UI is the next phase, as
+     allowed by §10/§12.

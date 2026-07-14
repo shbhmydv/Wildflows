@@ -21,9 +21,6 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["wildflows*"]
 
-[tool.setuptools.package-data]
-wildflows = ["macros/*.json", "dashboard/static/*"]
-
 [tool.mypy]
 python_version = "3.12"
 strict = true

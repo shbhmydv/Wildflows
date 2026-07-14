@@ -30,7 +30,12 @@ from wildflows.frame import (
     ToolResponse,
 )
 
-__all__ = ["MAX_BODY_BYTES", "MCPServer", "ToolHandler"]
+__all__ = ["MAX_BODY_BYTES", "MCPServer", "ToolHandler", "ToolProtocolError"]
+
+
+class ToolProtocolError(RuntimeError):
+    """A safe, caller-caused logical tool error."""
+
 
 MAX_BODY_BYTES = 1 << 20
 _JSON_RPC_VERSION = "2.0"
@@ -127,6 +132,7 @@ class MCPServer:
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._context_depth = 0
+        self._frame_capabilities: dict[str, str] = {}
 
     @property
     def endpoint(self) -> str:
@@ -141,6 +147,19 @@ class MCPServer:
     def url(self) -> str:
         """Alias for :attr:`endpoint` for HTTP clients."""
         return self.endpoint
+
+    def register_frame(self, frame_id: str) -> str:
+        """Issue a per-attempt capability cryptographically bound to one frame."""
+        if not frame_id:
+            raise ValueError("frame id must be non-empty")
+        capability = secrets.token_urlsafe(32)
+        with self._lock:
+            self._frame_capabilities[capability] = frame_id
+        return capability
+
+    def revoke_frame(self, capability: str) -> None:
+        with self._lock:
+            self._frame_capabilities.pop(capability, None)
 
     def start(self) -> "MCPServer":
         """Start serving on a fresh loopback ephemeral port, if not running."""
@@ -204,10 +223,14 @@ class MCPServer:
             yield self
 
     def _serve_post(self, request: _MCPRequestHandler) -> None:
-        if not self._authorized(request):
+        authorized, bound_frame = self._authorization(request)
+        if not authorized:
             # Do not disclose whether authentication was omitted or merely
-            # incorrect.  In particular, do not parse a bad caller's body.
-            request._empty(HTTPStatus.UNAUTHORIZED)
+            # incorrect. In particular, do not parse a bad caller's body.
+            request.send_response(HTTPStatus.UNAUTHORIZED)
+            request.send_header("WWW-Authenticate", "Bearer")
+            request.send_header("Content-Length", "0")
+            request.end_headers()
             return
 
         body = self._read_body(request)
@@ -219,16 +242,36 @@ class MCPServer:
             self._send_json(request, self._error(None, -32700, "Parse error"))
             return
 
-        response = self._dispatch(payload, request.headers.get("X-Wildflows-Frame"))
+        claimed_frame = request.headers.get("X-Wildflows-Frame")
+        if bound_frame is not None and claimed_frame not in (None, bound_frame):
+            request.send_response(HTTPStatus.UNAUTHORIZED)
+            request.send_header("WWW-Authenticate", "Bearer")
+            request.send_header("Content-Length", "0")
+            request.end_headers()
+            return
+        response = self._dispatch(payload, bound_frame or claimed_frame)
         if response is None:
             request._empty(HTTPStatus.NO_CONTENT)
             return
         self._send_json(request, response)
 
-    def _authorized(self, request: _MCPRequestHandler) -> bool:
+    def _authorization(
+        self, request: _MCPRequestHandler
+    ) -> tuple[bool, str | None]:
         supplied = request.headers.get("Authorization")
-        expected = f"Bearer {self.token}"
-        return supplied is not None and hmac.compare_digest(supplied, expected)
+        if supplied is None or not supplied.startswith("Bearer "):
+            return False, None
+        candidate = supplied.removeprefix("Bearer ")
+        with self._lock:
+            for capability, frame_id in self._frame_capabilities.items():
+                if hmac.compare_digest(candidate, capability):
+                    return True, frame_id
+            if hmac.compare_digest(candidate, self.token):
+                # The run token can initialize/inspect the protocol. Once frame
+                # capabilities exist it cannot impersonate one for tools/call.
+                frame = request.headers.get("X-Wildflows-Frame")
+                return True, frame if not self._frame_capabilities else ""
+        return False, None
 
     def _read_body(self, request: _MCPRequestHandler) -> bytes | None:
         length_header = request.headers.get("Content-Length")
@@ -334,9 +377,11 @@ class MCPServer:
             tool_response = self._handler.handle_tool(
                 frame_id, call_index, tool, validated
             )
+        except ToolProtocolError as exc:
+            return self._error(request_id, -32602, str(exc))
         except Exception:
             # Tool failures that are meaningful to a frame are values returned
-            # by its handler.  An exception is a transport/server fault instead.
+            # by its handler. An exception is a transport/server fault instead.
             return self._error(request_id, -32603, "Internal error")
         if not isinstance(tool_response, (DispatchResult, GateResult, AskResult)):
             return self._error(request_id, -32603, "Internal error")

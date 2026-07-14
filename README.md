@@ -1,80 +1,73 @@
 # wildflows
 
-**Better dynamic workflows.** Multi-harness, multi-model-ready, long-running,
-crash-recoverable, fully journalled — open source.
+**Resident agent frames with deterministic, journalled hands.**
 
-> The state machine is the hands, the model is the mind.
+Wildflows v2 is a standalone supervisor for long-running agent work. A run starts one
+root frame in an external Git worktree. That resident agent owns strategy and ordinary
+control flow; when it needs help it calls one of three authenticated engine tools:
 
-wildflows is an agent-workflow orchestrator. A planner-model owns *strategy*
-(which workflow shape to run, how to verify, when to end); a deterministic core
-owns *effects* (git, disk, journal, budgets/rails). Workflows are not a registry
-of files — they are **expressions** over eight primitives:
+- `dispatch(tasks[], rig, parallel?)` pushes child frames and blocks until their
+  committed work is integrated into the caller's frame branch;
+- `gate(cmd)` runs a deterministic check in the caller's worktree and returns the exit
+  code plus complete stdout **and** stderr;
+- `ask(question)` parks the frame until its owner supplies an answer.
 
+There is no planner/expression/epoch executor. Sequences, loops, and result synthesis
+are normal agent control flow. See [`docs/DESIGN.md` §12](docs/DESIGN.md) for the design
+of record.
+
+## Durability model
+
+Every run has an incompatible v2 append-only journal at
+`<repo>/.wildflows/runs/<run-id>/events.ndjson`. Child branches start at their parent
+frame's branch, never at the run branch. Child commits integrate only upward; the run
+branch advances once, when the root frame unwinds. All frame worktrees live outside the
+target repository.
+
+Resume replays the frame stack from original prompts with one engine-generated digest
+of completed and pending calls. Calls are keyed by frame, logical call index, and
+canonical content hash. A completed call reissued with the same identity returns its
+journalled result without launching another agent or rerunning a gate. Only the
+frontier frame's uncommitted work is disposable.
+
+Dispatch admission is enforced before child effects: depth, breadth, subtree frame,
+spend/time, and rig-allowlist rails. The per-run MCP-compatible JSON-RPC endpoint binds
+an ephemeral `127.0.0.1` port and requires its random bearer token.
+
+## Run
+
+Declare frame rigs in YAML (see [`docs/RIGS.md`](docs/RIGS.md)), then:
+
+```bash
+python3 -m wildflows run job.md \
+  --repo /path/to/target \
+  --rigs rigs.yaml \
+  --root-rig senior
 ```
-do(task, rig, ctx)     one agent, one task -> a result
-dispatch(tasks)        parallel do()s
-seq(children)           strict ordered composition
-combine(results, task) a do() whose input is other results
-loop(expr, until, cap) repeat a sub-expression until a condition or cap
-inplace(edit)          the planner's own hands: a small fix, core commits it
-ask(owner)             park until the owner answers a genuine decision
-setup(cmd)             a journaled host mutation (npm ci, boot a dev server)
+
+Resume a stopped stack with the printed run id:
+
+```bash
+python3 -m wildflows resume job.md --repo /path/to/target \
+  --rigs rigs.yaml --root-rig senior --run-id <id>
 ```
 
-Named shapes (swarm, battle, senior→junior loop) are just **macros** — saved
-expressions that act as nudges to the planner.
+A live parked ask can be answered by adding `--answer '...'`; the resident engine
+observes the durable answer file and resumes the blocked tool call.
 
-## Why it's different
+The optional dashboard currently exposes a v2 journal/status stub:
 
-Multi-CLI orchestrators exist. wildflows is built for **survivability**:
-
-- **Core-accounted effects** — every `do`, `inplace`, and predicate gets a fresh,
-  never-reused detached worktree. Successful commit ranges fast-forward onto the run
-  branch; failed/interrupted worktrees are abandoned, so there is nothing to undo.
-- **One journal, one event vocabulary** — resume = replay the event log against
-  the expression tree. No per-shape resume code.
-- **Core-enforced rails** — planner-declared run deadlines, maximum epochs, and
-  expression loop caps stop work at deterministic start boundaries.
-- **Multi-harness rigs** — `claude -p`, `pi`, local Qwen, `codex` all plug in
-  behind one prompt-in / files-out seam.
-
-The design's eventual default macro is a **BUILD** run followed by a spec-unbound
-**AUDIT** run (an expert panel judges the artifact, not the tasks); that planner
-macro is not part of the core yet.
-
-## Status
-
-Current core: v1 fsynced journal/replay, per-node worktree execution, exact
-receipt/run-branch verification, all eight expression kinds (command predicates for
-`loop`), bounded `dispatch`, and planner/run rails. Bundled adapters cover picodex
-planner/senior roles and the local OpenAI-compatible worker. The optional local
-dashboard folds that same journal into a live expression tree and drives controls
-through managed CLI subprocesses. See [`docs/DESIGN.md`](docs/DESIGN.md),
-[`docs/DASHBOARD.md`](docs/DASHBOARD.md), [`docs/PLANNER-RIG.md`](docs/PLANNER-RIG.md),
-and [`docs/RIGS.md`](docs/RIGS.md).
+```bash
+python3 -m wildflows dash --repo /path/to/target
+```
 
 ## Develop
 
-```
+```bash
 pip install -e '.[dev]'
 python3 -m pytest -q
 python3 -m mypy --strict wildflows tests
+bash -n rigs/*.sh
 ```
 
-`Run` stores state at `.wildflows/runs/<run-id>/` in the target repository: the
-journal, planner attempt outputs, bounded-result artifacts, and disposable worktrees.
-Add `.wildflows/runs/` to the target project's ignore rules when needed.
-
-Run the live adapter smoke from the checkout (see the example README for prerequisites):
-
-```bash
-python3 -m wildflows run examples/toy-run/job.md --repo <target>
-```
-
-Resume with `python3 -m wildflows resume ... --run-id <id>`; add `--answer TEXT`
-for a parked owner question. Install `.[dash]`, then open the control room with
-`python3 -m wildflows dash --repo <target>`.
-
-## Topics
-
-`agent workflows` · orchestrator · llm · worktrees · journalling · open source
+Repository tests use fake agent binaries; they do not invoke real models.

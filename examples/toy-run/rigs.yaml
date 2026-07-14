@@ -1,9 +1,4 @@
 rigs:
-  planner:
-    kind: script
-    script: ../../rigs/planner-picodex.sh
-    log_dir: /tmp/wildflows-toy-run/planner
-    timeout_s: 1800
   local:
     kind: script
     script: ../../rigs/worker-local.sh

@@ -1,7 +1,7 @@
 # Example wildflows rig registry (owner-facing config; YAML by policy).
 #
-# Each entry names a rig the planner can reference via RigRef(name=...). The `kind`
-# selects the implementation; per-kind fields configure it. Loaded by
+# Each entry names a frame rig admitted by dispatch (and one root rig). The `kind`
+# selects the process adapter; per-kind fields configure it. Loaded by
 # wildflows.rigconfig.load_rigs(path) -> RigRegistry.
 rigs:
   # Deterministic test substrate: echoes the prompt back. No process, no model.
@@ -15,8 +15,8 @@ rigs:
     template: "claude -p {prompt}"
     timeout_s: 300        # required — no unbounded rig (a hung command must be reaped)
 
-  # The production executor seam drives --worktree/--prompt/--log-dir/--handle-out/
-  # --timeout scripts. Bundled adapters are documented in docs/RIGS.md; for example:
+  # The production frame seam drives --worktree/--prompt/--log-dir/--handle-out/
+  # --timeout scripts and supplies MCP capability environment. See docs/RIGS.md:
   #
   # senior:
   #   kind: script

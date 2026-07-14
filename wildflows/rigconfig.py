@@ -1,10 +1,4 @@
-"""Owner-facing rig configuration: a YAML `rigs.yaml` -> a validated RigRegistry.
-
-YAML by policy for owner-facing config. Each named rig is a Pydantic-validated,
-discriminated union on `kind` (echo | shell | script); an unknown kind or a missing
-per-kind field is rejected at load time. `load_rigs(path) -> RigRegistry` builds the
-concrete rigs the engine resolves at execution time.
-"""
+"""Owner-facing YAML configuration for root, resident, and one-shot frame rigs."""
 from __future__ import annotations
 
 from pathlib import Path

@@ -26,7 +26,12 @@ export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
 provider="${GRINDSTONE_SENIOR_PROVIDER:-openai-codex}"
 model="${GRINDSTONE_SENIOR_MODEL:-gpt-5.6-sol}"
 thinking="${GRINDSTONE_SENIOR_EFFORT:-high}"
-system_prompt='You are the senior WILDFLOWS worker. Work only inside this worktree (your CWD), use relative paths, and commit useful changes there. Return a concise report as your final text.'
+extension="${WILDFLOWS_PI_EXTENSION:-}"
+[[ -n "$extension" && -f "$extension" ]] || {
+  echo "worker-picodex: WILDFLOWS_PI_EXTENSION is missing or unreadable" >&2
+  exit 2
+}
+system_prompt='You are a WILDFLOWS frame. Work only inside this worktree (your CWD), use relative paths, commit useful changes before engine tool calls or exit, and return a concise final report.'
 out="$log_dir/pi.stdout.log"; err="$log_dir/pi.stderr.log"
 limit=()
 if [[ -n "$timeout" ]] && command -v timeout >/dev/null 2>&1; then
@@ -38,7 +43,7 @@ fi
 set +e
 (
   cd "$worktree"
-  "${limit[@]}" pi --provider "$provider" --model "$model" --thinking "$thinking" \
+  "${limit[@]}" pi -e "$extension" --provider "$provider" --model "$model" --thinking "$thinking" \
     --mode text --print --no-session --append-system-prompt "$system_prompt" \
     < "$prompt" > "$out" 2> "$err"
 )

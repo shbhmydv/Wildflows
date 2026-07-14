@@ -1,15 +1,17 @@
 """Frame rig adapters: prompt + CWD + engine capability -> resident agent result."""
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import shlex
 import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TextIO, runtime_checkable
+from typing import Callable, Protocol, TextIO, runtime_checkable
 
 from wildflows.frame import FrameOutcome, FrameResult, FrameRuntime
 
@@ -23,6 +25,44 @@ __all__ = [
     "ScriptRig",
     "RigRegistry",
 ]
+
+_PRCTL: Callable[[int, int, int, int, int], int] | None = None
+if os.name == "posix" and Path("/proc").is_dir():
+    _libc = ctypes.CDLL(None, use_errno=True)
+    _raw_prctl = _libc.prctl
+    _raw_prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    _raw_prctl.restype = ctypes.c_int
+    _PRCTL = _raw_prctl
+
+
+def _die_with_parent(parent_pid: int) -> None:
+    if _PRCTL is None or _PRCTL(1, signal.SIGKILL, 0, 0, 0) != 0:
+        os._exit(127)
+    if os.getppid() != parent_pid:
+        os._exit(127)
+
+
+def _guarded_child(parent_pid: int) -> None:
+    """Fence the workload and kill its whole process group after parent death."""
+    _die_with_parent(parent_pid)
+    leader_pid = os.getpid()
+    watchdog_pid = os.fork()
+    if watchdog_pid != 0:
+        return
+    while os.getppid() == leader_pid:
+        time.sleep(0.02)
+    try:
+        os.killpg(leader_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os._exit(0)
+
 
 DEFAULT_BUSY_PATTERNS = [
     r"rate.?limit",
@@ -68,6 +108,7 @@ def _capture(
             tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
         out_file: TextIO = stdout
         err_file: TextIO = stderr
+        parent_pid = os.getpid()
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -77,6 +118,7 @@ def _capture(
             shell=shell,
             env=env,
             start_new_session=True,
+            preexec_fn=(lambda: _guarded_child(parent_pid)) if _PRCTL else None,
         )
         timed_out = False
         try:

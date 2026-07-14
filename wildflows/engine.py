@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import cast
 
 from wildflows.admission import AdmissionError, AdmissionPolicy, admit_dispatch
 from wildflows.events import (
@@ -41,7 +42,7 @@ from wildflows.frame import (
     call_hash,
 )
 from wildflows.journal import Journal
-from wildflows.mcp import MCPServer
+from wildflows.mcp import MCPServer, ToolProtocolError
 from wildflows.projection import FrameProjection, RunProjection
 from wildflows.result import CommitReceipt
 from wildflows.rig import RigRegistry, run_shell
@@ -54,11 +55,11 @@ from wildflows.workspace import (
 )
 
 
-class CallConflictError(RuntimeError):
+class CallConflictError(ToolProtocolError):
     """A frame reused a logical call index for different content."""
 
 
-class FrameNotActiveError(RuntimeError):
+class FrameNotActiveError(ToolProtocolError):
     """A token-authenticated request did not name a live caller frame."""
 
 
@@ -87,6 +88,8 @@ class Engine:
         self._active_lock = threading.RLock()
         self._integration_lock = threading.RLock()
         self._answer_condition = threading.Condition(threading.RLock())
+        self._call_condition = threading.Condition(threading.RLock())
+        self._inflight_calls: dict[tuple[str, int], tuple[ToolName, str]] = {}
         journal_path = self.run_dir / "events.ndjson"
         continuing = journal_path.exists() and journal_path.stat().st_size > 0
         self.journal = Journal.load(self.run_dir) if continuing else Journal(self.run_dir)
@@ -229,30 +232,73 @@ class Engine:
         worktree = self._active_worktree(frame_id)
         frame = self.journal.projection.frame(frame_id)
         digest = call_hash(tool, request)
-        existing = self.journal.projection.call(frame_id, call_index)
-        if existing is not None:
-            if existing.tool != tool or existing.call_hash != digest:
-                raise CallConflictError(
-                    f"call {frame_id}:{call_index} content differs from its durable call"
+        key = (frame_id, call_index)
+        with self._call_condition:
+            while True:
+                existing = self.journal.projection.call(frame_id, call_index)
+                if existing is not None:
+                    if existing.tool != tool or existing.call_hash != digest:
+                        raise CallConflictError(
+                            f"call {frame_id}:{call_index} content differs from its durable call"
+                        )
+                    if existing.response is not None:
+                        return existing.response
+                leader = self._inflight_calls.get(key)
+                if leader is not None:
+                    if leader != (tool, digest):
+                        raise CallConflictError(
+                            f"call {frame_id}:{call_index} conflicts with its live call"
+                        )
+                    self._call_condition.wait()
+                    continue
+                lower_pending = [
+                    call
+                    for (owner, index), call in self.journal.projection.calls.items()
+                    if owner == frame_id and index < call_index and not call.completed
+                ]
+                if lower_pending:
+                    lower_live = any(
+                        (frame_id, call.call_index) in self._inflight_calls
+                        for call in lower_pending
+                    )
+                    if lower_live:
+                        self._call_condition.wait()
+                        continue
+                    raise CallConflictError(
+                        "an earlier durable call is pending; replay it before later calls"
+                    )
+                if (
+                    existing is None
+                    and call_index != self.journal.projection.next_call_index(frame_id)
+                ):
+                    raise CallConflictError(
+                        f"call {frame_id}:{call_index} is not the next logical call"
+                    )
+                self._inflight_calls[key] = (tool, digest)
+                replaying = existing is not None
+                break
+        try:
+            if tool == "dispatch":
+                if not isinstance(request, DispatchRequest):
+                    raise TypeError("dispatch received the wrong request model")
+                return self._dispatch(
+                    frame, worktree, call_index, digest, request, replaying
                 )
-            if existing.response is not None:
-                return existing.response
-        elif call_index != self.journal.projection.next_call_index(frame_id):
-            raise CallConflictError(
-                f"call {frame_id}:{call_index} is not the next logical call"
+            if tool == "gate":
+                if not isinstance(request, GateRequest):
+                    raise TypeError("gate received the wrong request model")
+                return self._gate(
+                    frame, worktree, call_index, digest, request, replaying
+                )
+            if not isinstance(request, AskRequest):
+                raise TypeError("ask received the wrong request model")
+            return self._ask(
+                frame, worktree, call_index, digest, request, replaying
             )
-
-        if tool == "dispatch":
-            if not isinstance(request, DispatchRequest):
-                raise TypeError("dispatch received the wrong request model")
-            return self._dispatch(frame, worktree, call_index, digest, request, existing is not None)
-        if tool == "gate":
-            if not isinstance(request, GateRequest):
-                raise TypeError("gate received the wrong request model")
-            return self._gate(frame, worktree, call_index, digest, request, existing is not None)
-        if not isinstance(request, AskRequest):
-            raise TypeError("ask received the wrong request model")
-        return self._ask(frame, worktree, call_index, digest, request, existing is not None)
+        finally:
+            with self._call_condition:
+                self._inflight_calls.pop(key, None)
+                self._call_condition.notify_all()
 
     def _active_worktree(self, frame_id: str) -> FrameWorktree:
         with self._active_lock:
@@ -362,7 +408,15 @@ class Engine:
     ) -> list[ChildResult]:
         base = self.repository.branch_tip(parent.branch)
         by_index: dict[int, ChildResult] = {}
-        owned: set[str] = set()
+        owned: set[str] = {
+            path
+            for child in self.journal.projection.frames.values()
+            if child.parent_frame_id == parent.frame_id
+            and child.parent_call_index == call_index
+            and child.integrated is not None
+            for commit in child.integrated.source_commits
+            for path in commit.paths
+        }
         with ThreadPoolExecutor(max_workers=len(request.tasks)) as executor:
             futures: dict[Future[FrameProjection], int] = {}
             for task_index, task in enumerate(request.tasks):
@@ -454,12 +508,6 @@ class Engine:
                     owned=owned,
                     target_worktree=parent_worktree.path,
                 )
-            paths = {path for commit in integrated.source_commits for path in commit.paths}
-            overlap = paths.intersection(owned)
-            if overlap:
-                raise IntegrationError(
-                    f"parallel sibling path ownership overlaps: {', '.join(sorted(overlap))}"
-                )
             self._pop_once(child, "ok")
             return self._child_result(child, integrated.landed_commits)
         except RepositoryError as exc:
@@ -519,19 +567,33 @@ class Engine:
         ))
         with self._active_lock:
             self._active[frame_id] = worktree
+        capability = self.server.register_frame(frame_id)
         try:
             runtime_dir = self.run_dir / "runtime" / frame_id / f"attempt-{attempt}"
-            runtime_dir.mkdir(parents=True, exist_ok=True)
+            runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(runtime_dir, 0o700)
+            replay_calls = [
+                (
+                    call.call_index,
+                    call.tool,
+                    cast(dict[str, object], call.request.model_dump(mode="json")),
+                )
+                for (owner, _), call in sorted(
+                    self.journal.projection.calls.items(), key=lambda item: item[0][1]
+                )
+                if owner == frame_id
+            ]
             shim = write_pi_shim(
                 runtime_dir,
                 self.server.endpoint,
-                self.server.token,
+                capability,
                 frame_id,
                 self.journal.projection.next_call_index(frame_id),
+                replay_calls,
             )
             runtime = FrameRuntime(
                 endpoint=self.server.endpoint,
-                token=self.server.token,
+                token=capability,
                 frame_id=frame_id,
                 shim_path=shim,
                 runtime_dir=runtime_dir,
@@ -581,6 +643,7 @@ class Engine:
             ))
             return self.journal.projection.frame(frame_id)
         finally:
+            self.server.revoke_frame(capability)
             with self._active_lock:
                 self._active.pop(frame_id, None)
             self.repository.remove_worktree(worktree)
@@ -732,8 +795,8 @@ class Engine:
         request: AskRequest,
         replaying: bool,
     ) -> AskResult:
+        self.repository.ensure_clean(worktree.path, frame.branch)
         if not replaying:
-            self.repository.ensure_clean(worktree.path, frame.branch)
             self.journal.append(Asked(
                 run_id=self.run_id,
                 frame_id=frame.frame_id,
@@ -776,9 +839,20 @@ class Engine:
             raise ValueError(f"answer target is ambiguous or absent ({len(selected)} matches)")
         call = selected[0]
         path = self._answer_path(call.frame_id, call.call_index)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(answer, encoding="utf-8")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(answer)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         os.replace(temporary, path)
         with self._answer_condition:
             self._answer_condition.notify_all()

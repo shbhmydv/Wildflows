@@ -1,69 +1,102 @@
-"""The journal: full typed event vocabulary, in-memory list + ndjson, reloadable."""
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
-from wildflows.events import (
-    Answered,
-    Asked,
-    Boundary,
-    Dispatched,
-    Integrated,
-    Event,
-    Judged,
-    LoopIter,
-    ResultEvent,
-    parse_event,
-)
-from wildflows.journal import Journal
-from wildflows.result import CommitReceipt
+import pytest
+
+from wildflows.admission import AdmissionPolicy
+from wildflows.events import RunFinished, RunOpened
+from wildflows.journal import IncompatibleJournalError, Journal
 
 
-def test_append_assigns_increasing_seq(tmp_path: Path) -> None:
-    j = Journal(tmp_path)
-    s0 = j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="opened"))
-    s1 = j.append(Dispatched(run_id="r", epoch=0, node_id="n0", rig="echo", task="t"))
-    assert (s0, s1) == (0, 1)
-    assert len(j.events()) == 2
+def _opened(run_id: str = "run") -> RunOpened:
+    return RunOpened(
+        run_id=run_id,
+        repository="/repo",
+        run_branch="main",
+        base_commit="a" * 40,
+        root_frame_id="f0",
+        root_rig="fake",
+        root_prompt="job",
+        worktrees_root="/tmp/worktrees",
+        started_at=1.0,
+        policy=AdmissionPolicy(),
+    )
 
 
-def test_all_event_types_roundtrip_through_ndjson(tmp_path: Path) -> None:
-    j = Journal(tmp_path)
-    events: list[Event] = [
-        Boundary(run_id="r", epoch=0, node_id="n0", phase="opened"),
-        Dispatched(run_id="r", epoch=0, node_id="n0.0", rig="echo", task="t"),
-        ResultEvent(run_id="r", epoch=0, node_id="n0.0", text="done"),
-        Integrated(run_id="r", epoch=0, node_id="n0.0",
-                   commits=[CommitReceipt(sha="abc", paths=["a.txt"])]),
-        Judged(run_id="r", epoch=0, node_id="n0.1", verdict="pass", ok=True, target_node="n0.0"),
-        LoopIter(run_id="r", epoch=0, node_id="n0", iteration=0, commit="abc", converged=True),
-        Asked(run_id="r", epoch=0, node_id="n0.2", question="which?"),
-        Answered(run_id="r", epoch=0, node_id="n0.2", answer="left", ok=True),
-        Boundary(run_id="r", epoch=0, node_id="n0", phase="closed"),
-    ]
-    for e in events:
-        j.append(e)
-
-    reloaded = Journal.load(tmp_path)
-    assert len(reloaded.events()) == len(events)
-    # types survive the ndjson round-trip
-    kinds = [e.kind for e in reloaded.events()]
-    assert kinds == [e.kind for e in events]
-    assert isinstance(reloaded.events()[0], Boundary)
-
-
-def test_ndjson_is_line_per_event(tmp_path: Path) -> None:
-    j = Journal(tmp_path)
-    j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="opened"))
-    j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="closed"))
-    text = (tmp_path / "events.ndjson").read_text()
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    assert len(lines) == 2
-    assert json.loads(lines[0])["version"] == 1
+@pytest.mark.parametrize("version", [None, True, 0, 1, 3])
+def test_v2_load_refuses_other_or_missing_versions(
+    tmp_path: Path, version: object
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    record: dict[str, object] = {
+        "seq": 0,
+        "ts": 1,
+        "run_id": "old",
+        "kind": "run_finished",
+        "outcome": "ok",
+        "root_head": "deadbeef",
+        "text": "old",
+    }
+    if version is not None:
+        record["version"] = version
+    (run_dir / "events.ndjson").write_text(
+        json.dumps(record) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(IncompatibleJournalError, match="requires v2"):
+        Journal.load(run_dir)
 
 
-def test_parse_event_discriminates() -> None:
-    ev = parse_event({"kind": "result", "run_id": "r", "epoch": 0, "node_id": "n0", "ok": False})
-    assert isinstance(ev, ResultEvent)
-    assert ev.ok is False
+def test_v1_event_shape_is_not_accepted_when_falsely_stamped_v2(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events.ndjson").write_text(
+        json.dumps({
+            "version": 2,
+            "seq": 0,
+            "ts": 1,
+            "run_id": "old",
+            "epoch": 0,
+            "node_id": "n0",
+            "kind": "boundary",
+            "phase": "opened",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        Journal.load(run_dir)
+
+
+def test_load_durably_drops_any_unterminated_tail(tmp_path: Path) -> None:
+    journal = Journal(tmp_path / "run")
+    journal.append(_opened())
+    path = journal.path
+    with path.open("ab") as stream:
+        stream.write(b'{"version":2,"seq":1')
+    loaded = Journal.load(tmp_path / "run")
+    assert loaded.n_events == 1
+    assert path.read_bytes().endswith(b"\n")
+
+
+def test_parallel_append_owner_assigns_contiguous_sequences(tmp_path: Path) -> None:
+    journal = Journal(tmp_path / "run")
+    journal.append(_opened())
+
+    def append(index: int) -> None:
+        journal.append(RunFinished(
+            run_id="run",
+            outcome="ok",
+            root_head=str(index),
+            text=str(index),
+        ))
+
+    threads = [threading.Thread(target=append, args=(index,)) for index in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert [event.seq for event in journal.events()] == list(range(21))
+    assert [event.seq for event in Journal.load(tmp_path / "run").events()] == list(range(21))

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from collections.abc import Sequence
 
 __all__ = ["create_pi_extension", "write_pi_shim"]
 
@@ -14,6 +15,7 @@ def write_pi_shim(
     token: str,
     frame_id: str,
     next_call_index: int,
+    replay_calls: Sequence[tuple[int, str, dict[str, object]]] | None = None,
 ) -> Path:
     """Write a private Pi extension into a frame-owned runtime directory.
 
@@ -34,7 +36,9 @@ def write_pi_shim(
     directory = Path(runtime_dir)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "wildflows-pi-extension.ts"
-    content = _extension_source(endpoint, token, frame_id, next_call_index)
+    content = _extension_source(
+        endpoint, token, frame_id, next_call_index, replay_calls or []
+    )
 
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -58,9 +62,12 @@ def create_pi_extension(
     token: str,
     frame_id: str,
     next_call_index: int,
+    replay_calls: Sequence[tuple[int, str, dict[str, object]]] | None = None,
 ) -> Path:
     """Compatibility spelling for callers creating a Pi extension."""
-    return write_pi_shim(runtime_dir, endpoint, token, frame_id, next_call_index)
+    return write_pi_shim(
+        runtime_dir, endpoint, token, frame_id, next_call_index, replay_calls
+    )
 
 
 def _literal(value: str) -> str:
@@ -73,7 +80,12 @@ def _extension_source(
     token: str,
     frame_id: str,
     next_call_index: int,
+    replay_calls: Sequence[tuple[int, str, dict[str, object]]],
 ) -> str:
+    replay = [
+        {"callIndex": index, "name": name, "arguments": arguments}
+        for index, name, arguments in replay_calls
+    ]
     return f'''import type {{ ExtensionAPI }} from "@earendil-works/pi-coding-agent";
 import {{ Type }} from "typebox";
 
@@ -81,6 +93,8 @@ const endpoint = {_literal(endpoint)};
 const token = {_literal(token)};
 const frameId = {_literal(frame_id)};
 let nextCallIndex = {next_call_index};
+const replayCalls: Array<{{callIndex: number; name: string; arguments: Record<string, unknown>}}> = {json.dumps(replay, ensure_ascii=False)};
+const claimedReplayCalls = new Set<number>();
 
 type TextContent = {{ type: "text"; text: string }};
 type ToolResult = {{
@@ -119,14 +133,30 @@ function toolResult(value: unknown): ToolResult {{
   }};
 }}
 
+function allocateCallIndex(
+  name: string,
+  arguments_: Record<string, unknown>,
+): number {{
+  const encoded = JSON.stringify(arguments_);
+  const replay = replayCalls.find((call) =>
+    !claimedReplayCalls.has(call.callIndex) && call.name === name &&
+    JSON.stringify(call.arguments) === encoded
+  );
+  if (replay !== undefined) {{
+    claimedReplayCalls.add(replay.callIndex);
+    return replay.callIndex;
+  }}
+  return nextCallIndex++;
+}}
+
 async function callTool(
   name: string,
   arguments_: Record<string, unknown>,
   signal: AbortSignal,
 ): Promise<ToolResult> {{
   // Allocate before awaiting fetch, so concurrent Pi tool calls cannot reuse an
-  // index and resumed frames retain the same monotonically advancing sequence.
-  const callIndex = nextCallIndex++;
+  // index. Exact calls from a replay digest reclaim their durable logical index.
+  const callIndex = allocateCallIndex(name, arguments_);
   const response = await fetch(endpoint, {{
     method: "POST",
     headers: {{

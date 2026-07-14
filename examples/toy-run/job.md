@@ -1,9 +1,8 @@
-# Toy text swarm
+# Toy frame swarm
 
-The `local` workers are plain text-completion rigs: they cannot read files or run
-tools, so every task you give them must be fully self-contained. Ask two `local`
-workers in one dispatch for independent one-sentence answers to a self-contained
-question (for example: "name one advantage of append-only journals for crash
-recovery"). Combine all swarm results with the `senior` rig into a short text
-judgment picking the better answer, then end with that judgment. Do not request
-repository edits.
+You are the root frame. Use `wildflows_dispatch` once with two self-contained tasks,
+rig `local`, and `parallel: true`. Each local task should independently give one
+sentence naming an advantage of append-only journals for crash recovery. Read both
+returned reports in context, choose the clearer answer, and finish with a two-sentence
+judgment. Do not edit the repository. If useful, use `wildflows_gate` for a harmless
+`git status --short` check before finishing.

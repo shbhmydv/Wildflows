@@ -10,11 +10,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterator
+from typing import cast
 from uuid import uuid4
 
 from wildflows.admission import AdmissionPolicy
 from wildflows.engine import Engine
+from wildflows.events import parse_event
 from wildflows.frame import FrameOutcome
+from wildflows.projection import RunProjection
 from wildflows.rig import RigRegistry
 
 
@@ -97,6 +100,62 @@ class Run:
             policy=policy,
             worktrees_root=worktrees_root,
         )
+
+    @staticmethod
+    def deliver_live_answer(
+        workdir: Path,
+        run_id: str,
+        answer: str,
+        *,
+        frame_id: str | None = None,
+        call_index: int | None = None,
+    ) -> bool:
+        """Wake a live parked run without constructing a repair-capable Journal."""
+        run_dir = Path(workdir).resolve() / ".wildflows" / "runs" / run_id
+        descriptor = os.open(run_dir / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                projection = RunProjection()
+                raw = (run_dir / "events.ndjson").read_bytes()
+                complete = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
+                for line in raw[:complete].splitlines():
+                    decoded = json.loads(line)
+                    if not isinstance(decoded, dict):
+                        raise ValueError("journal event is not an object")
+                    projection.apply(parse_event(cast(dict[str, object], decoded)))
+                selected = [
+                    call
+                    for call in projection.pending_questions()
+                    if (frame_id is None or call.frame_id == frame_id)
+                    and (call_index is None or call.call_index == call_index)
+                ]
+                if len(selected) != 1:
+                    raise ValueError(
+                        f"answer target is ambiguous or absent ({len(selected)} matches)"
+                    )
+                call = selected[0]
+                answers = run_dir / "answers"
+                answers.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(answers, 0o700)
+                safe = call.frame_id.replace("/", "-")
+                path = answers / f"{safe}-{call.call_index}.txt"
+                temporary = answers / f".{path.name}.{os.getpid()}.tmp"
+                descriptor_out = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                with os.fdopen(descriptor_out, "w", encoding="utf-8") as stream:
+                    stream.write(answer)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                return True
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                return False
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _job_text(value: str | Path) -> str:
