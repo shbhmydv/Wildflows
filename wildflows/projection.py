@@ -28,7 +28,6 @@ class NodeProjection:
     result: Result | None = None
     result_seq: int = -1
     result_post_head: str | None = None
-    integration_base: str | None = None
     receipt_required: bool = False
     receipt: IntegrationReceipt | None = None
     integrated_seq: int = -1
@@ -103,7 +102,6 @@ class RunProjection:
             )
             node.result_seq = event.seq
             node.result_post_head = event.post_head
-            node.integration_base = event.integration_base
             node.receipt_required = event.receipt_required
             node.loop_status = event.loop_status
             self._results_by_seq[event.seq] = node.result

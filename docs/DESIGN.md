@@ -1391,9 +1391,10 @@ than patching each row. Both are the transaction model of record — not a later
     verified group tip receive a failed interruption result on resume instead of a global
     tail rewind, then rerun individually from the current verified tip. An advisory
     common-Git-dir `flock`, keyed by run ref and held across constructor reconciliation or
-    an epoch execution, serializes cooperating Wildflows owners; raw Git mutation during an
-    active run remains outside the operator-between-runs contract and CAS/ownership checks
-    still fail closed where observable.
+    an epoch execution, serializes cooperating Wildflows owners. After waiting for that
+    lock, an older Engine reloads any newly accepted journal stream before it can append.
+    Raw Git mutation during an active run remains outside the operator-between-runs contract
+    and CAS/ownership checks still fail closed where observable.
 
 89. **Checked-out merge trim deferred.** The owner-endorsed CAS-only simplification was
     considered and not taken in M2. Refusing a checked-out run branch would change the M1

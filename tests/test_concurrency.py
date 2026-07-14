@@ -12,7 +12,12 @@ from pathlib import Path
 import pytest
 
 from tests.test_engine import git, init_repo, registry
-from wildflows.engine import Engine, SiblingOwnershipError
+from wildflows.engine import (
+    Engine,
+    NodeExecutionError,
+    RepositoryTransientError,
+    SiblingOwnershipError,
+)
 from wildflows.events import Dispatched, Integrated, LoopIter, ResultEvent
 from wildflows.expr import Dispatch, Do, Loop, RigRef, Until
 from wildflows.result import Result
@@ -103,6 +108,22 @@ def test_overlapping_later_lander_is_a_typed_failed_attempt(tmp_path: Path) -> N
     assert engine.journal.projection.epoch_closed(0)
 
 
+def test_every_later_overlapping_sibling_fails(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    rig = OrderedRig(3, overlap=True)
+    engine = Engine(tmp_path / "run", repo, registry(ordered=rig), max_workers=3)
+
+    with pytest.raises(NodeExecutionError, match="ownership overlaps"):
+        engine.run_epoch(dispatch_three(), 0)
+
+    state = engine.journal.projection
+    assert state.results[(0, "n0.2")].ok
+    assert state.results[(0, "n0.1")].outcome == "failed"
+    assert state.results[(0, "n0.0")].outcome == "failed"
+    assert git(repo, "show", "HEAD:shared") == "value-2"
+
+
 def test_loop_uses_positional_dispatch_result_not_last_completion(
     tmp_path: Path,
 ) -> None:
@@ -111,7 +132,9 @@ def test_loop_uses_positional_dispatch_result_not_last_completion(
     rig = OrderedRig(3)
     tree = Loop(
         body=dispatch_three(),
-        until=Until(kind="cmd", cmd="true"),
+        until=Until(
+            kind="cmd", cmd="test -f file-0 && test -f file-1 && test -f file-2"
+        ),
         cap=1,
     )
     engine = Engine(tmp_path / "run", repo, registry(ordered=rig), max_workers=3)
@@ -129,6 +152,37 @@ def test_loop_uses_positional_dispatch_result_not_last_completion(
         if isinstance(event, ResultEvent) and event.node_id == "n0.0.2"
     )
     assert iteration.body_result_seq == positional.seq
+    predicate = next(
+        event
+        for event in engine.journal.events()
+        if isinstance(event, Dispatched) and event.node_id == "n0.until"
+    )
+    integrations = [
+        event for event in engine.journal.events() if isinstance(event, Integrated)
+    ]
+    assert predicate.pre_head == integrations[-1].commit
+    assert iteration.converged
+
+
+def test_stale_engine_refreshes_journal_after_waiting_for_ref_owner(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    run_dir = tmp_path / "run"
+    first = Engine(run_dir, repo, registry())
+    stale = Engine(run_dir, repo, registry())
+    tree = Do(task="observe", rig=RigRef(name="echo"))
+
+    with first.repo.integration_guard():
+        with pytest.raises(RepositoryTransientError, match="active Wildflows owner"):
+            stale.run_epoch(tree, 0)
+    first.run_epoch(tree, 0)
+    count = first.journal.n_events
+    stale.run_epoch(tree, 0)
+
+    assert stale.journal.n_events == count
+    assert Engine(run_dir, repo, registry()).journal.projection.epoch_closed(0)
 
 
 def test_max_workers_one_keeps_serial_dispatch_semantics(tmp_path: Path) -> None:
@@ -156,6 +210,57 @@ def test_max_workers_one_keeps_serial_dispatch_semantics(tmp_path: Path) -> None
         integrated[1].commit,
     ]
     assert [event.node_id for event in integrated] == ["n0.0", "n0.1", "n0.2"]
+
+
+def test_crash_before_rewritten_landing_preserves_integrated_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    rig = OrderedRig(3)
+    rigs = registry(ordered=rig)
+    run_dir = tmp_path / "run"
+    engine = Engine(run_dir, repo, rigs, max_workers=3)
+    integrate = engine.repo.integrate
+    calls = 0
+
+    def crash_second(base: str, candidate: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise SystemExit("before rewritten sibling landing")
+        integrate(base, candidate)
+
+    monkeypatch.setattr(engine.repo, "integrate", crash_second)
+    with pytest.raises(SystemExit, match="rewritten sibling"):
+        engine.run_epoch(dispatch_three(), 0)
+
+    before = [
+        event for event in engine.journal.events() if isinstance(event, Integrated)
+    ]
+    assert [event.node_id for event in before] == ["n0.2"]
+    moving = next(
+        event
+        for event in engine.journal.events()
+        if isinstance(event, ResultEvent) and event.node_id == "n0.1" and event.ok
+    )
+    dispatch = next(
+        event
+        for event in engine.journal.events()
+        if isinstance(event, Dispatched) and event.node_id == "n0.1"
+    )
+    assert moving.integration_base != dispatch.pre_head
+
+    resumed = Engine(run_dir, repo, rigs, max_workers=3)
+    resumed.run_epoch(dispatch_three(), 0)
+
+    dispatches = [
+        event for event in resumed.journal.events() if isinstance(event, Dispatched)
+    ]
+    assert sum(event.node_id == "n0.2" for event in dispatches) == 1
+    assert sum(event.node_id == "n0.1" for event in dispatches) == 2
+    assert sum(event.node_id == "n0.0" for event in dispatches) == 2
+    assert resumed.journal.projection.epoch_closed(0)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork/SIGKILL")
@@ -226,6 +331,7 @@ def test_sigkill_mid_group_resume_reruns_only_unintegrated_siblings(
         _, status = os.waitpid(pid, 0)
         waited = True
         assert os.WIFSIGNALED(status)
+        assert os.WTERMSIG(status) == signal.SIGKILL
     finally:
         if not waited:
             os.kill(pid, signal.SIGKILL)

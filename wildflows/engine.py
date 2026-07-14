@@ -86,6 +86,9 @@ class Engine:
         return self.journal.projection
     def run_epoch(self, tree: Expr, epoch: int) -> None:
         with self.repo.integration_guard():
+            fresh = Journal.load(self.run_dir)
+            if fresh.events() != self.journal.events():
+                self.journal = fresh
             self._run_epoch(tree, epoch)
     def _run_epoch(self, tree: Expr, epoch: int) -> None:
         self._verify_resume_claims()
@@ -499,28 +502,28 @@ class Engine:
         outcomes = [
             ExecutionOutcome(key=(epoch, child.node_id)) for child in node.children
         ]
-        attempts: list[tuple[int, _Attempt]] = []
+        attempts: list[_Attempt] = []
         failures: list[NodeExecutionError] = []
-        for index, child in enumerate(node.children):
-            assert isinstance(child, (Do, Inplace))
-            key = (epoch, child.node_id)
-            if self._proj.resume_action(key, floor) == "done":
-                continue
-            try:
-                attempts.append((index, self._prepare_attempt(child, epoch, base)))
-            except NodeExecutionError as exc:
-                failures.append(exc)
         owned_paths: set[str] = set()
         try:
+            for child in node.children:
+                assert isinstance(child, (Do, Inplace))
+                key = (epoch, child.node_id)
+                if self._proj.resume_action(key, floor) == "done":
+                    continue
+                try:
+                    attempts.append(self._prepare_attempt(child, epoch, base))
+                except NodeExecutionError as exc:
+                    failures.append(exc)
             with ThreadPoolExecutor(
                 max_workers=min(self.max_workers, len(attempts) or 1)
             ) as executor:
-                pending: dict[Future[_Candidate], tuple[int, _Attempt]] = {
-                    executor.submit(self._build_candidate, attempt): (index, attempt)
-                    for index, attempt in attempts
+                pending: dict[Future[_Candidate], _Attempt] = {
+                    executor.submit(self._build_candidate, attempt): attempt
+                    for attempt in attempts
                 }
                 for future in as_completed(pending):
-                    _, attempt = pending[future]
+                    attempt = pending[future]
                     candidate = future.result()
                     failure = self._land_sibling(
                         attempt, candidate, owned_paths, epoch
@@ -528,7 +531,7 @@ class Engine:
                     if failure is not None:
                         failures.append(failure)
         finally:
-            for _, attempt in attempts:
+            for attempt in attempts:
                 self.repo.remove_worktree(attempt.worktree)
         if len(failures) == 1:
             raise failures[0]
