@@ -47,9 +47,11 @@ macro is not part of the core yet.
 Current core: v1 fsynced journal/replay, per-node worktree execution, exact
 receipt/run-branch verification, all eight expression kinds (command predicates for
 `loop`), bounded `dispatch`, and planner/run rails. Bundled adapters cover picodex
-planner/senior roles and the local OpenAI-compatible worker. The dashboard remains on
-the build ladder. See [`docs/DESIGN.md`](docs/DESIGN.md),
-[`docs/PLANNER-RIG.md`](docs/PLANNER-RIG.md), and [`docs/RIGS.md`](docs/RIGS.md).
+planner/senior roles and the local OpenAI-compatible worker. The optional local
+dashboard folds that same journal into a live expression tree and drives controls
+through managed CLI subprocesses. See [`docs/DESIGN.md`](docs/DESIGN.md),
+[`docs/DASHBOARD.md`](docs/DASHBOARD.md), [`docs/PLANNER-RIG.md`](docs/PLANNER-RIG.md),
+and [`docs/RIGS.md`](docs/RIGS.md).
 
 ## Develop
 
@@ -70,7 +72,8 @@ python3 -m wildflows run examples/toy-run/job.md --repo <target>
 ```
 
 Resume with `python3 -m wildflows resume ... --run-id <id>`; add `--answer TEXT`
-for a parked owner question.
+for a parked owner question. Install `.[dash]`, then open the control room with
+`python3 -m wildflows dash --repo <target>`.
 
 ## Topics
 
