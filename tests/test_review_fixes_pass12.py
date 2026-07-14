@@ -76,11 +76,13 @@ def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_p
     run_dir = tmp_path / "run"
     marker = tmp_path / "first-attempt"
     delayed_started = tmp_path / "delayed-writer-started"
+    foreground_exit = tmp_path / "allow-foreground-exit"
     cmd = (
         f"if test ! -e {shlex.quote(str(marker))}; then "
         f": > {shlex.quote(str(marker))}; "
         f"(: > {shlex.quote(str(delayed_started))}; sleep 1.5; "
-        f"printf ORPHAN > {shlex.quote(str(workdir / 'base.txt'))}) & sleep 0.2; "
+        f"printf ORPHAN > {shlex.quote(str(workdir / 'base.txt'))}) & "
+        f"while test ! -e {shlex.quote(str(foreground_exit))}; do sleep 0.01; done; "
         "else test \"$(cat base.txt)\" = base; fi"
     )
     tree = Loop(
@@ -98,7 +100,8 @@ def test_killed_engine_reaps_predicate_group_after_foreground_exits_and_result_p
         supervisor_pid = int(json.loads(records[0].read_text())["pid"])
     finally:
         _kill_and_wait(engine_pid)
-    _wait_process_absent(supervisor_pid)  # result delivery has lost its reader
+    foreground_exit.touch()  # foreground exits only after the result reader is gone
+    _wait_process_absent(supervisor_pid)
 
     Engine(run_dir, workdir, RigRegistry({})).run_epoch(tree, 0)
     assert replay(run_dir).epoch_closed(0)
@@ -131,6 +134,7 @@ def test_killed_engine_reaps_inflight_shell_rig_before_recovery_and_after_closur
     engine_pid = _fork_engine(run_dir, workdir, tree, registry)
     try:
         _wait_for(delayed_started, "shell rig did not start")
+        _wait_for(delayed_pid, "shell rig did not publish its background pid")
     finally:
         _kill_and_wait(engine_pid)
     assert (workdir / "base.txt").read_bytes() == b"base"
@@ -154,6 +158,7 @@ def test_killed_engine_reaps_inflight_shell_rig_before_recovery_and_after_closur
     assert (workdir / "base.txt").read_bytes() == b"base"
     time.sleep(1.4)
     assert (workdir / "base.txt").read_bytes() == b"base"
+    assert not _process_is_live(old_child)
     assert not list((run_dir / "processes").glob("*.json"))
 
 
@@ -239,5 +244,38 @@ def test_reaper_never_signals_a_recycled_recorded_leader(
         ws, "_group_processes",
         lambda _record: pytest.fail("recycled group must not be enumerated"),
     )
+    ws.reap_process(0, "n0", 0)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("race", ["pid-reused-after-scan", "exit-before-pidfd-signal"])
+def test_reaper_rechecks_enumerated_identity_and_retries_pidfd_esrch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race: str,
+) -> None:
+    from wildflows.workspace import ProcessRecord
+
+    ws = WorkspaceEffects(tmp_path / "work", tmp_path / "run")
+    record = ProcessRecord(
+        epoch=0, node_id="n0", attempt=0, pid=4444, pgid=4444, start_time=100
+    )
+    record.integrity = ws._record_integrity(record)
+    path = ws._process_path(0, "n0", 0)
+    ws._fsync_json(path, record)
+    monkeypatch.setattr(
+        ws, "_proc_identity",
+        lambda pid: None if pid == 4444 else (
+            101 if race == "pid-reused-after-scan" else 100, "R", 4444
+        ),
+    )
+    groups = [[(5555, 100)], []]
+    monkeypatch.setattr(ws, "_group_processes", lambda _record: groups.pop(0))
+    monkeypatch.setattr(os, "pidfd_open", lambda _pid: os.open("/dev/null", os.O_RDONLY))
+
+    def signal_race(_pidfd: int, _sig: int) -> None:
+        if race == "pid-reused-after-scan":
+            pytest.fail("reaper signalled a PID generation that changed after its scan")
+        raise ProcessLookupError
+
+    monkeypatch.setattr(signal, "pidfd_send_signal", signal_race)
     ws.reap_process(0, "n0", 0)
     assert not path.exists()

@@ -2012,8 +2012,8 @@ class WorkspaceEffects:
         except (OSError, ValidationError) as exc:
             raise WorkspaceFault(f"process record is corrupt: {path}: {exc}") from exc
 
-    def _group_processes(self, record: ProcessRecord) -> list[int]:
-        members: list[int] = []
+    def _group_processes(self, record: ProcessRecord) -> list[tuple[int, int]]:
+        members: list[tuple[int, int]] = []
         try:
             entries = list(Path("/proc").iterdir())
         except OSError as exc:
@@ -2025,7 +2025,7 @@ class WorkspaceEffects:
             if identity is not None and identity[1] != "Z" and (
                 identity[2] == record.pgid and identity[0] >= record.start_time
             ):
-                members.append(int(entry.name))
+                members.append((int(entry.name), identity[0]))
         return members
 
     def _settle_process(self, record: ProcessRecord) -> None:
@@ -2061,7 +2061,7 @@ class WorkspaceEffects:
             if not members:
                 self._settle_process(record)
                 return
-            for pid in members:
+            for pid, observed_start in members:
                 try:
                     pidfd = os.pidfd_open(pid)
                 except ProcessLookupError:
@@ -2069,9 +2069,12 @@ class WorkspaceEffects:
                 try:
                     current = self._proc_identity(pid)
                     if current is not None and current[1] != "Z" and (
-                        current[2] == record.pgid and current[0] >= record.start_time
+                        current[2] == record.pgid and current[0] == observed_start
                     ):
-                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                 finally:
                     os.close(pidfd)
             time.sleep(0.01)

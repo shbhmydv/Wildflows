@@ -430,8 +430,8 @@ Git worktree off the run's base commit. The core integrates each child and enfor
 
 **Current serial PoC:** `do` and `inplace` share the integration workdir; a rig may author
 commits there, and the core validates, attributes, receipts, or quarantines them. Worktree
-creation, disjoint merge, reaping, and discard replace this shared-workdir recovery policy
-at the later hygiene step. `Rig.run(prompt, workdir)` is the seam that isolation slots
+creation, disjoint merge, and discard replace this shared-workdir recovery policy at the
+later hygiene step. `Rig.run(prompt, workdir)` is the seam that isolation slots
 behind; this section's first paragraph is not a claim that isolation is implemented now.
 
 ---
