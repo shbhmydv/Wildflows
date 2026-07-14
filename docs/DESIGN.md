@@ -1289,28 +1289,28 @@ than patching each row. Both are the transaction model of record — not a later
     integration/node failure and leaves both the ref and owner worktree untouched. An
     unowned named branch continues to use compare-and-swap `update-ref`.
 
-### Hand-21 calls — ownerless index-lock recovery
+### Hand-21 calls — ownerless Git-lock recovery
 
-83. **Resume-proven, live-owner-safe index-lock cleanup.** Checked-out integration keeps
+83. **Resume-proven, live-owner-safe Git-lock cleanup.** Checked-out integration keeps
     `merge --ff-only`; changing the supplied worktree into an anchor would break the M1
-    contract that its checked-out run branch and files advance together. The engine may
-    remove that worktree's `index.lock` only while resolving one of two journal-proven
-    interrupted index-write windows: an effectful result is durable at the exact base but
-    its integration did not land, or a missing current claim is being restored to its
-    verified predecessor. The run branch must still be owned by the supplied worktree,
-    the run branch must still be owned there, the lock must belong to the engine's uid,
-    `/proc` must conclusively show no live same-uid Git process, and the pathname must still
-    name the observed inode immediately before unlink. Otherwise recovery leaves the lock
-    untouched and raises typed `RepositoryTransientError`. The index directory is fsynced
-    after unlink (and when adopting an already-absent lock) before the fallback can be
-    journalled, so the durable fallback never outruns durable cleanup. A new ordinary Git
-    writer cannot acquire an already-existing
-    lock; an existing live operator is caught by its Git process even in Git's
-    close-before-rename interval. A filter descended from the already-dead Git process may
-    retain an inherited descriptor, but it does not own Git's lock protocol and cannot land
-    the ref move. This rule deliberately excludes an operator manually deleting/replacing
-    Git's lock file concurrently with resume; manual lock surgery must occur only while the
-    engine is stopped. Successful cleanup is named in the fallback boundary.
+    contract that its checked-out run branch and files advance together. Only while
+    resolving one of two journal-proven interrupted mutation windows — an effectful result
+    at the exact base whose integration did not land, or a missing current claim being
+    restored to its verified predecessor — may the engine remove the supplied worktree's
+    `index.lock`, the run ref's `.lock`, or merge's `ORIG_HEAD.lock`. An `index.lock`
+    additionally requires the run branch still be owned by the supplied worktree. Every
+    lock must belong to the engine's uid, `/proc` must conclusively show no live same-uid
+    Git process, and its pathname must still name the observed inode immediately before
+    unlink. Otherwise recovery preserves the lock and raises typed
+    `RepositoryTransientError`. Each lock directory is fsynced after unlink (and when
+    adopting an already-absent lock) before fallback can be journalled, so durable fallback
+    never outruns durable cleanup. A new ordinary Git writer cannot acquire an
+    already-existing lock; an existing live operator is caught by its Git process even in
+    Git's close-before-rename interval. A filter descended from the already-dead Git process
+    may retain an inherited descriptor, but it does not own Git's lock protocol and cannot
+    land the ref move. This rule excludes an operator manually deleting/replacing Git's lock
+    file concurrently with resume; manual lock surgery must occur only while the engine is
+    stopped. Successful cleanup is named in the fallback boundary.
 
 84. **Missing-claim restore has the same lifetime and residue boundary.** Its checked-out
     `read-tree --reset -u` now uses the parent-bound launcher already used by ref movers.

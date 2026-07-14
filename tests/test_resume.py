@@ -753,6 +753,90 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
     assert not (repo / ".git" / "index.lock").exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux parent-death signals")
+def test_sigkill_during_unchecked_out_ref_update_recovers_ref_lock(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    git(repo, "branch", "workflow")
+    base = git(repo, "rev-parse", "workflow")
+    started = tmp_path / "ref-hook-started"
+    finished = tmp_path / "ref-hook-finished"
+    gate = tmp_path / "finish-ref-hook"
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = prepared ] && grep -q ' refs/heads/workflow$'; then\n"
+        f"  printf started > {shlex.quote(str(started))}\n"
+        f"  while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.01; done\n"
+        f"  printf done > {shlex.quote(str(finished))}\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="target", content="candidate")])
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            Engine(run_dir, repo, registry(), "workflow").run_epoch(tree, 0)
+        except BaseException:
+            os._exit(91)
+        os._exit(0)
+
+    waited = False
+    try:
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            exited, _ = os.waitpid(pid, os.WNOHANG)
+            if exited:
+                waited = True
+                pytest.fail("engine exited before the ref transaction hook blocked")
+            time.sleep(0.01)
+        assert started.exists(), "reference-transaction hook did not start"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        waited = True
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    finally:
+        if not waited:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    ref_lock = repo / ".git" / "refs" / "heads" / "workflow.lock"
+    assert ref_lock.exists()
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                resumed = Engine(run_dir, repo, registry(), "workflow")
+                break
+            except RepositoryTransientError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        assert not ref_lock.exists()
+        assert git(repo, "rev-parse", "workflow") == base
+        assert any(
+            event.kind == "boundary" and event.fallback_from is not None
+            for event in resumed.journal.events()
+        )
+    finally:
+        gate.write_text("finish", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        while not finished.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert finished.exists(), "old ref hook did not exit after its Git parent died"
+    assert git(repo, "rev-parse", "workflow") == base
+
+    resumed.run_epoch(tree, 0)
+    assert git(repo, "show", "workflow:target") == "candidate"
+    assert git(repo, "status", "--porcelain") == ""
+    assert not ref_lock.exists()
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux procfs")
 def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
     tmp_path: Path,
@@ -797,7 +881,7 @@ def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
         assert started.exists(), "operator smudge filter did not start"
 
         with pytest.raises(RepositoryTransientError, match="live writer"):
-            engine.repo.recover_interrupted_index_lock()
+            engine.repo.recover_interrupted_locks()
         assert writer.poll() is None
         assert (repo / ".git" / "index.lock").exists()
     finally:
@@ -818,7 +902,7 @@ def test_interrupted_index_lock_is_preserved_after_branch_becomes_unowned(
     lock.touch()
 
     with pytest.raises(RepositoryTransientError, match="no longer owns"):
-        engine.repo.recover_interrupted_index_lock()
+        engine.repo.recover_interrupted_locks()
 
     assert lock.exists()
     lock.unlink()

@@ -219,10 +219,10 @@ class Engine:
                 return True
             if live == expected:
                 assert dispatch is not None
-                cleaned = self.repo.recover_interrupted_index_lock()
+                cleaned = self.repo.recover_interrupted_locks()
                 reason = "resume fallback: result was journalled but its commits did not land"
                 if cleaned:
-                    reason += "; removed ownerless interrupted index lock"
+                    reason += "; removed ownerless interrupted Git lock residue"
                 self._journal_fallback(key[0], dispatch.seq, reason, expected)
                 return True
             if self._fallback_known_prefix(prefix_dependents, live):
@@ -273,7 +273,7 @@ class Engine:
             cleaned = self.repo.restore_missing_claim(claimed, expected)
             reason = f"resume fallback: missing current claimed commit {claimed}"
             if cleaned:
-                reason += "; removed ownerless interrupted index lock"
+                reason += "; removed ownerless interrupted Git lock residue"
         else:
             return self._fallback_known_prefix(prefix_dependents, live)
         self._journal_fallback(epoch_id, start, reason, expected)
