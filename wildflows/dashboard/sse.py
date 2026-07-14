@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 import json
+import os
 from pathlib import Path
 import time
 from typing import cast
@@ -48,18 +49,28 @@ async def tail_events(
 
     offset = 0
     pending = b""
+    expected = 0
     last = after
+    file_identity: tuple[int, int] | None = None
     last_activity = time.monotonic()
 
     while True:
         try:
-            if path.stat().st_size < offset:
-                offset = 0
-                pending = b""
             with path.open("rb") as journal:
+                status = os.fstat(journal.fileno())
+                identity = (status.st_dev, status.st_ino)
+                if file_identity != identity or status.st_size < offset:
+                    offset = 0
+                    pending = b""
+                    expected = 0
                 journal.seek(offset)
                 chunk = journal.read()
+                file_identity = identity
         except FileNotFoundError:
+            offset = 0
+            pending = b""
+            expected = 0
+            file_identity = None
             chunk = b""
 
         if chunk:
@@ -71,6 +82,12 @@ async def tail_events(
                 pending = pending[complete_end + 1 :]
                 for record in records:
                     event = _parse_record(record)
+                    if event.seq != expected:
+                        raise ValueError(
+                            f"journal seq {event.seq} is not contiguous "
+                            f"(expected {expected})"
+                        )
+                    expected += 1
                     if event.seq > last:
                         last = event.seq
                         yield _message(event)

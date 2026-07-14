@@ -48,9 +48,9 @@ def test_tail_emits_only_complete_validated_records(tmp_path: Path) -> None:
             await stream.aclose()
 
     initial, appended = asyncio.run(scenario())
-    assert initial.startswith("id: 0\nevent: journal\n")
+    assert initial == f"id: 0\nevent: journal\ndata: {first.decode()[:-1]}\n\n"
     assert _payload(initial)["text"] == "first"
-    assert appended.startswith("id: 1\nevent: journal\n")
+    assert appended == f"id: 1\nevent: journal\ndata: {second.decode()[:-1]}\n\n"
     assert _payload(appended)["text"] == "second"
 
 
@@ -80,6 +80,67 @@ def test_tail_resumes_strictly_after_sequence_without_poll_duplicates(
     assert _payload(current)["seq"] == 1
     assert _payload(following)["seq"] == 2
     assert path.read_bytes() == original + next_record
+
+
+@pytest.mark.parametrize("rewrite", ["shrink", "replace"])
+def test_tail_follows_shrunk_or_replaced_journal(
+    tmp_path: Path, rewrite: str
+) -> None:
+    path = tmp_path / "events.ndjson"
+    if rewrite == "shrink":
+        original = _record(0, "old" * 1_000)
+        replacement = _record(0, "new") + _record(1, "following")
+        assert len(replacement) < len(original)
+    else:
+        original = _record(0, "old")
+        replacement = _record(0, "new" * 1_000) + _record(1, "following")
+        assert len(replacement) > len(original)
+    path.write_bytes(original)
+
+    async def scenario() -> tuple[str, str]:
+        stream = tail_events(path, poll_interval=0.001, heartbeat_interval=1.0)
+        try:
+            initial = await asyncio.wait_for(anext(stream), timeout=1)
+            if rewrite == "shrink":
+                path.write_bytes(replacement)
+            else:
+                replacement_path = path.with_suffix(".replacement")
+                replacement_path.write_bytes(replacement)
+                replacement_path.replace(path)
+            following = await asyncio.wait_for(anext(stream), timeout=1)
+            return initial, following
+        finally:
+            await stream.aclose()
+
+    initial, following = asyncio.run(scenario())
+    assert _payload(initial)["seq"] == 0
+    assert _payload(following)["seq"] == 1
+    assert path.read_bytes() == replacement
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        _record(0, "first") + _record(0, "duplicate"),
+        _record(0, "first") + _record(2, "gap"),
+    ],
+)
+def test_tail_rejects_duplicate_or_noncontiguous_sequences(
+    tmp_path: Path, records: bytes
+) -> None:
+    path = tmp_path / "events.ndjson"
+    path.write_bytes(records)
+
+    async def scenario() -> None:
+        stream = tail_events(path, poll_interval=0.001, heartbeat_interval=1.0)
+        try:
+            assert _payload(await asyncio.wait_for(anext(stream), timeout=1))["seq"] == 0
+            with pytest.raises(ValueError, match=r"not contiguous \(expected 1\)"):
+                await anext(stream)
+        finally:
+            await stream.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_tail_rejects_invalid_complete_record(tmp_path: Path) -> None:
