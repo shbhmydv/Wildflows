@@ -6,9 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from wildflows.admission import AdmissionError
-from wildflows.engine import Engine, NodeExecutionError, PredicateEvaluationError, replay
-from wildflows.expr import Ask, CtxRef, Do, Edit, Inplace, Loop, RigRef, Seq, Until
+from wildflows.engine import (
+    AwaitingOwner,
+    Engine,
+    NodeExecutionError,
+    PredicateEvaluationError,
+    replay,
+)
+from wildflows.expr import Ask, CtxRef, Do, Edit, Inplace, Loop, RigRef, Seq, Setup, Until
+from wildflows.journal import Journal
 from wildflows.result import Result
 from wildflows.rig import EchoRig, Rig, RigRegistry, ShellRig
 
@@ -209,8 +215,56 @@ def test_shell_timeout_is_durable_retryable_node_failure(tmp_path: Path) -> None
     assert not state.epoch_closed(0)
 
 
-def test_admission_rejects_before_boundary(tmp_path: Path) -> None:
+def test_ask_parks_and_answer_is_materialized_as_node_result(tmp_path: Path) -> None:
     eng = engine(tmp_path)
-    with pytest.raises(AdmissionError):
-        eng.run_epoch(Ask(question="not executable"), 0)
-    assert not (eng.run_dir / "events.ndjson").exists()
+    tree = Seq(children=[
+        Ask(question="Which color?", options=["blue", "green"]),
+        Do(
+            task="use the answer",
+            rig=RigRef(name="echo"),
+            ctx=[CtxRef(kind="node", ref="n0.0")],
+        ),
+    ])
+
+    with pytest.raises(AwaitingOwner) as parked:
+        eng.run_epoch(tree, 0)
+    assert parked.value.node_id == "n0.0"
+    assert parked.value.question == "Which color?"
+    assert not replay(eng.run_dir).epoch_closed(0)
+
+    eng.answer("blue", epoch=0, node_id="n0.0")
+    Engine(eng.run_dir, eng.workdir, registry()).run_epoch(tree, 0)
+
+    state = replay(eng.run_dir)
+    assert state.epoch_closed(0)
+    assert state.results[(0, "n0.0")].text == "blue"
+    assert "blue" in state.results[(0, "n0.1")].text
+    assert [event.kind for event in eng.journal.events()].count("asked") == 1
+
+
+def test_setup_success_and_failure_are_journalled_and_retryable(tmp_path: Path) -> None:
+    eng = engine(tmp_path)
+    success = Setup(cmd="printf ready > setup-ready; printf installed")
+    eng.run_epoch(success, 0)
+    assert (eng.workdir / "setup-ready").read_text(encoding="utf-8") == "ready"
+    result = replay(eng.run_dir).results[(0, "n0")]
+    assert result.text == "installed"
+    assert result.exit_code == 0
+
+    retry = Engine(tmp_path / "setup-retry", eng.workdir, registry())
+    flaky = Setup(cmd=(
+        "if [ ! -f setup-attempted ]; then "
+        "touch setup-attempted; printf first-failure >&2; exit 4; fi; printf recovered"
+    ))
+    with pytest.raises(NodeExecutionError, match="first-failure"):
+        retry.run_epoch(flaky, 0)
+    assert replay(retry.run_dir).results[(0, "n0")].exit_code == 4
+
+    Engine(retry.run_dir, retry.workdir, registry()).run_epoch(flaky, 0)
+    state = replay(retry.run_dir)
+    assert state.epoch_closed(0)
+    assert state.results[(0, "n0")].text == "recovered"
+    assert len([
+        event for event in Journal.load(retry.run_dir).events()
+        if event.kind == "dispatched" and event.node_id == "n0"
+    ]) == 2
