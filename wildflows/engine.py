@@ -4,11 +4,21 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import time
 from typing import NoReturn
 from wildflows.admission import admit_epoch
-from wildflows.events import Boundary, Dispatched, Integrated, LoopIter, ResultEvent
-from wildflows.expr import CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Until
+from wildflows.events import (
+    Answered,
+    Asked,
+    Boundary,
+    Dispatched,
+    Integrated,
+    LoopIter,
+    ResultEvent,
+)
+from wildflows.expr import Ask, CtxRef, Dispatch, Do, Expr, Inplace, Loop, Seq, Setup, Until
 from wildflows.journal import Journal
+from wildflows.planner import AwaitingOwner, OwnerQuestion, RailStop, Rails
 from wildflows.projection import ExecutionOutcome, Floor, NodeKey, RunProjection, replay
 from wildflows.result import IntegrationReceipt, Result
 from wildflows.rig import RigRegistry, run_shell
@@ -22,6 +32,8 @@ from wildflows.workspace import (
 )
 __all__ = [
     "Engine",
+    "AwaitingOwner",
+    "RailStop",
     "NodeExecutionError",
     "SiblingOwnershipError",
     "PredicateEvaluationError",
@@ -67,6 +79,9 @@ class Engine:
             raise ValueError("max_workers must be at least 1")
         self.max_workers = max_workers
         self.run_id = self.run_dir.name
+        self._deadline_at: float | None = None
+        self._active_rails = Rails()
+        self._active_epoch = 0
         with self.repo.integration_guard():
             self.journal = Journal.load(self.run_dir)
             for epoch in self.journal.projection.epochs.values():
@@ -84,13 +99,48 @@ class Engine:
     @property
     def _proj(self) -> RunProjection:
         return self.journal.projection
-    def run_epoch(self, tree: Expr, epoch: int) -> None:
+    def run_epoch(
+        self,
+        tree: Expr,
+        epoch: int,
+        *,
+        rails: Rails | None = None,
+        rationale: str | None = None,
+        deadline_at: float | None = None,
+    ) -> None:
+        self._deadline_at = deadline_at
+        self._active_rails = rails or Rails()
+        self._active_epoch = epoch
+        try:
+            with self.repo.integration_guard():
+                fresh = Journal.load(self.run_dir)
+                if fresh.events() != self.journal.events():
+                    self.journal = fresh
+                self._run_epoch(tree, epoch, rationale)
+        finally:
+            self._deadline_at = None
+    def answer(self, answer: str, *, epoch: int | None = None, node_id: str | None = None) -> None:
+        """Durably answer one currently pending Ask; the answer is its projected result."""
         with self.repo.integration_guard():
-            fresh = Journal.load(self.run_dir)
-            if fresh.events() != self.journal.events():
-                self.journal = fresh
-            self._run_epoch(tree, epoch)
-    def _run_epoch(self, tree: Expr, epoch: int) -> None:
+            self.journal = Journal.load(self.run_dir)
+            pending = [
+                item for item in self._proj.pending_questions()
+                if (epoch is None or item.epoch == epoch)
+                and (node_id is None or item.node_id == node_id)
+            ]
+            if len(pending) != 1:
+                raise ValueError(
+                    f"answer must select exactly one pending Ask (matched {len(pending)})"
+                )
+            question = pending[0]
+            self.journal.append(Answered(
+                run_id=self.run_id,
+                epoch=question.epoch,
+                node_id=question.node_id,
+                answer=answer,
+                ok=True,
+            ))
+    def _run_epoch(self, tree: Expr, epoch: int, rationale: str | None) -> None:
         self._verify_resume_claims()
         tree = admit_epoch(tree, epoch, self._proj, self.registry)
         if self._proj.epoch_closed(epoch):
@@ -106,6 +156,8 @@ class Engine:
                     expr=tree.model_dump(),
                     run_branch=self.repo.ref,
                     base_commit=base,
+                    rails=self._active_rails,
+                    rationale=rationale,
                 )
             )
         self._exec(tree, epoch)
@@ -130,6 +182,7 @@ class Engine:
         results: dict[NodeKey, ResultEvent] = {}
         integrated_after: dict[NodeKey, int] = {}
         prefix_dependents: dict[str, tuple[int, int]] = {}
+        host_dispatches: set[NodeKey] = set()
         verified_tips: set[str] = set()
         expected: str | None = None
         for event in events:
@@ -151,8 +204,11 @@ class Engine:
                     )
                 continue
             if isinstance(event, Dispatched):
-                dispatches[(event.epoch, event.node_id)] = event
-                if expected is not None:
+                key = (event.epoch, event.node_id)
+                dispatches[key] = event
+                if event.host:
+                    host_dispatches.add(key)
+                elif expected is not None:
                     prefix_dependents.setdefault(expected, (event.epoch, event.seq))
                 continue
             if isinstance(event, ResultEvent):
@@ -292,7 +348,7 @@ class Engine:
         unfinished = [
             (key, node)
             for key, node in self._proj.nodes.items()
-            if node.last_dispatch_seq > node.result_seq
+            if key not in host_dispatches and node.last_dispatch_seq > node.result_seq
         ]
         if unfinished:
             key, node = min(unfinished, key=lambda item: item[1].last_dispatch_seq)
@@ -360,18 +416,22 @@ class Engine:
         self.journal.append(Boundary(
             run_id=self.run_id, epoch=epoch_id, node_id="n0", phase="opened",
             expr=epoch.expr, run_branch=self.repo.ref, base_commit=tip,
-            reason=text, fallback_from=start,
+            reason=text, fallback_from=start, rails=epoch.rails,
+            rationale=epoch.rationale,
         ))
     def _exec(self, node: Expr, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
+        self._check_deadline()
         key = (epoch, node.node_id)
-        if isinstance(node, (Do, Inplace)) and self._proj.resume_action(key, floor) == "done":
+        if isinstance(node, (Do, Inplace, Ask, Setup)) and self._proj.resume_action(
+            key, floor
+        ) == "done":
             return ExecutionOutcome(key=key)
         if isinstance(node, Dispatch):
             if self.max_workers > 1 and all(
                 isinstance(child, (Do, Inplace)) for child in node.children
             ):
                 return self._exec_dispatch(node, epoch, floor)
-            return self._exec_children(node.children, epoch, floor)
+            return self._exec_children(node.children, epoch, floor, collect_asks=True)
         if isinstance(node, Seq):
             return self._exec_children(node.children, epoch, floor)
         if isinstance(node, Loop):
@@ -380,21 +440,97 @@ class Engine:
             return self._exec_do(node, epoch)
         if isinstance(node, Inplace):
             return self._exec_inplace(node, epoch)
-        return ExecutionOutcome(key=key)
+        if isinstance(node, Ask):
+            return self._exec_ask(node, epoch, floor)
+        assert isinstance(node, Setup)
+        return self._exec_setup(node, epoch)
     def _exec_children(
-        self, children: list[Expr], epoch: int, floor: Floor
+        self,
+        children: list[Expr],
+        epoch: int,
+        floor: Floor,
+        *,
+        collect_asks: bool = False,
     ) -> ExecutionOutcome:
         outcomes: list[ExecutionOutcome] = []
         failures: list[RuntimeError] = []
+        questions: list[OwnerQuestion] = []
         for child in children:
             try:
                 outcomes.append(self._exec(child, epoch, floor))
+            except AwaitingOwner as exc:
+                if not collect_asks:
+                    raise
+                outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
+                questions.extend(exc.questions)
             except (NodeExecutionError, PredicateEvaluationError) as exc:
                 outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
                 failures.append(exc)
         if failures:
             raise NodeExecutionError("; ".join(str(exc) for exc in failures))
+        if questions:
+            raise AwaitingOwner(tuple(questions))
         return ExecutionOutcome(children=tuple(outcomes))
+    def _check_deadline(self) -> None:
+        if self._deadline_at is None or time.time() < self._deadline_at:
+            return
+        limit = self._active_rails.deadline_s or 0.0
+        raise RailStop(
+            run_id=self.run_id,
+            epoch=self._active_epoch,
+            rail="deadline_s",
+            limit=limit,
+            observed=max(limit, limit + time.time() - self._deadline_at),
+        )
+    def _exec_ask(self, node: Ask, epoch: int, floor: Floor) -> ExecutionOutcome:
+        state = self._proj.node((epoch, node.node_id))
+        if (
+            floor is not None
+            and state.asked_seq > floor
+            and state.asked_seq > state.answered_seq
+        ):
+            raise AwaitingOwner((OwnerQuestion(
+                epoch, node.node_id, node.question, tuple(node.options)
+            ),))
+        self.journal.append(Asked(
+            run_id=self.run_id,
+            epoch=epoch,
+            node_id=node.node_id,
+            question=node.question,
+            options=node.options,
+        ))
+        raise AwaitingOwner((OwnerQuestion(
+            epoch, node.node_id, node.question, tuple(node.options)
+        ),))
+    def _exec_setup(self, node: Setup, epoch: int) -> ExecutionOutcome:
+        key = (epoch, node.node_id)
+        base = self.repo.branch_tip()
+        self.journal.append(Dispatched(
+            run_id=self.run_id,
+            epoch=epoch,
+            node_id=node.node_id,
+            cmd=node.cmd,
+            workdir=str(self.repo.root),
+            pre_head=base,
+            host=True,
+        ))
+        try:
+            execution = run_shell(node.cmd, self.repo.root, 900.0)
+        except OSError as exc:
+            self._fail_node(key, base, f"setup launch failed: {exc}")
+        text = (execution.stdout + execution.stderr)[-8192:]
+        if execution.timed_out:
+            self._fail_node(key, base, f"setup timed out after 900s\n{text}")
+        assert execution.returncode is not None
+        result = Result(
+            text=text,
+            exit_code=execution.returncode,
+            outcome="ok" if execution.returncode == 0 else "failed",
+        )
+        if not result.ok:
+            self._record_failed_result(key, base, result)
+        self._append_result(key, result, post_head=base)
+        return ExecutionOutcome(key=key)
     def _prepare_attempt(self, node: Do | Inplace, epoch: int, base: str) -> _Attempt:
         key = (epoch, node.node_id)
         attempt = self._proj.node(key).dispatch_count
@@ -757,7 +893,7 @@ class Engine:
         integration_base: str | None = None,
         loop_status: str | None = None,
     ) -> None:
-        self._persist_artifact(key, result)
+        artifact = self._persist_artifact(key, result)
         self.journal.append(
             ResultEvent(
                 run_id=self.run_id,
@@ -771,6 +907,7 @@ class Engine:
                 integration_base=integration_base,
                 receipt_required=receipt_required,
                 loop_status=loop_status,
+                artifact=artifact,
             )
         )
     def _append_integrated(self, key: NodeKey, receipt: IntegrationReceipt) -> None:
@@ -782,7 +919,7 @@ class Engine:
                 commits=receipt.commits,
             )
         )
-    def _persist_artifact(self, key: NodeKey, result: Result) -> None:
+    def _persist_artifact(self, key: NodeKey, result: Result) -> str:
         node = key[1].replace("/", "-").replace("..", "-")
         directory = self.run_dir / "artifacts" / f"e{key[0]}-{node}"
         directory.mkdir(parents=True, exist_ok=True)
@@ -801,6 +938,7 @@ class Engine:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        return path.relative_to(self.run_dir).as_posix()
     def _record_failed_result(self, key: NodeKey, base: str, result: Result) -> NoReturn:
         self.repo.ensure_tip(base)
         self._append_result(key, result, post_head=base)

@@ -55,8 +55,6 @@ class Repository:
         ).stdout.strip()
         self.root = Path(root).resolve()
         self.run_dir = Path(run_dir).resolve()
-        if self.run_dir.is_relative_to(self.root):
-            raise ValueError("run_dir must be outside the target repository worktree")
         self.worktrees_dir = self.run_dir / "worktrees"
         self.ref = self._resolve_branch(run_branch)
     @staticmethod

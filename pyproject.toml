@@ -17,6 +17,9 @@ dev = ["pytest>=8", "mypy>=1.8", "types-PyYAML>=6.0"]
 [tool.setuptools.packages.find]
 include = ["wildflows*"]
 
+[tool.setuptools.package-data]
+wildflows = ["macros/*.json"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

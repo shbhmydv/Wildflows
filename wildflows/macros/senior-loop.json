@@ -1,0 +1,20 @@
+{
+  "name": "senior-loop",
+  "description": "A senior iterates on one artifact with an explicit command predicate and cap.",
+  "parameters": {
+    "task": "Senior task text",
+    "rig": "Registered rig name",
+    "until_cmd": "Exit-zero convergence command",
+    "cap": "Positive iteration cap"
+  },
+  "expression": {
+    "kind": "loop",
+    "body": {
+      "kind": "do",
+      "task": "${task}",
+      "rig": {"name": "${rig}"}
+    },
+    "until": {"kind": "cmd", "cmd": "${until_cmd}"},
+    "cap": "${cap}"
+  }
+}

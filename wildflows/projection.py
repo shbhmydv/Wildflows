@@ -1,7 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from wildflows.events import Boundary, Dispatched, Event, Integrated, LoopIter, ResultEvent
+from wildflows.events import (
+    Answered,
+    Asked,
+    Boundary,
+    Dispatched,
+    Event,
+    Integrated,
+    LoopIter,
+    ResultEvent,
+)
+from wildflows.planner import OwnerQuestion, Rails
 from wildflows.result import IntegrationReceipt, Result
 NodeKey = tuple[int, str]
 Floor = int | None
@@ -31,6 +41,11 @@ class NodeProjection:
     receipt_required: bool = False
     receipt: IntegrationReceipt | None = None
     integrated_seq: int = -1
+    artifact: str | None = None
+    question: str | None = None
+    options: tuple[str, ...] = ()
+    asked_seq: int = -1
+    answered_seq: int = -1
     loop_status: str | None = None
     loop_iterations: int = 0
     loop_last_commit: str | None = None
@@ -49,6 +64,9 @@ class EpochProjection:
     expr: dict[str, object] | None = None
     run_branch: str | None = None
     base_commit: str | None = None
+    rails: Rails | None = None
+    rationale: str | None = None
+    reason: str | None = None
 class RunProjection:
     def __init__(self) -> None:
         self._history: list[Event] = []
@@ -87,6 +105,9 @@ class RunProjection:
                     epoch.expr = event.expr
                 epoch.run_branch = event.run_branch
                 epoch.base_commit = event.base_commit
+                epoch.rails = event.rails
+                epoch.rationale = event.rationale
+            epoch.reason = event.reason
             return
         key = (event.epoch, event.node_id)
         node = self.nodes.setdefault(key, NodeProjection())
@@ -104,6 +125,20 @@ class RunProjection:
             node.result_post_head = event.post_head
             node.receipt_required = event.receipt_required
             node.loop_status = event.loop_status
+            node.artifact = event.artifact
+            self._results_by_seq[event.seq] = node.result
+            self._last_result_seq = event.seq
+        elif isinstance(event, Asked):
+            node.question = event.question
+            node.options = tuple(event.options)
+            node.asked_seq = event.seq
+        elif isinstance(event, Answered):
+            node.result = Result(
+                text=event.answer, outcome="ok" if event.ok else "failed"
+            )
+            node.result_seq = event.seq
+            node.answered_seq = event.seq
+            node.receipt_required = False
             self._results_by_seq[event.seq] = node.result
             self._last_result_seq = event.seq
         elif isinstance(event, Integrated):
@@ -164,6 +199,19 @@ class RunProjection:
     def epoch_expr(self, epoch: int) -> dict[str, object] | None:
         value = self.epochs.get(epoch)
         return value.expr if value is not None else None
+    def epoch_rails(self, epoch: int) -> Rails | None:
+        value = self.epochs.get(epoch)
+        return value.rails if value is not None else None
+    def pending_questions(self) -> list[OwnerQuestion]:
+        pending: list[OwnerQuestion] = []
+        for (epoch, node_id), node in self.nodes.items():
+            if (
+                node.question is not None
+                and node.asked_seq > node.answered_seq
+                and not self.epoch_closed(epoch)
+            ):
+                pending.append(OwnerQuestion(epoch, node_id, node.question, node.options))
+        return pending
     @property
     def results(self) -> dict[NodeKey, Result]:
         return {key: node.result for key, node in self.nodes.items() if node.result is not None}

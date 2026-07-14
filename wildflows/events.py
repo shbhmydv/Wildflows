@@ -2,6 +2,7 @@ from __future__ import annotations
 import time
 from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, Field, computed_field, model_validator
+from wildflows.planner import Rails
 from wildflows.result import CommitReceipt, reconcile_outcome
 class _Header(BaseModel):
     seq: int = -1
@@ -17,6 +18,8 @@ class Boundary(_Header):
     run_branch: str | None = None
     base_commit: str | None = None
     fallback_from: int | None = None
+    rails: Rails | None = None
+    rationale: str | None = None
 class Dispatched(_Header):
     kind: Literal["dispatched"] = "dispatched"
     rig: str | None = None
@@ -24,6 +27,7 @@ class Dispatched(_Header):
     cmd: str | None = None
     workdir: str | None = None
     pre_head: str | None = None
+    host: bool = False
 class ResultEvent(_Header):
     kind: Literal["result"] = "result"
     text: str = ""
@@ -34,6 +38,7 @@ class ResultEvent(_Header):
     loop_status: str | None = None
     outcome: Literal["ok", "failed", "busy"] = "ok"
     receipt_required: bool = False
+    artifact: str | None = None
     @model_validator(mode="before")
     @classmethod
     def _collapse_ok(cls, data: Any) -> Any:

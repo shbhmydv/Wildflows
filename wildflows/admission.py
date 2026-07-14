@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 from wildflows.expr import (
+    Ask,
     Combine,
     Dispatch,
     Do,
@@ -23,6 +24,7 @@ from wildflows.expr import (
     Inplace,
     Loop,
     Seq,
+    Setup,
     assign_node_ids,
     children_of,
     parse_expr,
@@ -46,10 +48,11 @@ def _walk(expr: Expr) -> Iterator[Expr]:
 
 
 def _check_capability(node: Expr) -> None:
-    # combine/ask/setup are representable but not executable in the PoC; a `loop` is
-    # executable only with a `cmd` predicate (a `flag` predicate needs the planner).
-    if isinstance(node, Combine) or node.kind in ("ask", "setup"):
-        raise AdmissionError(f"{node.kind} is not executable in the PoC")
+    # Combine and planner-judged loop flags remain outside the M4 execution core.
+    if isinstance(node, Combine):
+        raise AdmissionError("combine is not executable in the M4 core")
+    if isinstance(node, Setup) and node.cwd not in (None, "", "."):
+        raise AdmissionError("setup always runs at the repository root")
     if isinstance(node, Loop):
         if node.until.kind != "cmd":
             raise AdmissionError(
@@ -63,15 +66,13 @@ def _check_capability(node: Expr) -> None:
 
 
 def _has_executable_leaf(node: Expr) -> bool:
-    if isinstance(node, (Do, Inplace)):
+    if isinstance(node, (Do, Inplace, Ask, Setup)):
         return True
     return any(_has_executable_leaf(c) for c in children_of(node))
 
 
-# Result-producing node kinds: a leaf (`do`/`inplace`) and a `loop` (journals a final
-# result) produce a durable result; `seq`/`dispatch` are structural (no node-level result),
-# and `combine`/`ask`/`setup` are not executable. A ctx ref may only target these.
-_RESULTFUL = (Do, Inplace, Loop)
+# Executable leaves and loops produce durable results; composites are structural.
+_RESULTFUL = (Do, Inplace, Ask, Setup, Loop)
 
 
 def _is_result_total(node: Expr) -> bool:
@@ -95,7 +96,7 @@ def _check_result_total(node: Expr) -> None:
     if isinstance(node, (Dispatch, Seq)) and not _is_result_total(node):
         raise AdmissionError(
             f"composite {node.node_id!r} ({node.kind}) has no result-producing last leaf: "
-            f"its final positional child chain must terminate in a do/inplace/loop"
+            f"its final positional child chain must terminate in an executable leaf/loop"
         )
 
 
