@@ -363,8 +363,8 @@ moves the ref, and appends integration facts.
 
 A run owns one existing Git branch. `Run` places `run_dir` at target-local
 `.wildflows/runs/<run-id>/`; direct `Engine` callers may still choose another path. It
-contains `events.ndjson`, verbatim planner decisions, result artifacts, and a run-scoped
-`worktrees/` directory.
+contains `events.ndjson`, planner attempt outputs (successful decisions verbatim),
+result artifacts, and a run-scoped `worktrees/` directory.
 For every `do` and `inplace`, the core:
 
 1. verifies the run branch at the newest journalled tip;
@@ -1406,7 +1406,8 @@ than patching each row. Both are the transaction model of record — not a later
 
 90. **Planner output durability and admission.** A strict `PlannerDecision` carries an
     expression (or an ending summary), typed deadline/max-epoch rails, rationale, and end
-    flag. Raw rig stdout is atomically retained verbatim before parsing. Expression parsing
+    flag. The rig's `Result.text` is atomically retained before parsing (exact stdout on a
+    successful ScriptRig call; its selected error surface on nonzero). Expression parsing
     plus the existing admission pass remain the hard no-effect boundary; rejection is a
     retryable typed `PlannerFailure`. Opened boundaries add validated rails/rationale.
 

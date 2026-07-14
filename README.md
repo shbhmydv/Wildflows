@@ -60,7 +60,7 @@ python3 -m mypy --strict wildflows tests
 ```
 
 `Run` stores state at `.wildflows/runs/<run-id>/` in the target repository: the
-journal, verbatim planner decisions, bounded-result artifacts, and disposable worktrees.
+journal, planner attempt outputs, bounded-result artifacts, and disposable worktrees.
 Add `.wildflows/runs/` to the target project's ignore rules when needed.
 
 Run the live adapter smoke from the checkout (see the example README for prerequisites):

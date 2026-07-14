@@ -28,8 +28,10 @@ adapter asks the model for one fenced object, strips surrounding noise, validate
 object, and prints compact unfenced JSON. Invalid extraction exits nonzero. The planner
 should not mutate the repository; effects belong in its emitted expression.
 
-Every invocation's stdout is atomically retained byte-for-byte under
-`.wildflows/runs/<run-id>/decisions/` before JSON parsing. The prompt names the run
+Every invocation's `Result.text` is atomically retained under
+`.wildflows/runs/<run-id>/decisions/` before JSON parsing. On success that is the exact
+JSON stdout. On a nonzero ScriptRig exit it is the selected error surface; raw adapter
+transport streams remain in that dispatch's log directory. The prompt names the run
 directory so a capable rig may inspect full result artifacts there.
 
 ## Decision JSON
