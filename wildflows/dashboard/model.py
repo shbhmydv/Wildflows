@@ -103,8 +103,6 @@ class DashboardModel:
             return "completed" if projection.finished.outcome == "ok" else "failed"
         if projection.pending_questions():
             return "parked"
-        if any(frame.outcome not in (None, "ok") for frame in projection.frames.values()):
-            return "failed"
         return "running"
 
     def list_runs(self) -> dict[str, object]:

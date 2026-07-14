@@ -279,7 +279,7 @@ function parentCall(frame) {
 }
 
 function defaultCollapsed(frame) {
-  if (frame.state !== "done") return false;
+  if (!["done", "failed"].includes(frame.state)) return false;
   const call = parentCall(frame);
   return call?.status === "completed" || (frame.frame_id === state.run.root_frame_id && !state.run.active);
 }
@@ -334,7 +334,7 @@ function renderFrame(frameId, relativeDepth) {
   node.dataset.frame = frameId;
   const collapsed = defaultCollapsed(frame) && !state.expandedFrames.has(frameId);
   node.append(collapsed ? renderCollapsedFrame(frame) : renderFullFrame(frame));
-  if (relativeDepth >= 3 && frame.calls.some(call => call.tool === "dispatch" && call.children.length)) {
+  if (relativeDepth >= 3 && frame.calls.length) {
     const drill = el("button", "drill-button", `drill in · rebase on ${frame.path}`);
     drill.type = "button";
     drill.addEventListener("click", () => rebase(frame.frame_id));
@@ -358,18 +358,20 @@ function timed(target, frame) {
 }
 
 function renderCollapsedFrame(frame) {
-  const card = el("button", "frame-card collapsed done");
+  const card = el("button", `frame-card collapsed ${frame.state}`);
   card.type = "button";
   card.title = `Expand ${frame.path}`;
-  card.append(dot("done"), el("span", "frame-name", frame.name), el("span", "rig-chip", frame.rig), timed(el("span"), frame), el("span", "collapsed-result", firstLine(frame.text, "completed")));
+  const result = frame.state === "failed" ? frame.reason : firstLine(frame.text, "completed");
+  card.append(dot(frame.state), el("span", "frame-name", frame.name), el("span", "rig-chip", frame.rig), timed(el("span"), frame), el("span", `collapsed-result${frame.state === "failed" ? " failure-reason" : ""}`, result));
   card.addEventListener("click", () => { state.expandedFrames.add(frame.frame_id); renderCanvas(); });
   return card;
 }
 
 function renderFullFrame(frame) {
   const card = el("article", `frame-card ${frame.state}`);
-  card.tabIndex = 0;
-  const top = el("div", "frame-top");
+  const collapsible = defaultCollapsed(frame) && state.expandedFrames.has(frame.frame_id);
+  const top = el(collapsible ? "button" : "div", `frame-top${collapsible ? " frame-toggle" : ""}`);
+  if (collapsible) top.type = "button";
   top.append(dot(frame.state), el("span", "frame-path", frame.path), el("span", "rig-chip", frame.rig));
   const pendingDispatch = frame.calls.find(call => call.tool === "dispatch" && call.status === "pending");
   let label = frame.state;
@@ -381,15 +383,20 @@ function renderFullFrame(frame) {
   if (frame.skills.length) meta.append(el("span", "", `skills · ${frame.skills.join(", ")}`));
   card.append(meta);
   if (frame.text || frame.reason) {
-    const result = el("div", `frame-result${frame.state === "failed" ? " failure-reason" : ""}`);
+    const result = el("button", `frame-result${frame.state === "failed" ? " failure-reason" : ""}`);
+    result.type = "button";
+    result.setAttribute("aria-expanded", "false");
     const copy = el("span", "clamped", frame.state === "failed" ? frame.reason : frame.text);
     result.append(copy);
-    result.title = "Click to expand result";
-    result.addEventListener("click", event => { event.stopPropagation(); copy.classList.toggle("expanded"); });
+    result.title = "Expand result text";
+    result.addEventListener("click", () => {
+      copy.classList.toggle("expanded");
+      result.setAttribute("aria-expanded", String(copy.classList.contains("expanded")));
+    });
     card.append(result);
   }
-  if (defaultCollapsed(frame) && state.expandedFrames.has(frame.frame_id)) {
-    card.title = "Click card header to collapse the completed frame";
+  if (collapsible) {
+    top.title = "Collapse the completed frame";
     top.addEventListener("click", () => { state.expandedFrames.delete(frame.frame_id); renderCanvas(); });
   }
   return card;
@@ -458,20 +465,25 @@ function callSummary(call) {
 }
 
 function renderGate(frame, call) {
-  const row = el("button", "gate-row");
-  row.type = "button";
+  const row = el("section", "gate-row");
   const result = call.result;
   const failed = result && result.exit_code !== 0;
   const language = call.gate_language || "gate: RUNNING";
-  const main = el("span", "gate-main");
+  const main = el("button", "gate-main");
+  main.type = "button";
+  main.disabled = !result;
+  main.setAttribute("aria-expanded", "false");
   main.append(dot(result ? (failed ? "failed" : "success") : "running"), el("span", `gate-language${failed ? " fail" : ""}`, language), el("code", "call-command", call.request.cmd), el("span", "frame-duration", formatDuration(currentDuration(call.started_at, call.ended_at))));
   row.append(main);
   if (result) {
-    const streams = el("span", "gate-streams");
+    const streams = el("div", "gate-streams");
     streams.append(streamBox("stdout", result.stdout), streamBox("stderr", result.stderr));
     row.append(streams);
-    row.title = "Expand captured stdout and stderr";
-    row.addEventListener("click", () => row.classList.toggle("expanded"));
+    main.title = "Expand captured stdout and stderr";
+    main.addEventListener("click", () => {
+      row.classList.toggle("expanded");
+      main.setAttribute("aria-expanded", String(row.classList.contains("expanded")));
+    });
   }
   return row;
 }

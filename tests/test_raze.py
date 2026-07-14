@@ -10,7 +10,6 @@ def test_v1_execution_surface_is_absent() -> None:
     assert not Path("wildflows/macros").exists()
     assert not Path("rigs/planner-picodex.sh").exists()
     assert not Path("docs/PLANNER-RIG.md").exists()
-    assert not Path("wildflows/dashboard/static").exists()
 
     source = "\n".join(
         path.read_text(encoding="utf-8")

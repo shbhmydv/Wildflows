@@ -40,6 +40,18 @@ def read_watchlist(path: Path) -> list[Path]:
     return values
 
 
+def _event_cursor(after: int | None, last_event_id: str | None) -> int:
+    cursor = -1 if after is None else after
+    if last_event_id is None:
+        return cursor
+    try:
+        return int(last_event_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Last-Event-ID must be an integer"
+        ) from exc
+
+
 def create_app(
     repos: Path | list[Path],
     *,
@@ -69,16 +81,8 @@ def create_app(
         last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     ) -> StreamingResponse:
         run_dir = dashboard.run_dir(repo_id, run_id)
-        cursor = -1 if after is None else after
-        if after is None and last_event_id is not None:
-            try:
-                cursor = int(last_event_id)
-            except ValueError as exc:
-                raise HTTPException(
-                    status.HTTP_400_BAD_REQUEST, "Last-Event-ID must be an integer"
-                ) from exc
         return StreamingResponse(
-            tail_events(run_dir / "events.ndjson", cursor),
+            tail_events(run_dir / "events.ndjson", _event_cursor(after, last_event_id)),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -106,6 +110,7 @@ def create_app(
         ):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid control token")
         repo = dashboard.repo(repo_id)
+        dashboard.run_dir(repo_id, run_id)
         try:
             delivered = Run.deliver_live_answer(
                 repo.path,

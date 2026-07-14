@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from wildflows.__main__ import _parser
-from wildflows.dashboard.app import DEFAULT_PORT, create_app
+from wildflows.dashboard.app import DEFAULT_PORT, _event_cursor, create_app
 
 
 _FIXTURE_JOURNAL = (
@@ -129,10 +129,17 @@ def _css_tokens(css: str, selector: str) -> dict[str, str]:
 
 def test_dashboard_port_and_dash_cli_default_are_8181() -> None:
     args = _parser().parse_args(["dash"])
+    watched = _parser().parse_args([
+        "dash", "--repo", "one", "--repo", "two", "--watchlist", "repos.txt"
+    ])
 
     assert DEFAULT_PORT == 8181
     assert args.port == 8181
     assert args.repo == []
+    assert watched.repo == [Path("one"), Path("two")]
+    assert watched.watchlist == Path("repos.txt")
+    assert _event_cursor(12, None) == 12
+    assert _event_cursor(12, "15") == 15
 
 
 def test_app_lists_deduplicated_repositories_with_qualified_run_keys(
@@ -237,6 +244,22 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
     }
 
 
+def test_unfinished_run_stays_live_after_a_child_failure(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    run_dir = repo / ".wildflows" / "runs" / _RUN_ID
+    run_dir.mkdir(parents=True)
+    records = _FIXTURE_JOURNAL.read_bytes().splitlines(keepends=True)
+    (run_dir / "events.ndjson").write_bytes(b"".join(records[:44]))
+    client = TestClient(create_app(repo))
+
+    listing = _objects(_json_object(client.get("/api/runs"))["runs"])
+    assert listing[0]["state"] == "running"
+    detail = _json_object(client.get(_run_url(client)))
+    assert detail["state"] == "running"
+    assert detail["active"] is True
+    assert _object(_object(detail["frames"])["f0.c2.t1"])["state"] == "failed"
+
+
 def test_artifacts_are_listed_and_contained_inside_the_run(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     run_dir = _write_fixture_run(repo)
@@ -296,3 +319,7 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     assert dark == _DARK_TOKENS
     assert automatic_dark == _DARK_TOKENS
     assert "border-left" not in css
+    assert (
+        ".call-children.full-grid { grid-template-columns: "
+        "repeat(6, minmax(105px, 1fr)); }"
+    ) in css
