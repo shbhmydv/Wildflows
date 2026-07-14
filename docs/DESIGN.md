@@ -316,14 +316,15 @@ Leaf rules are deliberately small:
 
 - A durable successful effectless `result` is done.
 - A successful effectful `result` is done only after its later `integrated` receipt.
-- `dispatched` without `result` is an interrupted attempt: append a failed fallback
-  result and rerun in a new, uniquely named worktree.
+- `dispatched` without `result` is an interrupted attempt: append a fallback boundary
+  that invalidates the attempt tail and rerun in a new, uniquely named worktree.
 - In the `result`→branch-fast-forward→`integrated` crash window, branch at `post_head`
   reconstructs and journals the receipt; branch still at `pre_head` journals a fallback
   and reruns; any third tip is refused.
-- An unverifiable receipt is invalidated by an append-only failed `result` and rerun only
-  when the branch is still at the preceding verified tip. If its alleged effect is live,
-  the engine refuses rather than guessing.
+- An unverifiable receipt at an inactive tip appends one `boundary(opened)` carrying
+  `fallback_from`; projection atomically discards that attempt and every dependent later
+  journal fact, then reruns from the preceding verified tip. If the alleged effect is
+  live, the engine refuses rather than guessing.
 - A rig, timeout, path, or integration failure journals a failed result, abandons the
   attempt worktree, leaves the epoch open, and reruns on the next `run_epoch` call.
 
@@ -1242,8 +1243,9 @@ than patching each row. Both are the transaction model of record — not a later
 78. **Exact-tip resume verification.** Opened boundaries pin run ref/base. Resume verifies
     commit existence, exact ranges, paths, and newest tip with plain subprocess Git. A
     result/fast-forward tear is reconciled only at exact base or candidate. Unverifiable
-    inactive claims append a failed fallback and rerun; an unknown/live unverified tip
-    raises a typed error. Operator activity is never reset or quarantined.
+    inactive claims append one tail-invalidating fallback boundary and rerun; an
+    unknown/live unverified tip raises a typed error. Operator activity is never reset or
+    quarantined.
 79. **Small process and path boundary.** Built-in external commands use only an in-process
     process group with timeout kill; no durable process record, guardian, reaper, or core
     Git scope remains. Escaped orphans can write only abandoned worktrees. Receipt paths

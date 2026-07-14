@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from wildflows.events import Boundary, Dispatched, Event, Integrated, LoopIter, ResultEvent
-from wildflows.result import CommitReceipt, IntegrationReceipt, Result
+from wildflows.result import IntegrationReceipt, Result
 NodeKey = tuple[int, str]
 Floor = int | None
 @dataclass(frozen=True)
@@ -40,8 +40,7 @@ class NodeProjection:
     loop_iters: list[LoopIterRecord] = field(default_factory=list)
     def has_unfinished_dispatch(self, floor: Floor) -> bool:
         return (
-            floor is not None
-            and self.last_dispatch_seq > floor
+            floor is not None and self.last_dispatch_seq > floor
             and self.last_dispatch_seq > self.result_seq
         )
 @dataclass
@@ -52,12 +51,34 @@ class EpochProjection:
     base_commit: str | None = None
 class RunProjection:
     def __init__(self) -> None:
+        self._history: list[Event] = []
+        self._clear()
+    def _clear(self) -> None:
         self.nodes: dict[NodeKey, NodeProjection] = {}
         self.epochs: dict[int, EpochProjection] = {}
         self._results_by_seq: dict[int, Result] = {}
         self._last_result_seq = -1
-        self._integrations: dict[int, tuple[NodeKey, list[CommitReceipt]]] = {}
+    @staticmethod
+    def _effective(history: list[Event]) -> list[Event]:
+        effective: list[Event] = []
+        for event in history:
+            if isinstance(event, Boundary) and event.fallback_from is not None:
+                effective = [old for old in effective if old.seq < event.fallback_from]
+            effective.append(event)
+        return effective
+    @property
+    def effective_events(self) -> list[Event]:
+        return self._effective(self._history)
     def apply(self, event: Event) -> None:
+        self._history.append(event)
+        if isinstance(event, Boundary) and event.fallback_from is not None:
+            effective = self._effective(self._history)
+            self._clear()
+            for retained in effective:
+                self._apply_fact(retained)
+            return
+        self._apply_fact(event)
+    def _apply_fact(self, event: Event) -> None:
         if isinstance(event, Boundary):
             epoch = self.epochs.setdefault(event.epoch, EpochProjection())
             epoch.phase = event.phase
@@ -76,9 +97,7 @@ class RunProjection:
             node.dispatched_pre_head = event.pre_head
         elif isinstance(event, ResultEvent):
             node.result = Result(
-                text=event.text,
-                files=event.files,
-                exit_code=event.exit_code,
+                text=event.text, files=event.files, exit_code=event.exit_code,
                 outcome=event.outcome,
             )
             node.result_seq = event.seq
@@ -87,48 +106,27 @@ class RunProjection:
             node.loop_status = event.loop_status
             self._results_by_seq[event.seq] = node.result
             self._last_result_seq = event.seq
-            if event.fallback_for is not None:
-                old = self._integrations.pop(event.fallback_for, None)
-                if old is not None:
-                    self._rebuild_receipt(old[0])
         elif isinstance(event, Integrated):
-            self._integrations[event.seq] = (key, list(event.commits))
-            self._rebuild_receipt(key)
+            if node.receipt is None:
+                node.receipt = IntegrationReceipt()
+            node.receipt.extend(event.commits)
+            node.integrated_seq = event.seq
         elif isinstance(event, LoopIter):
             node.loop_iterations = event.iteration + 1
             node.loop_last_commit = event.commit
             node.loop_last_iter_seq = event.seq
             node.loop_converged = event.converged
             ref = event.body_result_seq
-            if ref is None:  # compatibility with pre-reference journals
+            if ref is None:
                 ref = self._last_result_seq
             node.loop_last_body = self._results_by_seq.get(ref)
-            node.loop_iters.append(
-                LoopIterRecord(
-                    seq=event.seq,
-                    commit=event.commit,
-                    converged=event.converged,
-                    body=node.loop_last_body,
-                )
-            )
-    def _rebuild_receipt(self, key: NodeKey) -> None:
-        contributions = [
-            (seq, commits) for seq, (owner, commits) in self._integrations.items()
-            if owner == key
-        ]
-        node = self.nodes[key]
-        node.receipt = IntegrationReceipt()
-        for _, commits in sorted(contributions):
-            node.receipt.extend(commits)
-        node.integrated_seq = max((seq for seq, _ in contributions), default=-1)
-        if not node.receipt.commits:
-            node.receipt = None
+            node.loop_iters.append(LoopIterRecord(
+                seq=event.seq, commit=event.commit, converged=event.converged,
+                body=node.loop_last_body,
+            ))
     def resume_action(self, key: NodeKey, floor: Floor) -> str:
-        """Return ``run`` or ``done`` for one leaf in the requested loop scope."""
         node = self.nodes.get(key)
-        if node is None or floor is None:
-            return "run"
-        if node.has_unfinished_dispatch(floor):
+        if node is None or floor is None or node.has_unfinished_dispatch(floor):
             return "run"
         if node.result is None or node.result_seq <= floor or not node.result.ok:
             return "run"
@@ -143,11 +141,6 @@ class RunProjection:
         if floor is None:
             return 0, None, False, None
         node = self.nodes.get(key)
-        if (
-            node is not None and node.result is not None and not node.result.ok
-            and node.loop_status is None and node.result_seq > node.loop_last_iter_seq
-        ):
-            return 0, floor, False, None
         records = [] if node is None else [item for item in node.loop_iters if item.seq > floor]
         if not records:
             return 0, floor, False, None
@@ -176,33 +169,20 @@ class RunProjection:
         return {key: node.result for key, node in self.nodes.items() if node.result is not None}
     @property
     def integrated(self) -> dict[NodeKey, list[str]]:
-        return {
-            key: node.receipt.paths
-            for key, node in self.nodes.items()
-            if node.receipt is not None
-        }
+        return {key: node.receipt.paths for key, node in self.nodes.items() if node.receipt}
     @property
     def receipts(self) -> dict[NodeKey, IntegrationReceipt]:
-        return {
-            key: node.receipt
-            for key, node in self.nodes.items()
-            if node.receipt is not None
-        }
+        return {key: node.receipt for key, node in self.nodes.items() if node.receipt}
     @property
     def dispatched(self) -> set[NodeKey]:
         return {key for key, node in self.nodes.items() if node.dispatched}
     @property
     def loop_iterations(self) -> dict[NodeKey, int]:
-        return {
-            key: node.loop_iterations
-            for key, node in self.nodes.items()
-            if node.loop_iterations
-        }
+        return {key: node.loop_iterations for key, node in self.nodes.items() if node.loop_iterations}
     @property
     def loop_last_commit(self) -> dict[NodeKey, str | None]:
         return {
-            key: node.loop_last_commit
-            for key, node in self.nodes.items()
+            key: node.loop_last_commit for key, node in self.nodes.items()
             if node.loop_last_iter_seq >= 0
         }
 def replay(run_dir: Path) -> RunProjection:

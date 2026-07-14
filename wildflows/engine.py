@@ -93,14 +93,9 @@ class Engine:
         while self._verify_once():
             pass
     def _verify_once(self) -> bool:
-        events = self.journal.events()
+        events = self._proj.effective_events
         if not events:
             return False
-        invalidated = {
-            event.fallback_for
-            for event in events
-            if isinstance(event, ResultEvent) and event.fallback_for is not None
-        }
         dispatches: dict[NodeKey, Dispatched] = {}
         results: dict[NodeKey, ResultEvent] = {}
         integrated_after: dict[NodeKey, int] = {}
@@ -128,7 +123,7 @@ class Engine:
             if isinstance(event, ResultEvent):
                 results[(event.epoch, event.node_id)] = event
                 continue
-            if not isinstance(event, Integrated) or event.seq in invalidated:
+            if not isinstance(event, Integrated):
                 continue
             key = (event.epoch, event.node_id)
             dispatch = dispatches.get(key)
@@ -142,12 +137,6 @@ class Engine:
                     f"integrated claim at seq {event.seq} has no contiguous attempt provenance"
                 )
             if base != expected:
-                if invalidated and min(invalidated) < event.seq and self.repo.branch_tip() == expected:
-                    self._journal_fallback(
-                        key, f"resume fallback: receipt seq {event.seq} depends on an "
-                        "invalidated claim", expected, fallback_for=event.seq,
-                    )
-                    return True
                 raise ResumeVerificationError(
                     f"integrated claim at seq {event.seq} does not follow the verified tip"
                 )
@@ -156,10 +145,9 @@ class Engine:
             except RepositoryError as exc:
                 if self.repo.branch_tip() == expected:
                     self._journal_fallback(
-                        key,
+                        key[0], dispatch.seq,
                         f"resume fallback: unverifiable receipt at seq {event.seq}: {exc}",
                         expected,
-                        fallback_for=event.seq,
                     )
                     return True
                 raise ResumeVerificationError(
@@ -186,8 +174,10 @@ class Engine:
             candidate = result.post_head
             if base != expected or candidate is None:
                 if live == expected:
+                    assert dispatch is not None
                     self._journal_fallback(
-                        key, "resume fallback: incomplete integration claim", expected
+                        key[0], dispatch.seq, "resume fallback: incomplete integration claim",
+                        expected,
                     )
                     return True
                 raise BranchDivergedError("run branch does not match an incomplete claim")
@@ -203,8 +193,9 @@ class Engine:
                 self._append_integrated(key, receipt)
                 return True
             if live == expected:
+                assert dispatch is not None
                 self._journal_fallback(
-                    key,
+                    key[0], dispatch.seq,
                     "resume fallback: result was journalled but its commits did not land",
                     expected,
                 )
@@ -228,36 +219,18 @@ class Engine:
             if node.dispatched_pre_head != expected:
                 raise ResumeVerificationError("unfinished attempt did not start at verified tip")
             self._journal_fallback(
-                key, "resume fallback: interrupted attempt abandoned", expected
+                key[0], node.last_dispatch_seq,
+                "resume fallback: interrupted attempt abandoned", expected,
             )
             return True
         return False
-    def _journal_fallback(
-        self, key: NodeKey, text: str, tip: str, *, fallback_for: int | None = None
-    ) -> None:
-        self._append_result(
-            key, Result(text=text, outcome="failed"), post_head=tip,
-            fallback_for=fallback_for,
-        )
-        if fallback_for is not None:
-            loop_ids = {
-                event.node_id for event in self.journal.events()
-                if isinstance(event, LoopIter) and event.epoch == key[0]
-                and event.seq >= fallback_for
-            }
-            for loop_id in sorted(loop_ids):
-                self._append_result(
-                    (key[0], loop_id),
-                    Result(text="resume fallback: loop tail invalidated", outcome="failed"),
-                    post_head=tip,
-                )
-        if self._proj.epoch_closed(key[0]):
-            epoch = self._proj.epochs[key[0]]
-            self.journal.append(Boundary(
-                run_id=self.run_id, epoch=key[0], node_id="n0", phase="opened",
-                expr=epoch.expr, run_branch=self.repo.ref, base_commit=tip,
-                reason="resume fallback",
-            ))
+    def _journal_fallback(self, epoch_id: int, start: int, text: str, tip: str) -> None:
+        epoch = self._proj.epochs[epoch_id]
+        self.journal.append(Boundary(
+            run_id=self.run_id, epoch=epoch_id, node_id="n0", phase="opened",
+            expr=epoch.expr, run_branch=self.repo.ref, base_commit=tip,
+            reason=text, fallback_from=start,
+        ))
     def _exec(self, node: Expr, epoch: int, floor: Floor = -1) -> ExecutionOutcome:
         key = (epoch, node.node_id)
         if isinstance(node, (Do, Inplace)) and self._proj.resume_action(key, floor) == "done":
@@ -275,11 +248,11 @@ class Engine:
         self, children: list[Expr], epoch: int, floor: Floor
     ) -> ExecutionOutcome:
         outcomes: list[ExecutionOutcome] = []
-        failures: list[NodeExecutionError] = []
+        failures: list[RuntimeError] = []
         for child in children:
             try:
                 outcomes.append(self._exec(child, epoch, floor))
-            except NodeExecutionError as exc:
+            except (NodeExecutionError, PredicateEvaluationError) as exc:
                 outcomes.append(ExecutionOutcome(key=(epoch, child.node_id)))
                 failures.append(exc)
         if failures:
@@ -521,7 +494,6 @@ class Engine:
         post_head: str | None,
         receipt_required: bool = False,
         loop_status: str | None = None,
-        fallback_for: int | None = None,
     ) -> None:
         self._persist_artifact(key, result)
         self.journal.append(
@@ -536,7 +508,6 @@ class Engine:
                 post_head=post_head,
                 receipt_required=receipt_required,
                 loop_status=loop_status,
-                fallback_for=fallback_for,
             )
         )
     def _append_integrated(self, key: NodeKey, receipt: IntegrationReceipt) -> None:

@@ -14,9 +14,10 @@ from wildflows.engine import (
     Engine,
     ResumeVerificationError,
 )
-from wildflows.events import Event, Integrated
+from wildflows.events import Boundary, Event, Integrated
 from wildflows.expr import Do, Edit, Inplace, Loop, RigRef, Seq, Until
 from wildflows.projection import ExecutionOutcome
+from wildflows.journal import Journal
 from wildflows.result import Result
 
 
@@ -81,7 +82,7 @@ def test_crash_before_fast_forward_journals_fallback_and_reruns(
     resumed.run_epoch(tree, 0)
     assert rig.calls == 2
     assert any(
-        event.kind == "result" and event.text.startswith("resume fallback")
+        event.kind == "boundary" and (event.reason or "").startswith("resume fallback")
         for event in resumed.journal.events()
     )
 
@@ -176,7 +177,7 @@ def test_unverifiable_receipt_at_previous_tip_falls_back(tmp_path: Path) -> None
     resumed.run_epoch(tree, 0)
     assert rig.calls == 2
     assert any(
-        event.kind == "result" and event.fallback_for is not None
+        event.kind == "boundary" and event.fallback_from is not None
         for event in resumed.journal.events()
     )
 
@@ -251,6 +252,38 @@ def test_invalid_non_tail_receipt_reruns_the_whole_unverified_tail(tmp_path: Pat
     assert (repo / "a").read_text(encoding="utf-8") == "a"
     assert (repo / "b").read_text(encoding="utf-8") == "b"
     assert "f" * 40 not in state.receipts[(0, "n0.0")].shas
+
+
+def test_fallback_invalidates_later_effectless_results(tmp_path: Path) -> None:
+    class EffectlessRig:
+        def __init__(self) -> None:
+            self.calls = 0
+        def run(self, prompt: str, workdir: Path) -> Result:
+            self.calls += 1
+            return Result(text=f"observation {self.calls}")
+    rig = EffectlessRig()
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    run_dir = tmp_path / "run"
+    tree = Seq(children=[
+        Inplace(edits=[Edit(path="a", content="a")]),
+        Do(task="observe", rig=RigRef(name="observe")),
+    ])
+    eng = Engine(run_dir, repo, registry(observe=rig))
+    eng.run_epoch(tree, 0)
+    path = run_dir / "events.ndjson"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    receipt = next(record for record in records if record["kind"] == "integrated")
+    receipt["commits"][-1]["sha"] = "f" * 40
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    git(repo, "reset", "--hard", base)
+    resumed = Engine(run_dir, repo, registry(observe=rig))
+    resumed.run_epoch(tree, 0)
+    assert rig.calls == 2
+    assert resumed.journal.projection.results[(0, "n0.1")].text == "observation 2"
 
 
 def test_invalid_loop_body_receipt_does_not_reuse_old_loop_result(tmp_path: Path) -> None:
@@ -350,6 +383,63 @@ def test_operator_third_tip_in_result_integration_window_is_refused(
     git(eng.workdir, "commit", "-qm", "operator in crash window")
     with pytest.raises(BranchDivergedError, match="incomplete attempt"):
         Engine(eng.run_dir, eng.workdir, registry(count=rig))
+
+
+def test_fallback_boundary_is_complete_after_immediate_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    run_dir = tmp_path / "run"
+    tree = Inplace(edits=[Edit(path="a", content="a")])
+    Engine(run_dir, repo, registry()).run_epoch(tree, 0)
+    path = run_dir / "events.ndjson"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    receipt = next(record for record in records if record["kind"] == "integrated")
+    receipt["commits"][-1]["sha"] = "f" * 40
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    git(repo, "reset", "--hard", base)
+    append = Journal.append
+    def crash_after_fallback(self: Journal, event: Event) -> int:
+        seq = append(self, event)
+        if isinstance(event, Boundary) and event.fallback_from is not None:
+            raise SystemExit("after fallback append")
+        return seq
+    monkeypatch.setattr(Journal, "append", crash_after_fallback)
+    with pytest.raises(SystemExit):
+        Engine(run_dir, repo, registry())
+    monkeypatch.setattr(Journal, "append", append)
+    resumed = Engine(run_dir, repo, registry())
+    resumed.run_epoch(tree, 0)
+    assert (repo / "a").read_text(encoding="utf-8") == "a"
+
+
+def test_invalid_receipt_truncates_later_epoch_claims(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = init_repo(repo)
+    run_dir = tmp_path / "run"
+    first = Inplace(edits=[Edit(path="a", content="a")])
+    second = Inplace(edits=[Edit(path="b", content="b")])
+    eng = Engine(run_dir, repo, registry())
+    eng.run_epoch(first, 0)
+    eng.run_epoch(second, 1)
+    path = run_dir / "events.ndjson"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    receipt = next(record for record in records if record["kind"] == "integrated")
+    receipt["commits"][-1]["sha"] = "f" * 40
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    git(repo, "reset", "--hard", base)
+    resumed = Engine(run_dir, repo, registry())
+    resumed.run_epoch(first, 0)
+    resumed.run_epoch(second, 1)
+    assert (repo / "a").read_text(encoding="utf-8") == "a"
+    assert (repo / "b").read_text(encoding="utf-8") == "b"
 
 
 def test_named_run_branch_can_advance_without_checkout(tmp_path: Path) -> None:

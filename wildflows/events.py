@@ -16,6 +16,7 @@ class Boundary(_Header):
     reason: str | None = None
     run_branch: str | None = None
     base_commit: str | None = None
+    fallback_from: int | None = None
 class Dispatched(_Header):
     kind: Literal["dispatched"] = "dispatched"
     rig: str | None = None
@@ -32,7 +33,6 @@ class ResultEvent(_Header):
     loop_status: str | None = None
     outcome: Literal["ok", "failed", "busy"] = "ok"
     receipt_required: bool = False
-    fallback_for: int | None = None
     @model_validator(mode="before")
     @classmethod
     def _collapse_ok(cls, data: Any) -> Any:
