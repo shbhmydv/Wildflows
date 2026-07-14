@@ -219,18 +219,19 @@
     </footer>
   </div>
 
-  <dialog id="token-dialog">
+  <dialog id="token-dialog" aria-labelledby="token-dialog-title">
     <form method="dialog" id="token-form">
-      <span class="micro-label">Local control</span><h2>Control token</h2>
+      <span class="micro-label">Local control</span><h2 id="token-dialog-title">Control token</h2>
       <p>Paste the token printed by <code>wildflows dash</code>. It stays in this browser tab.</p>
+      <label class="field-label" for="token-input">Token</label>
       <input id="token-input" type="password" autocomplete="off" placeholder="Control token" required>
       <div class="dialog-actions"><button value="cancel" formnovalidate class="btn">Cancel</button><button value="default" class="btn primary">Save token</button></div>
     </form>
   </dialog>
 
-  <dialog id="launch-dialog">
+  <dialog id="launch-dialog" aria-labelledby="launch-dialog-title">
     <form method="dialog" id="launch-form">
-      <span class="micro-label">New run</span><h2>Launch a workflow</h2>
+      <span class="micro-label">New run</span><h2 id="launch-dialog-title">Launch a workflow</h2>
       <label>Job path<input name="job" placeholder="jobs/job.md" required></label>
       <label>Rigs path<input name="rigs" placeholder="rigs.yaml" required></label>
       <div class="form-row"><label>Planner rig<input name="planner_rig" value="planner"></label><label>Workers<input name="max_workers" type="number" min="1" value="1"></label></div>

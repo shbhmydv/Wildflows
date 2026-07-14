@@ -262,6 +262,7 @@ textarea:focus-visible {
   cursor: pointer;
 }
 .recent-run.selected { border-color: var(--amber); background: var(--surface); }
+.recent-run:disabled { color: var(--muted); opacity: .62; cursor: not-allowed; }
 .recent-run .status-dot { width: 6px; height: 6px; margin-top: 3px; }
 .recent-copy { min-width: 0; display: block; }
 .recent-id,
@@ -506,6 +507,7 @@ h1 .slash { color: var(--muted); font-weight: 400; }
   display: grid;
   grid-template-columns: repeat(var(--lane-count), minmax(260px, 1fr));
 }
+.lane-grid.lanes-3 { grid-template-columns: minmax(260px, 27fr) minmax(260px, 39fr) minmax(260px, 34fr); }
 .lane {
   min-width: 0;
   min-height: 215px;
@@ -539,6 +541,8 @@ h1 .slash { color: var(--muted); font-weight: 400; }
 }
 .lane-arrow { margin-left: auto; color: var(--muted); }
 .lane-nodes { display: grid; gap: 10px; align-content: center; margin-top: 16px; }
+.lanes-3 .lane-dispatch .lane-nodes { margin-top: 41px; }
+.lanes-3 .lane-combine .lane-nodes { margin-top: 31px; }
 .node-card {
   position: relative;
   width: 100%;
@@ -555,6 +559,9 @@ h1 .slash { color: var(--muted); font-weight: 400; }
   box-shadow: 0 1px 1px var(--shadow);
 }
 .node-card > .status-dot { position: absolute; top: 11px; right: 11px; width: 6px; height: 6px; }
+.node-card.kind-dispatch { min-height: 76px; border-style: dashed; }
+.node-card.kind-combine { min-height: 96px; }
+.node-card.kind-do { min-height: 60px; }
 .node-card:hover,
 .node-card.selected { border-color: var(--violet); }
 .node-card.selected .node-id { color: var(--violet); }
@@ -831,6 +838,10 @@ dialog input { width: 100%; margin-top: 5px; padding: 9px 10px; border: 1px soli
 }
 .toast.bad { border-color: var(--failure); color: var(--failure); }
 .toast.show { opacity: 1; transform: none; }
+@media (max-width: 1179px), (max-height: 759px) {
+  html,
+  body { overflow: auto; }
+}
 @media (max-width: 1280px) {
   .top-actions { gap: 5px; }
   .top-actions .btn { padding-inline: 8px; }

@@ -14,9 +14,10 @@ const state = {
   selected: null,
   selectedArtifact: null,
   token: sessionStorage.getItem("wf-token") || "",
-  action: null,
   actionTimer: null,
+  actionGeneration: 0,
   request: 0,
+  refresh: 0,
 };
 
 function toast(message, bad = false) {
@@ -129,6 +130,7 @@ async function loadRuns(preferred) {
 async function selectRun(runId) {
   if (!runId) return;
   closeStream();
+  state.refresh += 1;
   const request = ++state.request;
   const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
   if (request !== state.request) return;
@@ -156,9 +158,10 @@ async function receiveEvent(runId, message) {
   if (!state.run.events.some(item => item.seq === event.seq)) state.run.events.push(event);
   appendEvent(event);
   updateJournalFacts();
+  const refresh = ++state.refresh;
   try {
     const fresh = await api(`/api/runs/${encodeURIComponent(runId)}`);
-    if (state.run?.run_id === runId) {
+    if (state.run?.run_id === runId && refresh === state.refresh) {
       state.run = fresh;
       render();
     }
@@ -287,13 +290,14 @@ function renderRunRail() {
   for (const run of ordered.slice(0, 4)) {
     const button = make("button", `recent-run${state.run?.run_id === run.run_id ? " selected" : ""}`);
     button.type = "button";
-    button.title = run.run_id;
+    button.title = run.state === "invalid" ? `${run.run_id}: ${run.error || "invalid journal"}` : run.run_id;
+    button.disabled = run.state === "invalid";
     const dot = make("span", "status-dot");
     setDot(dot, run.state);
     const copy = make("span", "recent-copy");
     copy.append(make("span", "recent-id", shortId(run.run_id)), make("span", "recent-meta", `${run.state} · ${run.epoch_count || 0} epoch${run.epoch_count === 1 ? "" : "s"}`));
     button.append(dot, copy);
-    button.addEventListener("click", () => selectRun(run.run_id).catch(error => toast(error.message, true)));
+    if (run.state !== "invalid") button.addEventListener("click", () => selectRun(run.run_id).catch(error => toast(error.message, true)));
     target.append(button);
   }
 }
@@ -304,7 +308,11 @@ function expressionSExpr(expr) {
   const rig = expr.rig?.name ? ` :rig ${expr.rig.name}` : "";
   if (expr.kind === "dispatch" || expr.kind === "seq") return `(${expr.kind} ${id}${expressionChildren(expr).map(child => ` ${expressionSExpr(child)}`).join("")})`;
   if (expr.kind === "combine") return `(combine ${id}${rig}${expressionChildren(expr).map(child => ` ${expressionSExpr(child)}`).join("")})`;
-  if (expr.kind === "loop") return `(loop ${id} :cap ${expr.cap} ${expressionSExpr(expr.body)})`;
+  if (expr.kind === "loop") {
+    const until = expr.until || {};
+    const predicate = until.kind === "cmd" ? `(cmd ${JSON.stringify(until.cmd || "")} :timeout ${until.timeout_s ?? "—"})` : `(flag :timeout ${until.timeout_s ?? "—"})`;
+    return `(loop ${id} :cap ${expr.cap} :until ${predicate} ${expressionSExpr(expr.body)})`;
+  }
   if (expr.kind === "do") return `(do ${id}${rig} ${JSON.stringify(expr.task)})`;
   if (expr.kind === "ask") return `(ask ${id} ${JSON.stringify(expr.question)})`;
   if (expr.kind === "setup") return `(setup ${id} ${JSON.stringify(expr.cmd)})`;
@@ -320,6 +328,7 @@ function renderTree() {
   grid.replaceChildren();
   $("#flow-lines").replaceChildren();
   if (!expression) {
+    grid.className = "lane-grid";
     empty.hidden = false;
     empty.textContent = state.run ? "No admitted expression in the current epoch." : "Select or launch a run to inspect its expression.";
     $("#expression-line").textContent = "No admitted expression";
@@ -339,8 +348,10 @@ function renderTree() {
   const closed = state.run.closed_epochs > state.run.epoch;
   $("#epoch-chip").lastChild.textContent = `epoch ${state.run.epoch} / ${closed ? "closed" : state.run.state}`;
   setDot($("#epoch-chip .status-dot"), closed ? "integrated" : state.run.state);
+  grid.className = `lane-grid lanes-${layout.lanes.length}`;
   for (const lane of layout.lanes) {
-    const column = make("section", "lane");
+    const kinds = [...new Set(lane.nodes.map(node => node.kind))];
+    const column = make("section", `lane${kinds.length === 1 ? ` lane-${kinds[0]}` : ""}`);
     const header = make("div", "lane-label");
     header.append(make("span", "lane-number", String(lane.index + 1).padStart(2, "0")), document.createTextNode(laneLabel(lane.nodes)));
     if (lane.index < layout.lanes.length - 1) header.append(make("span", "lane-arrow", "→"));
@@ -353,7 +364,7 @@ function renderTree() {
 }
 
 function renderNodeCard(node) {
-  const card = make("button", `node-card state-${node.state}${state.selected === node.id ? " selected" : ""}`);
+  const card = make("button", `node-card kind-${node.kind} state-${node.state}${state.selected === node.id ? " selected" : ""}`);
   card.type = "button";
   card.dataset.node = node.id;
   card.title = node.label;
@@ -620,6 +631,7 @@ function renderAsk(ask) {
   form.append(make("span", "micro-label", "Owner input required"), make("h3", "", ask.question));
   const input = make("textarea");
   input.placeholder = "Answer the planner…";
+  input.setAttribute("aria-label", `Answer: ${ask.question}`);
   input.required = true;
   if (ask.options.length) {
     const options = make("div", "ask-options");
@@ -765,18 +777,20 @@ async function mutate(path, body, message) {
 }
 
 function watchAction(actionId) {
-  state.action = actionId;
+  const generation = ++state.actionGeneration;
   window.clearInterval(state.actionTimer);
   const poll = async () => {
     try {
       const action = await api(`/api/actions/${actionId}`);
+      if (generation !== state.actionGeneration) return;
       $("#action-log").textContent = action.log || "Waiting for output…";
       $("#action-log").scrollTop = $("#action-log").scrollHeight;
       if (action.state === "finished") {
         window.clearInterval(state.actionTimer);
-        await loadRuns(action.run_id);
+        await loadRuns(state.run?.run_id || action.run_id);
       }
     } catch (error) {
+      if (generation !== state.actionGeneration) return;
       window.clearInterval(state.actionTimer);
       toast(error.message, true);
     }
