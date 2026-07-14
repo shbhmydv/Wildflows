@@ -6,6 +6,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -204,6 +205,7 @@ def test_missing_current_claimed_commit_falls_back_to_last_verified_tip(
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux parent-death signals")
 def test_sigkill_during_missing_claim_restore_converges_without_orphan_writer(
     tmp_path: Path,
 ) -> None:
@@ -654,18 +656,22 @@ def test_integrated_claim_must_match_successful_result_certificate(
         Engine(eng.run_dir, eng.workdir, registry(count=rig))
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux parent-death signals")
 def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
     init_repo(repo)
     started = tmp_path / "filter-started"
+    finished = tmp_path / "filter-finished"
+    gate = tmp_path / "finish-filter"
     filter_script = tmp_path / "slow-smudge.sh"
     filter_script.write_text(
         "#!/bin/sh\n"
         f"printf started > {shlex.quote(str(started))}\n"
-        "sleep 1\n"
-        "cat\n",
+        f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.01; done\n"
+        "cat\n"
+        f"printf done > {shlex.quote(str(finished))}\n",
         encoding="utf-8",
     )
     filter_script.chmod(0o755)
@@ -707,30 +713,37 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
             os.waitpid(pid, 0)
 
     assert git(repo, "rev-parse", "HEAD") == base
-    deadline = time.monotonic() + 5
-    while True:
-        try:
-            resumed = Engine(run_dir, repo, registry())
-            break
-        except RepositoryTransientError:
-            if time.monotonic() >= deadline:
-                raise
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                resumed = Engine(run_dir, repo, registry())
+                break
+            except RepositoryTransientError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        fallback = [
+            event for event in resumed.journal.events()
+            if event.kind == "boundary" and event.fallback_from is not None
+        ]
+        assert fallback
+        candidate = next(
+            event.post_head for event in resumed.journal.events()
+            if event.kind == "result" and event.receipt_required
+        )
+        assert not finished.exists(), "replacement waited for an unbound ref mover"
+        assert git(repo, "rev-parse", "HEAD") == base
+        assert git(repo, "rev-parse", "HEAD") != candidate
+        assert not any(event.kind == "integrated" for event in resumed.journal.events())
+        assert not (repo / ".git" / "index.lock").exists()
+    finally:
+        gate.write_text("finish", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        while not finished.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
-    fallback = [
-        event for event in resumed.journal.events()
-        if event.kind == "boundary" and event.fallback_from is not None
-    ]
-    assert fallback
-    candidate = next(
-        event.post_head for event in resumed.journal.events()
-        if event.kind == "result" and event.receipt_required
-    )
-
-    time.sleep(1.2)
+    assert finished.exists(), "original filter did not exit after its Git parent died"
     assert git(repo, "rev-parse", "HEAD") == base
-    assert git(repo, "rev-parse", "HEAD") != candidate
-    assert not any(event.kind == "integrated" for event in resumed.journal.events())
-    assert not (repo / ".git" / "index.lock").exists()
 
     resumed.run_epoch(tree, 0)
 
@@ -740,6 +753,7 @@ def test_sigkill_during_slow_checked_out_fast_forward_cannot_land_after_fallback
     assert not (repo / ".git" / "index.lock").exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux procfs")
 def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
     tmp_path: Path,
 ) -> None:
@@ -760,11 +774,12 @@ def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
     git(repo, "reset", "--hard", base)
 
     started = tmp_path / "operator-filter-started"
+    gate = tmp_path / "finish-operator-filter"
     filter_script = tmp_path / "slow-operator-smudge.sh"
     filter_script.write_text(
         "#!/bin/sh\n"
         f"printf started > {shlex.quote(str(started))}\n"
-        "sleep 1\n"
+        f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.01; done\n"
         "cat\n",
         encoding="utf-8",
     )
@@ -786,6 +801,7 @@ def test_interrupted_index_lock_recovery_refuses_a_live_git_owner(
         assert writer.poll() is None
         assert (repo / ".git" / "index.lock").exists()
     finally:
+        gate.write_text("finish", encoding="utf-8")
         writer.wait(timeout=5)
 
     assert not (repo / ".git" / "index.lock").exists()
