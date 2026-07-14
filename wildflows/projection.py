@@ -22,17 +22,11 @@ from wildflows.events import (
 from wildflows.frame import (
     AskResult,
     DispatchRequest,
-    DispatchResult,
     FrameOutcome,
-    GateRequest,
-    GateResult,
     ToolName,
     ToolRequest,
     ToolResponse,
 )
-from wildflows.result import CommitReceipt
-
-
 @dataclass
 class FrameProjection:
     frame_id: str
@@ -177,14 +171,6 @@ class RunProjection:
     def call(self, frame_id: str, call_index: int) -> CallProjection | None:
         return self.calls.get((frame_id, call_index))
 
-    def completed_calls(self, frame_id: str) -> list[CallProjection]:
-        values = [
-            call
-            for (owner, _), call in self.calls.items()
-            if owner == frame_id and call.completed
-        ]
-        return sorted(values, key=lambda call: call.call_index)
-
     def next_call_index(self, frame_id: str) -> int:
         indexes = [index for owner, index in self.calls if owner == frame_id]
         return max(indexes, default=-1) + 1
@@ -232,7 +218,3 @@ class RunProjection:
                 item["skills"] = [list(bundle) for bundle in call.request.skills]
             digest.append(item)
         return digest
-
-    def integrated_commits(self, frame_id: str) -> list[CommitReceipt]:
-        integrated = self.frame(frame_id).integrated
-        return [] if integrated is None else list(integrated.landed_commits)

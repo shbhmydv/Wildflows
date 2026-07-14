@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
 import tempfile
@@ -174,9 +173,6 @@ class Repository:
     def remove_worktree(self, worktree: FrameWorktree) -> None:
         self.git(["worktree", "remove", "--force", str(worktree.path)], check=False)
         self.git(["worktree", "prune", "--expire", "now"], check=False)
-
-    def delete_branch(self, branch: str) -> None:
-        self.git(["branch", "-D", branch.removeprefix("refs/heads/")], check=False)
 
     def ensure_clean(self, worktree: Path, branch: str) -> str:
         head = self.head(worktree)
