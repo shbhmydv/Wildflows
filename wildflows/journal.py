@@ -176,7 +176,7 @@ class Journal:
         if not raw:
             return j
         complete_end = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
-        records = [r for r in raw[:complete_end].split(b"\n") if r.strip()]
+        records = raw[:complete_end].split(b"\n")[:-1] if complete_end else []
         raws: list[dict[str, object]] = []
         prev_seq = -1
         for i, rec in enumerate(records):

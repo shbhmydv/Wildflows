@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import os
 import shlex
 import signal
@@ -197,6 +198,17 @@ def test_partial_append_failure_fresh_load_repairs_tail_before_continuing(
         Boundary(run_id="run", epoch=0, node_id="n0", phase="closed")
     ) == 1
     assert [event.seq for event in Journal.load(run_dir).events()] == [0, 1]
+
+
+def test_load_rejects_complete_blank_middle_record(tmp_path: Path) -> None:
+    run_dir = tmp_path / "blank-run"
+    journal = Journal(run_dir)
+    journal.append(Boundary(run_id="run", epoch=0, node_id="n0", phase="opened"))
+    with open(run_dir / "events.ndjson", "ab") as fh:
+        fh.write(b"\n")
+    journal.append(Boundary(run_id="run", epoch=0, node_id="n0", phase="closed"))
+    with pytest.raises(json.JSONDecodeError):
+        Journal.load(run_dir)
 
 
 def test_constructor_refuses_existing_nonempty_journal(tmp_path: Path) -> None:
