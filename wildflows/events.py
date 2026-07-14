@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, computed_field, model_validator
 from wildflows.planner import Rails
 from wildflows.result import CommitReceipt, reconcile_outcome
 class _Header(BaseModel):
+    version: Literal[1] = 1
     seq: int = -1
     ts: float = Field(default_factory=time.time)
     run_id: str

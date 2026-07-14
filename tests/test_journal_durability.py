@@ -11,6 +11,7 @@ import pytest
 from wildflows.events import Boundary
 from wildflows.journal import (
     Journal,
+    IncompatibleJournalError,
     JournalCompatibilityError,
     JournalExistsError,
     JournalPoisonedError,
@@ -84,24 +85,22 @@ def test_creation_refuses_to_continue_nonempty_journal(tmp_path: Path) -> None:
         Journal(tmp_path)
 
 
-def test_complete_legacy_shapes_still_fold(tmp_path: Path) -> None:
-    records = [
-        {"seq": 0, "kind": "boundary", "run_id": "r", "epoch": 0,
-         "node_id": "n0", "phase": "opened"},
-        {"seq": 1, "kind": "result", "run_id": "r", "epoch": 0,
-         "node_id": "n0", "ok": True, "files": ["a"]},
-        {"seq": 2, "kind": "integrated", "run_id": "r", "epoch": 0,
-         "node_id": "n0", "commit": "abc", "paths": ["a"]},
-        {"seq": 3, "kind": "boundary", "run_id": "r", "epoch": 0,
-         "node_id": "n0", "phase": "closed"},
-    ]
+@pytest.mark.parametrize("version", [None, 0, 2, "1", True])
+def test_load_refuses_unversioned_or_incompatible_journal(
+    tmp_path: Path, version: object
+) -> None:
+    record: dict[str, object] = {
+        "seq": 0, "kind": "boundary", "run_id": "r", "epoch": 0,
+        "node_id": "n0", "phase": "opened",
+    }
+    if version is not None:
+        record["version"] = version
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "events.ndjson").write_text(
-        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        json.dumps(record) + "\n", encoding="utf-8"
     )
-    loaded = Journal.load(tmp_path)
-    assert loaded.projection.epoch_closed(0)
-    assert loaded.projection.receipts[(0, "n0")].shas == ["abc"]
+    with pytest.raises(IncompatibleJournalError, match="requires v1"):
+        Journal.load(tmp_path)
 
 
 def test_load_refuses_gapped_sequence(tmp_path: Path) -> None:

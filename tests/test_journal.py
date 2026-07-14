@@ -1,6 +1,7 @@
 """The journal: full typed event vocabulary, in-memory list + ndjson, reloadable."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from wildflows.events import (
@@ -57,7 +58,9 @@ def test_ndjson_is_line_per_event(tmp_path: Path) -> None:
     j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="opened"))
     j.append(Boundary(run_id="r", epoch=0, node_id="n0", phase="closed"))
     text = (tmp_path / "events.ndjson").read_text()
-    assert len([ln for ln in text.splitlines() if ln.strip()]) == 2
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    assert json.loads(lines[0])["version"] == 1
 
 
 def test_parse_event_discriminates() -> None:

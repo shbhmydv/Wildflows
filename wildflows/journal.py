@@ -10,6 +10,8 @@ class JournalExistsError(RuntimeError):
     pass
 class JournalCompatibilityError(ValueError):
     pass
+class IncompatibleJournalError(JournalCompatibilityError):
+    """The journal is unversioned or uses a vocabulary this core cannot read."""
 def _fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -77,6 +79,11 @@ class Journal:
         previous = -1
         for position, record in enumerate(records):
             data = json.loads(record.decode("utf-8"))
+            version = data.get("version")
+            if type(version) is not int or version != 1:
+                raise IncompatibleJournalError(
+                    f"journal version {version!r} is incompatible; this core requires v1"
+                )
             event = parse_event(data)
             expected = previous + 1
             if event.seq != expected:
