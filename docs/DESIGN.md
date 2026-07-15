@@ -1846,3 +1846,34 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      Therefore a pre-Hand-35 journal resumes without a hash conflict and receives the
      stronger preamble on a restarted attempt; no event kind or field is added. An
      already memoized old refusal retains its old text, as all durable results do.
+
+### Hand-38 calls — intrinsic dashboard canvas and own outcomes
+
+139. **Text has a card-local containment contract.** Single-line frame, call, gate,
+     and collapsed-row fields clip with ellipsis. Result, error, owner-input, and
+     journal summaries clamp to two lines; their existing expansion affordance opens
+     a bounded, internally scrolling region. Long unbreakable paths, hashes, and
+     provider errors may break anywhere inside that clamp. No expanded stream or
+     summary may grow or paint beyond its owning card.
+
+140. **Intrinsic canvas geometry supersedes Hand-34's wrap-before-shrink call.** A
+     parallel call is one unwrapped row of natural-width sibling subtrees with a 280px
+     minimum column at 100%. The stack determines an unbounded surface width; the
+     canvas pane is only a two-axis viewport onto that surface. Broad calls therefore
+     extend the canvas rather than squeezing or overlapping cards. Calls wider than
+     five tasks still mount the first five slots plus the counted ghost by default;
+     expanding the ghost widens the same row instead of wrapping it.
+
+141. **Canvas navigation changes the viewport, never card geometry.** Empty-canvas
+     dragging pans, ordinary wheel/trackpad input scrolls, and Ctrl/Cmd+wheel scales
+     the surface around the pointer with compensated scroll offsets. The fixed
+     bottom-right cluster provides minus, percentage, plus, and fit-to-width. Zoom is
+     a transform over a separately sized scroll plane; reduced-motion removes its
+     transition without changing its final geometry.
+
+142. **A frame's display state is its own exit outcome.** `frame_exited` alone decides
+     DONE versus FAILED for that frame. A later aggregate `frame_popped(outcome=
+     "failed")` caused by a failed descendant must not repaint an ok parent red; the
+     parent remains DONE and carries a direct `N failed children` count. Dispatch
+     summaries use those same own-outcome states, reserving FAILED chips and red card
+     borders for frames whose own exit failed.
