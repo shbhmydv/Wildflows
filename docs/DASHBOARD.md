@@ -2,11 +2,13 @@
 
 The optional dashboard is a local FastAPI/Uvicorn operator console with a
 framework-free static frontend over v2 `events.ndjson` journals. It discovers the call
-stack from frame and tool-call facts;
-it does not forecast or write engine state. The canvas reads top-down: a frame card,
-then that frame's dispatch rows in call order, with parallel siblings across each row.
-Completed sibling rows collapse together, an in-flight caller is **banked**, and only a
-running leaf breathes. Frame state follows the frame's own exit: an ok frame with failed
+stack from frame and tool-call facts; its display does not forecast or write engine
+state. The canvas reads top-down: a frame
+card, then that frame's dispatch rows in call order, with parallel siblings across each
+row. A nested frame collapses as soon as it is done and its own calls are complete;
+failed frames collapse when their enclosing dispatch returns, and a finished root
+collapses when the run completes. An in-flight caller is **banked**, and only a running
+leaf breathes. Frame state follows the frame's own exit: an ok frame with failed direct
 children remains **done** and shows an `N failed children` chip.
 
 The call stack keeps its natural intrinsic width on an unbounded surface. Parallel

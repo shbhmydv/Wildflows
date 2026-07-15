@@ -1999,3 +1999,22 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      chip tokens. Light uses a 4% tint and dark uses an 8% tint: enough to separate
      nested cards and rows from their ground while keeping state borders and chips the
      dominant, immediately legible color signals.
+
+### Hand-40 calls — final public accuracy sweep
+
+155. **The ship docs name only code-backed surfaces and current UI behavior.** The
+     final sweep corrects: bare conceptual tool names → the three MCP tool names plus
+     their `wildflows_`-prefixed Pi names and exact serial-by-default/parallel semantics;
+     “every effect is a record” → the durable frame/call history is a stream of fsynced
+     records, with all 15 v2 kinds listed including parked `frame_relaunch_blocked`;
+     “short” rig descriptions →
+     nonblank single-line descriptions shown only for currently dispatchable rigs, with
+     the per-kind YAML fields and top-level/CLI notify precedence documented; omitted
+     owner controls → dashboard/CLI ask answering, notify arguments/environment, and
+     replay-without-duplicate-notification; “completed sibling rows/collapsed
+     dispatches” → per-frame collapse-on-done, enclosing-return collapse for failures,
+     finished-root collapse, own-exit coloring, and direct failed-child counts; and
+     synthetic screenshot claims → the real 19-frame self-audit light/dark pair under
+     `selfaudit-*`, with the DF2 and toy captions matched to their current runs. Canvas
+     panning, two-axis scrolling, pointer-centered zoom, fit-to-width, and repeatable
+     dashboard `--repo` usage were rechecked against the shipped frontend and CLI.

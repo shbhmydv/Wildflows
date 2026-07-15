@@ -2,13 +2,15 @@
 
 A v2 frame rig is an agent process that receives a prompt, works in one engine-created
 CWD, can call the run's MCP tools, and exits with final text. Every entry may set an
-optional, short, single-line `description`; the engine shows it beside that registry key
-in frame resource preambles. An entry without `description` renders name-only.
-`rigs.yaml` supports:
+optional, nonblank, single-line `description`; when that rig is currently dispatchable,
+the engine shows it beside the registry key in frame resource preambles. An entry
+without `description` renders name-only. `rigs.yaml` supports:
 
-- `echo`: deterministic no-tool test rig;
-- `shell`: a bounded shell command (useful for test/fake frame binaries);
-- `script`: the production prompt-file adapter contract.
+- `echo`: deterministic no-tool test rig with no kind-specific fields;
+- `shell`: a bounded shell command requiring `template` and positive `timeout_s`;
+- `script`: the production prompt-file adapter contract, requiring `script` and
+  `log_dir`, with optional positive `timeout_s` (default 900), `env`, and
+  `busy_patterns`.
 
 The script contract remains:
 
@@ -60,7 +62,15 @@ provider override bypasses lock creation and acquisition entirely.
 
 ## Example YAML
 
+The top level requires `rigs` and may also set one nonblank, single-line `notify`
+command. `--notify` overrides that YAML value. After each newly journalled owner ask,
+the engine attempts to launch the command detached from the repository root, appending
+the question, frame id, and run id as arguments and setting `WILDFLOWS_QUESTION`,
+`WILDFLOWS_FRAME_ID`, and `WILDFLOWS_RUN_ID`. Exact ask replay does not notify again;
+spawn failure and notifier exit status cannot affect the run.
+
 ```yaml
+# notify: /path/to/owner-notify
 rigs:
   senior:
     kind: script
