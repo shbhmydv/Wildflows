@@ -27,6 +27,8 @@ def test_cli_starts_root_frame_and_resume_reuses_finished_run(
         "echo",
         "--run-id",
         "cli-test",
+        "--notify",
+        "true",
     ]
     first = subprocess.run(base, capture_output=True, text=True, check=True)
     payload = json.loads(first.stdout.splitlines()[-1])

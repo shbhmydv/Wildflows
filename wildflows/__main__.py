@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from pathlib import Path
 
 from wildflows.admission import AdmissionPolicy
-from wildflows.rigconfig import load_rigs
+from wildflows.rigconfig import load_rigs_config
 from wildflows.run import Run
 
 
@@ -18,6 +19,7 @@ def _common(parser: argparse.ArgumentParser, *, resume: bool) -> None:
     parser.add_argument("--run-id", required=resume)
     parser.add_argument("--run-branch")
     parser.add_argument("--worktrees-root", type=Path)
+    parser.add_argument("--notify")
     parser.add_argument("--max-depth", type=int, default=4)
     parser.add_argument("--max-breadth", type=int, default=8)
     parser.add_argument("--max-subtree-frames", type=int, default=64)
@@ -77,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
 
     job: Path = args.job
     rigs: Path = args.rigs or job.parent / "rigs.yaml"
+    registry, configured_notify = load_rigs_config(rigs)
+    notify = args.notify if args.notify is not None else configured_notify
+    notify_command = None if notify is None else shlex.split(notify)
+    if notify is not None and not notify_command:
+        raise ValueError("notify command must not be empty")
     policy = AdmissionPolicy(
         max_depth=args.max_depth,
         max_breadth=args.max_breadth,
@@ -87,12 +94,13 @@ def main(argv: list[str] | None = None) -> int:
     run = Run(
         workdir=args.repo,
         job_spec=job,
-        registry=load_rigs(rigs),
+        registry=registry,
         root_rig=args.root_rig,
         run_id=args.run_id,
         run_branch=args.run_branch,
         policy=policy,
         worktrees_root=args.worktrees_root,
+        notify_command=notify_command,
     )
     print(f"wildflows run_id={run.run_id}")
     if args.command == "resume":

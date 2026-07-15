@@ -63,6 +63,7 @@ class Run:
         run_branch: str | None = None,
         policy: AdmissionPolicy | None = None,
         worktrees_root: Path | None = None,
+        notify_command: list[str] | None = None,
     ) -> None:
         process = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -104,6 +105,7 @@ class Run:
                 run_branch=run_branch,
                 policy=policy,
                 worktrees_root=worktrees_root,
+                notify_command=notify_command,
             )
         except BaseException:
             self._release_lifecycle()

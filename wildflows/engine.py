@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess as _subprocess
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -59,6 +60,16 @@ from wildflows.workspace import (
 )
 
 
+class _NotifierSubprocess:
+    """Patchable notifier process seam, isolated from repository Git subprocesses."""
+
+    Popen = staticmethod(_subprocess.Popen)
+    DEVNULL = _subprocess.DEVNULL
+
+
+subprocess = _NotifierSubprocess()
+
+
 class CallConflictError(ToolProtocolError):
     """A frame reused a logical call index for different content."""
 
@@ -92,10 +103,14 @@ class Engine:
         run_branch: str | None = None,
         policy: AdmissionPolicy | None = None,
         worktrees_root: Path | None = None,
+        notify_command: list[str] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir).resolve()
         self.registry = registry
         self.run_id = run_id
+        self._notify_command = tuple(notify_command or ())
+        if notify_command is not None and not self._notify_command:
+            raise ValueError("notify command must not be empty")
         self._active: dict[str, FrameWorktree] = {}
         self._active_lock = threading.RLock()
         self._integration_lock = threading.RLock()
@@ -1192,13 +1207,15 @@ class Engine:
     ) -> AskResult:
         self.repository.ensure_clean(worktree.path, frame.branch)
         if not replaying:
-            self.journal.append(Asked(
+            asked = Asked(
                 run_id=self.run_id,
                 frame_id=frame.frame_id,
                 call_index=call_index,
                 call_hash=digest,
                 request=request,
-            ))
+            )
+            self.journal.append(asked)
+            self._notify_asked(asked)
         answer_path = self._answer_path(frame.frame_id, call_index)
         with self._answer_condition:
             while not answer_path.is_file():
@@ -1212,6 +1229,40 @@ class Engine:
             answer=answer,
         ))
         return AskResult(answer=answer)
+
+    def _notify_asked(self, asked: Asked) -> None:
+        if not self._notify_command:
+            return
+        environment = {
+            **os.environ,
+            "WILDFLOWS_QUESTION": asked.request.question,
+            "WILDFLOWS_FRAME_ID": asked.frame_id,
+            "WILDFLOWS_RUN_ID": self.run_id,
+            "WILDFLOWS_NOTIFY_QUESTION": asked.request.question,
+            "WILDFLOWS_NOTIFY_FRAME_ID": asked.frame_id,
+            "WILDFLOWS_NOTIFY_RUN_ID": self.run_id,
+        }
+        try:
+            subprocess.Popen(
+                [
+                    *self._notify_command,
+                    asked.request.question,
+                    asked.frame_id,
+                    self.run_id,
+                ],
+                cwd=self.repository.root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except (OSError, ValueError, _subprocess.SubprocessError):
+            # Notification is an owner wakeup hint, never part of run correctness.
+            return
 
     def _answer_path(self, frame_id: str, call_index: int) -> Path:
         safe = frame_id.replace("/", "-")

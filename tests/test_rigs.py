@@ -10,7 +10,7 @@ import pytest
 from tests.conftest import executable
 from wildflows.frame import FrameRuntime
 from wildflows.rig import ScriptRig
-from wildflows.rigconfig import RigsFile, load_rigs
+from wildflows.rigconfig import RigsFile, load_rigs, load_rigs_config
 from wildflows.shim import write_pi_shim
 
 
@@ -342,7 +342,8 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
     executable(tmp_path / "adapter", "#!/bin/sh\ncat \"$4\"\n")
     config = tmp_path / "rigs.yaml"
     config.write_text(
-        """rigs:
+        """notify: owner-notify --urgent
+rigs:
   root:
     kind: script
     script: adapter
@@ -357,6 +358,9 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     registry = load_rigs(config)
+    configured_registry, notify = load_rigs_config(config)
+    assert notify == "owner-notify --urgent"
+    assert configured_registry.names == registry.names
     assert registry.names == frozenset({"root", "local"})
     assert registry.ordered_names == ("root", "local")
     assert registry.description("root") is None

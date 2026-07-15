@@ -65,13 +65,24 @@ RigConfig = Annotated[
 
 
 class RigsFile(BaseModel):
-    """The parsed rigs.yaml: name -> rig config."""
+    """The parsed rigs.yaml: rigs plus optional run-level owner notification."""
 
     rigs: dict[str, RigConfig]
+    notify: str | None = None
+
+    @field_validator("notify")
+    @classmethod
+    def _nonblank_notify(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or "\n" in normalized or "\r" in normalized:
+            raise ValueError("notify command must be a non-blank single line")
+        return normalized
 
 
-def load_rigs(path: Path) -> RigRegistry:
-    """Parse a rigs.yaml; relative script/log paths are relative to that file."""
+def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
+    """Parse rigs and run options; resolve rig paths relative to the YAML file."""
     config_path = Path(path).resolve()
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     parsed = RigsFile.model_validate(data)
@@ -87,4 +98,10 @@ def load_rigs(path: Path) -> RigRegistry:
                 "log_dir": (base / config.log_dir).resolve(),
             })
         built[name] = config.build()
-    return RigRegistry(built, descriptions)
+    return RigRegistry(built, descriptions), parsed.notify
+
+
+def load_rigs(path: Path) -> RigRegistry:
+    """Parse a rigs.yaml while preserving the registry-only compatibility API."""
+    registry, _ = load_rigs_config(path)
+    return registry

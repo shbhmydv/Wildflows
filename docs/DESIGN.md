@@ -1890,14 +1890,14 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      exception. Disconnected-call lifetime (H2) and frame completion reconciliation
      (H4) are consciously deferred rather than folded into lifecycle locking.
 
-140. **Fresh frame refs require durable ownership (closes the H3 guard).** A launch
+144. **Fresh frame refs require durable ownership (closes the H3 guard).** A launch
      with no projected `frame_pushed` owner refuses a pre-existing deterministic frame
      ref with typed `FrameOwnershipError` before worktree creation or rig execution;
      only a projected frame may enter resume mode. The branch-format digest rename and
      deeper resumed-tip validation recommended by H3 are consciously deferred because
      UUID run ids make the naming collision itself a non-issue for the configured use.
 
-141. **Projection transactions serialize complete live decisions (closes audit M1).**
+145. **Projection transactions serialize complete live decisions (closes audit M1).**
      The journal append lock is now also the explicit projection transaction lock, with
      engine coordination locks ordered outside it. Call-frontier checks, ancestor and
      descendant admission reads plus reservation mutation, dispatch child/replay scans,
@@ -1906,7 +1906,7 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      transition validation/append poisoning (M4) remains consciously deferred; this call
      closes concurrent access to the existing projection vocabulary, not its validation.
 
-142. **Serial and parallel child-launch faults share one durable boundary (closes
+146. **Serial and parallel child-launch faults share one durable boundary (closes
      audit M5).** Both traversal modes classify an ordinary failure before any durable
      `frame_pushed` as the same failed `ChildResult`, allowing the enclosing dispatch
      return to memoize it. An unexpected failure after a push is not guessed safe: the
@@ -1914,7 +1914,7 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      fail-closed. Full frame-completion certification (H4) and semantic journal
      transition poisoning (M4) remain consciously deferred.
 
-143. **The configured repository is the sole checked-out root owner (closes audit
+147. **The configured repository is the sole checked-out root owner (closes audit
      M6).** Root unwind accepts the run ref only when it is unowned (the existing
      compare-and-swap path) or checked out by the repository worktree configured for
      this run. A different linked-worktree owner raises typed
@@ -1923,7 +1923,7 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      contract. Broader pending-intent/receipt resume validation from M2 remains
      consciously deferred.
 
-144. **Reapplied integration candidates stay referenced (closes the M2 temp-ref
+148. **Reapplied integration candidates stay referenced (closes the M2 temp-ref
      slice).** Before removing a detached sibling-reapply worktree, the repository
      publishes its candidate under a deterministic run/frame temporary ref. That ref
      survives intent append, target advance, and durable `frame_integrated`, then is
@@ -1932,9 +1932,17 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      The audit's deeper pending/completed receipt, candidate-equality, and target-owner
      resume validation extension is consciously deferred.
 
-145. **Frame preambles name agent-authored control-flow shapes (owner-directed;
+149. **Frame preambles name agent-authored control-flow shapes (owner-directed;
      no audit finding).** The tools block now states that sequences are consecutive
      dispatches, loops are caller-owned redispatch, and fan-out is one parallel
      multi-task dispatch, with dependency-based guidance for choosing serial versus
      parallel. This adds vocabulary only: engine-owned loop/sequence primitives remain
      consciously out of scope, preserving the v2 frame model.
+
+150. **Durable asks may emit a best-effort owner wakeup (owner hook #65; no audit
+     finding).** A top-level `rigs.yaml` `notify` command or overriding CLI `--notify`
+     becomes run configuration. Immediately after each new `asked` append, the engine
+     starts that command detached with question, frame id, and run id in both argv and
+     named environment variables; exact ask replay emits no duplicate. Spawn failure or
+     nonzero notifier exit cannot affect the run. Delivery acknowledgement, retry, and
+     a second durable notification vocabulary are consciously not introduced.
