@@ -143,7 +143,6 @@ class Engine:
                 requested = run_branch.removeprefix("refs/heads/")
                 if requested != opened.run_branch:
                     raise ValueError("resumed run branch differs from durable run")
-            self._verify_integrations()
         else:
             self.policy = policy or AdmissionPolicy()
             self.repository = Repository(
@@ -168,6 +167,9 @@ class Engine:
                 started_at=started,
                 policy=self.policy,
             ))
+        self._sweep_integration_refs()
+        if continuing:
+            self._verify_integrations()
         self.skill_library = SkillLibrary(self.repository.root)
         self._restore_dispatch_reservations()
         self.server = MCPServer(self)
@@ -175,6 +177,17 @@ class Engine:
     @property
     def projection(self) -> RunProjection:
         return self.journal.projection
+
+    def _sweep_integration_refs(self) -> None:
+        with self.journal.projection_transaction() as projection:
+            retained = {
+                self.repository.integration_ref(frame.frame_id)
+                for frame in projection.frames.values()
+                if frame.integrating is not None
+            }
+        for ref in self.repository.integration_refs():
+            if ref not in retained:
+                self.repository.delete_integration_ref(ref)
 
     def _verify_integrations(self) -> None:
         for frame in self.journal.projection.frames.values():
@@ -1061,6 +1074,7 @@ class Engine:
                 target_worktree = owner
             elif target_worktree is None:
                 target_worktree = self.repository.checked_out_owner(target_ref)
+            temporary_ref = self.repository.integration_ref(frame_id)
             intent = frame.integrating
             if intent is None:
                 source = self.repository.receipt(frame.base_commit, frame.head)
@@ -1075,7 +1089,9 @@ class Engine:
                     landed = source
                 else:
                     candidate, landed = self.repository.reapply(
-                        source.commits, moving_base
+                        source.commits,
+                        moving_base,
+                        temporary_ref=temporary_ref,
                     )
                 intent = FrameIntegrating(
                     run_id=self.run_id,
@@ -1103,6 +1119,8 @@ class Engine:
                 landed_commits=intent.landed_commits,
             )
             self.journal.append(integrated)
+            if self.repository.ref_exists(temporary_ref):
+                self.repository.delete_integration_ref(temporary_ref)
             return integrated
 
     def _pop_once(self, frame: FrameProjection, outcome: FrameOutcome) -> None:

@@ -1922,3 +1922,12 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      touching that owner. Child integration retains its explicit active-parent-worktree
      contract. Broader pending-intent/receipt resume validation from M2 remains
      consciously deferred.
+
+144. **Reapplied integration candidates stay referenced (closes the M2 temp-ref
+     slice).** Before removing a detached sibling-reapply worktree, the repository
+     publishes its candidate under a deterministic run/frame temporary ref. That ref
+     survives intent append, target advance, and durable `frame_integrated`, then is
+     deleted. Construction sweeps run-scoped refs with no pending durable intent (and
+     leftovers whose integration completed), while retaining refs for pending intents.
+     The audit's deeper pending/completed receipt, candidate-equality, and target-owner
+     resume validation extension is consciously deferred.

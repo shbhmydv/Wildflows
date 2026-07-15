@@ -118,6 +118,42 @@ class Repository:
         safe_frame = re.sub(r"[^A-Za-z0-9._-]", "-", frame_id)[:120] or "frame"
         return f"refs/heads/wildflows/{safe_run}/{safe_frame}"
 
+    @property
+    def _integration_ref_prefix(self) -> str:
+        run_key = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:24]
+        return f"refs/wildflows/integration/{run_key}/"
+
+    def integration_ref(self, frame_id: str) -> str:
+        frame_key = hashlib.sha256(frame_id.encode("utf-8")).hexdigest()
+        return f"{self._integration_ref_prefix}{frame_key}"
+
+    def integration_refs(self) -> list[str]:
+        output = self.git(
+            ["for-each-ref", "--format=%(refname)", self._integration_ref_prefix]
+        ).stdout
+        return [ref for ref in output.splitlines() if ref]
+
+    def publish_integration_ref(self, ref: str, candidate: str) -> None:
+        if not ref.startswith(self._integration_ref_prefix):
+            raise RepositoryError(f"temporary integration ref is outside this run: {ref}")
+        if self.ref_exists(ref):
+            if self.branch_tip(ref) == candidate:
+                return
+            raise RepositoryError(f"temporary integration ref already exists: {ref}")
+        process = self.git(
+            ["update-ref", ref, candidate, "0" * 40], check=False
+        )
+        if process.returncode != 0:
+            detail = process.stderr.strip() or process.stdout.strip()
+            raise RepositoryError(
+                f"could not publish temporary integration ref {ref!r}: {detail}"
+            )
+
+    def delete_integration_ref(self, ref: str) -> None:
+        if not ref.startswith(self._integration_ref_prefix):
+            raise RepositoryError(f"temporary integration ref is outside this run: {ref}")
+        self.git(["update-ref", "-d", ref], check=False)
+
     def ref_exists(self, ref: str) -> bool:
         return self.git(["show-ref", "--verify", "--quiet", ref], check=False).returncode == 0
 
@@ -308,7 +344,11 @@ class Repository:
         return owners[0]
 
     def reapply(
-        self, source: list[CommitReceipt], moving_base: str
+        self,
+        source: list[CommitReceipt],
+        moving_base: str,
+        *,
+        temporary_ref: str | None = None,
     ) -> tuple[str, IntegrationReceipt]:
         path = self.worktrees_root / f"integrate-{uuid4().hex}"
         self.git(["worktree", "add", "--detach", str(path), moving_base])
@@ -325,6 +365,8 @@ class Repository:
             receipt = self.receipt(moving_base, candidate)
             if [item.paths for item in receipt.commits] != [item.paths for item in source]:
                 raise IntegrationError("sibling reapply changed its owned path set")
+            if temporary_ref is not None:
+                self.publish_integration_ref(temporary_ref, candidate)
             return candidate, receipt
         finally:
             self.remove_worktree(temporary)
