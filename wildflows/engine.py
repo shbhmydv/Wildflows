@@ -23,6 +23,7 @@ from wildflows.events import (
     FrameIntegrating,
     FramePopped,
     FramePushed,
+    FrameRelaunchBlocked,
     GateCalled,
     GateReturned,
     RunFinished,
@@ -82,6 +83,21 @@ class FrameNotActiveError(ToolProtocolError):
 
 class FrameCallJoinTimeoutError(RuntimeError):
     """A frame's effectful MCP worker did not acknowledge cancellation."""
+
+
+class FrameRelaunchBlockedError(RuntimeError):
+    """An outcome-less frame branch contains effects the journal cannot explain."""
+
+    def __init__(self, frame_id: str, expected_tip: str, found_tip: str) -> None:
+        self.frame_id = frame_id
+        self.expected_tip = expected_tip
+        self.found_tip = found_tip
+        super().__init__(
+            f"frame {frame_id!r} relaunch parked: expected journal-explained tip "
+            f"{expected_tip}, found {found_tip}; crash-window suspected. Operator: "
+            "inspect the frame branch, manually disposition or reset the unexplained "
+            "commit, then resume"
+        )
 
 
 FRAME_CALL_JOIN_TIMEOUT_S = 5.0
@@ -257,6 +273,7 @@ class Engine:
             )
         opened = self.journal.projection.opened
         assert opened is not None
+        self._raise_active_relaunch_block()
         with self.server:
             root = self.journal.projection.frames.get(self.ROOT_FRAME_ID)
             if root is None or root.outcome is None:
@@ -932,6 +949,79 @@ class Engine:
             commits=commits,
         )
 
+    @staticmethod
+    def _explained_frame_tips(
+        projection: RunProjection, frame_id: str
+    ) -> tuple[str, set[str]]:
+        """Return the canonical and currently allowed journal-explained tips."""
+        frame = projection.frame(frame_id)
+        completed_tip = frame.base_commit
+        pending: FrameIntegrating | None = None
+        for event in projection.effective_events:
+            if (
+                isinstance(event, FrameIntegrating)
+                and event.target_frame_id == frame_id
+                and event.integration_base == completed_tip
+            ):
+                pending = event
+            elif (
+                isinstance(event, FrameIntegrated)
+                and event.target_frame_id == frame_id
+                and (
+                    event.integration_base == completed_tip
+                    or (
+                        pending is not None
+                        and event.integration_base == pending.integration_base
+                        and event.candidate_head == pending.candidate_head
+                    )
+                )
+            ):
+                completed_tip = event.candidate_head
+                pending = None
+        if pending is None:
+            return completed_tip, {completed_tip}
+        return pending.candidate_head, {
+            pending.integration_base,
+            pending.candidate_head,
+        }
+
+    def _guard_frame_relaunch(
+        self, projection: RunProjection, frame: FrameProjection
+    ) -> None:
+        expected_tip, allowed = self._explained_frame_tips(
+            projection, frame.frame_id
+        )
+        found_tip = self.repository.branch_tip(frame.branch)
+        if found_tip in allowed:
+            return
+        error = FrameRelaunchBlockedError(
+            frame.frame_id, expected_tip, found_tip
+        )
+        blocked = frame.relaunch_blocked
+        if (
+            blocked is None
+            or blocked.expected_tip != expected_tip
+            or blocked.found_tip != found_tip
+        ):
+            self.journal.append(FrameRelaunchBlocked(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                expected_tip=expected_tip,
+                found_tip=found_tip,
+                message=str(error),
+            ))
+        raise error
+
+    def _raise_active_relaunch_block(self) -> None:
+        with self.journal.projection_transaction() as projection:
+            blocked = [
+                frame
+                for frame in projection.frames.values()
+                if frame.outcome is None and frame.relaunch_blocked is not None
+            ]
+            for frame in blocked:
+                self._guard_frame_relaunch(projection, frame)
+
     def _launch_frame(
         self,
         *,
@@ -959,6 +1049,8 @@ class Engine:
                 raise FrameOwnershipError(
                     f"frame branch {branch!r} exists without a durable frame owner"
                 )
+            if existing is not None and existing.outcome is None:
+                self._guard_frame_relaunch(projection, existing)
             resume = existing is not None
         if existing is not None:
             # A same-process retry after a bounded join timeout must rejoin the
@@ -1057,6 +1149,7 @@ class Engine:
             # MCP validation transfers lifetime ownership to the engine. No frame
             # effect below may race a detached worker from this attempt.
             self._join_frame_calls(frame_id)
+            self._raise_active_relaunch_block()
             if result.outcome == "ok":
                 try:
                     head = self.repository.commit_all(

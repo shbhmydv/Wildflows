@@ -120,6 +120,16 @@ class CallFailed(_Header):
     result: ToolFailure
 
 
+class FrameRelaunchBlocked(_Header):
+    """Durable fail-closed diagnosis for an outcome-less advanced frame branch."""
+
+    kind: Literal["frame_relaunch_blocked"] = "frame_relaunch_blocked"
+    frame_id: str
+    expected_tip: str
+    found_tip: str
+    message: str
+
+
 class FrameExited(_Header):
     kind: Literal["frame_exited"] = "frame_exited"
     frame_id: str
@@ -178,6 +188,7 @@ Event: TypeAlias = Annotated[
     | Asked
     | Answered
     | CallFailed
+    | FrameRelaunchBlocked
     | FrameExited
     | FrameIntegrating
     | FrameIntegrated

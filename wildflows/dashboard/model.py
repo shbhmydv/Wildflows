@@ -101,7 +101,10 @@ class DashboardModel:
     def _run_state(projection: RunProjection) -> str:
         if projection.finished is not None:
             return "completed" if projection.finished.outcome == "ok" else "failed"
-        if projection.pending_questions():
+        if projection.pending_questions() or any(
+            frame.relaunch_blocked is not None
+            for frame in projection.frames.values()
+        ):
             return "parked"
         return "running"
 
@@ -213,6 +216,8 @@ class DashboardModel:
         own_outcome = own_outcomes.get(frame.frame_id)
         if own_outcome is not None:
             return "done" if own_outcome == "ok" else "failed"
+        if frame.relaunch_blocked is not None:
+            return "parked"
         if self._pending_ask(frame.frame_id, projection) is not None:
             return "parked"
         if self._pending_dispatch(frame.frame_id, projection) is not None:
@@ -338,6 +343,20 @@ class DashboardModel:
 
     def _state_line(self, projection: RunProjection, frames: list[dict[str, object]]) -> str:
         root_id = projection.opened.root_frame_id if projection.opened is not None else "f0"
+        blocked = sorted(
+            (
+                frame
+                for frame in projection.frames.values()
+                if frame.relaunch_blocked is not None
+            ),
+            key=lambda frame: (frame.depth, frame.frame_id),
+        )
+        if blocked:
+            frame = blocked[0]
+            return (
+                f"{self._frame_path(frame.frame_id)} parked · "
+                "unexplained frame branch advancement"
+            )
         pending_asks = projection.pending_questions()
         if pending_asks:
             selected = pending_asks[0]

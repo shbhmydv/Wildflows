@@ -15,6 +15,7 @@ from wildflows.events import (
     FrameIntegrating,
     FramePopped,
     FramePushed,
+    FrameRelaunchBlocked,
     GateCalled,
     GateReturned,
     RunFinished,
@@ -51,6 +52,7 @@ class FrameProjection:
     stderr: str = ""
     head: str | None = None
     exited_seq: int = -1
+    relaunch_blocked: FrameRelaunchBlocked | None = None
     integrating: FrameIntegrating | None = None
     integrated: FrameIntegrated | None = None
     popped: bool = False
@@ -107,6 +109,7 @@ class RunProjection:
             current.push_count += 1
             current.worktree = event.worktree
             current.popped = False
+            current.relaunch_blocked = None
         elif isinstance(event, (DispatchCalled, GateCalled, Asked)):
             if isinstance(event, DispatchCalled):
                 tool: ToolName = "dispatch"
@@ -156,6 +159,8 @@ class RunProjection:
                 self.calls[key] = failed_call
             failed_call.response = event.result
             failed_call.finished_seq = event.seq
+        elif isinstance(event, FrameRelaunchBlocked):
+            self.frames[event.frame_id].relaunch_blocked = event
         elif isinstance(event, FrameExited):
             frame = self.frames[event.frame_id]
             frame.outcome = event.outcome

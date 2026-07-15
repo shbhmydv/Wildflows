@@ -1967,3 +1967,18 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      process work itself remains governed by its larger rig/subtree timeout. Arbitrary
      external-effect exactly-once remains deferred, as does audit H4's full frame
      completion-certificate/reconciliation subsystem.
+
+152. **Outcome-less relaunch refuses unexplained branch advancement (closes the audit
+     H4 guard only).** Before stale-owner cleanup, resume-worktree creation, another
+     `frame_pushed`, or rig execution, both root and child relaunch compare the frame ref
+     with the journal-explained frontier: its recorded `base_commit`, each completed
+     child-integration candidate in order, and either side of a still-pending durable
+     integration intent. A third tip appends one typed `frame_relaunch_blocked` fact and
+     raises `FrameRelaunchBlockedError` naming frame, canonical expected tip, and found
+     tip. The run remains without `run_finished`, and subsequent resumes fail before any
+     rig rerun while the mystery tip remains; the dashboard reports the durable block as
+     parked. An operator inspects the branch and may manually reset/disposition it, after
+     which the existing outcome-less replay path proceeds. This is deliberately not a
+     completion certificate: automatic recovery of the commit-to-`frame_exited` window,
+     rig-result reconciliation, and arbitrary external-effect exactly-once remain
+     deferred and require the full H4 certificate/idempotency protocol.
