@@ -7,6 +7,11 @@ const el = (tag, className, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
+const FRAME_COLUMN_MIN = 260;
+const CALL_COLUMN_GAP = 8;
+const CALL_COLUMN_LIMIT = 5;
+let callLayoutFrame = null;
+
 const state = {
   runs: [],
   repositories: [],
@@ -278,10 +283,38 @@ function parentCall(frame) {
   return parent?.calls.find(call => call.call_index === frame.parent_call_index) || null;
 }
 
+function fullyDone(frame) {
+  return frame.state === "done" && frame.calls.every(call => call.status === "completed");
+}
+
 function defaultCollapsed(frame) {
+  const nested = frame.frame_id !== state.run.root_frame_id;
+  if (nested && fullyDone(frame)) return true;
   if (!["done", "failed"].includes(frame.state)) return false;
   const call = parentCall(frame);
-  return call?.status === "completed" || (frame.frame_id === state.run.root_frame_id && !state.run.active);
+  return call?.status === "completed" || (!nested && !state.run.active);
+}
+
+function layoutCallRows(root) {
+  root.querySelectorAll(".call-children:not(.serial)").forEach(row => {
+    const slots = row.children.length;
+    if (!slots) return;
+    const available = row.parentElement?.clientWidth || FRAME_COLUMN_MIN;
+    const fit = Math.max(1, Math.floor((available + CALL_COLUMN_GAP) / (FRAME_COLUMN_MIN + CALL_COLUMN_GAP)));
+    const columns = Math.min(slots, CALL_COLUMN_LIMIT, fit);
+    const minimum = columns * FRAME_COLUMN_MIN + (columns - 1) * CALL_COLUMN_GAP;
+    row.dataset.columns = String(columns);
+    row.style.setProperty("--call-columns", String(columns));
+    row.style.setProperty("--call-row-min", `${minimum}px`);
+  });
+}
+
+function scheduleCallRowLayout() {
+  if (callLayoutFrame !== null) window.cancelAnimationFrame(callLayoutFrame);
+  callLayoutFrame = window.requestAnimationFrame(() => {
+    callLayoutFrame = null;
+    layoutCallRows($("#canvas"));
+  });
 }
 
 function renderCanvas() {
@@ -296,6 +329,7 @@ function renderCanvas() {
   const root = el("div", "stack-root");
   root.append(renderFrame(state.canvasRoot, 0));
   target.append(root);
+  layoutCallRows(root);
 }
 
 function ancestors(frameId) {
@@ -330,10 +364,11 @@ function rebase(frameId) {
 
 function renderFrame(frameId, relativeDepth) {
   const frame = state.run.frames[frameId];
-  const node = el("section", "frame-node");
-  node.dataset.frame = frameId;
   const collapsed = defaultCollapsed(frame) && !state.expandedFrames.has(frameId);
+  const node = el("section", `frame-node frame-card ${frame.state}${collapsed ? " collapsed-container" : ""}`);
+  node.dataset.frame = frameId;
   node.append(collapsed ? renderCollapsedFrame(frame) : renderFullFrame(frame));
+  if (collapsed) return node;
   if (relativeDepth >= 3 && frame.calls.length) {
     const drill = el("button", "drill-button", `drill in · rebase on ${frame.path}`);
     drill.type = "button";
@@ -341,7 +376,7 @@ function renderFrame(frameId, relativeDepth) {
     node.append(drill);
     return node;
   }
-  if (!collapsed && relativeDepth < 3 && frame.calls.length) {
+  if (frame.calls.length) {
     const calls = el("div", "frame-calls");
     for (const call of frame.calls) calls.append(renderCall(frame, call, relativeDepth));
     node.append(calls);
@@ -358,7 +393,7 @@ function timed(target, frame) {
 }
 
 function renderCollapsedFrame(frame) {
-  const card = el("button", `frame-card collapsed ${frame.state}`);
+  const card = el("button", "frame-summary collapsed");
   card.type = "button";
   card.title = `Expand ${frame.path}`;
   const result = frame.state === "failed" ? frame.reason : firstLine(frame.text, "completed");
@@ -368,7 +403,7 @@ function renderCollapsedFrame(frame) {
 }
 
 function renderFullFrame(frame) {
-  const card = el("article", `frame-card ${frame.state}`);
+  const card = el("div", "frame-summary");
   const collapsible = defaultCollapsed(frame) && state.expandedFrames.has(frame.frame_id);
   const top = el(collapsible ? "button" : "div", `frame-top${collapsible ? " frame-toggle" : ""}`);
   if (collapsible) top.type = "button";
@@ -420,6 +455,7 @@ function renderCall(frame, call, relativeDepth) {
   const all = dispatchSlots(call);
   const visible = expanded || all.length <= 5 ? all : all.slice(0, 5);
   const children = el("div", `call-children${call.parallel ? "" : " serial"}${expanded ? " full-grid" : ""}`);
+  children.dataset.slots = String(all.length);
   for (const slot of visible) {
     children.append(slot.frameId ? renderFrame(slot.frameId, relativeDepth + 1) : renderQueued(slot));
   }
@@ -445,7 +481,7 @@ function dispatchSlots(call) {
 }
 
 function renderQueued(slot) {
-  const card = el("article", "frame-card queued");
+  const card = el("article", "frame-node frame-card queued");
   const top = el("div", "frame-top");
   top.append(dot("queued"), el("span", "frame-path", `task ${slot.index}`), el("span", "state-chip", "queued"));
   card.append(top, el("p", "frame-prompt", slot.task));
@@ -640,6 +676,7 @@ $("#token-form").addEventListener("submit", event => {
   toast("Control token saved for this tab");
 });
 window.addEventListener("beforeunload", closeStream);
+window.addEventListener("resize", scheduleCallRowLayout);
 window.setInterval(updateLiveClocks, 1000);
 applyQueryTheme();
 updateThemeButton();

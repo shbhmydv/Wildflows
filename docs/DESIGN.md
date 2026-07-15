@@ -1796,3 +1796,25 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      and rate-limit behavior with local model/effort defaults. The small shell body is
      duplicated rather than factored so `worker-picodex.sh` and its existing
      environment/default contract remain byte-for-byte unchanged.
+
+### Hand-34 calls — recursive dashboard containment
+
+133. **A frame card owns its rendered call subtree.** The card boundary encloses
+     the frame summary and every dispatch, gate, and ask row emitted by that frame.
+     Dispatch children are card descendants of their owning call row, recursively,
+     so borders and spacing expose ancestry without connector inference. Parked asks
+     remain ordinary in-flow blocks inside that same boundary.
+
+134. **Parallel geometry wraps before it shrinks.** A mounted call row derives an
+     equal-column count from its containing card at a 260px minimum, an 8px gap, and
+     a five-column wrap ceiling. Its intrinsic width can exceed the pane when nested
+     content requires it; only the canvas owns horizontal scrolling, while both the
+     card and canvas grow vertically with normal document flow. No card geometry is
+     absolutely positioned.
+
+135. **A collapsed container is one slim row.** A fully-done nested frame may
+     collapse independently of unfinished siblings, and completed dispatch rows
+     retain their existing collapse behavior. Collapse removes the complete call
+     interior, including a depth-cutoff drill affordance; clicking the row restores
+     the same contained subtree. Depth remains capped at three relative levels and
+     drill-in still rebases the canvas root.

@@ -319,7 +319,17 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     assert dark == _DARK_TOKENS
     assert automatic_dark == _DARK_TOKENS
     assert "border-left" not in css
+    assert "const FRAME_COLUMN_MIN = 260;" in javascript
     assert (
-        ".call-children.full-grid { grid-template-columns: "
-        "repeat(6, minmax(105px, 1fr)); }"
+        'const node = el("section", `frame-node frame-card ${frame.state}'
+        '${collapsed ? " collapsed-container" : ""}`);'
+    ) in javascript
+    assert 'node.append(calls);' in javascript
+    assert "if (collapsed) return node;" in javascript
+    assert ".canvas { min-height: 0; overflow-x: auto; overflow-y: auto;" in css
+    assert (
+        "grid-template-columns: repeat(var(--call-columns), "
+        "minmax(260px, 1fr));"
     ) in css
+    assert ".frame-card.collapsed-container { padding: 0; }" in css
+    assert ".ask-card { position: absolute" not in css
