@@ -260,54 +260,60 @@ class Engine:
         key = (frame_id, call_index)
         with self._call_condition:
             while True:
-                existing = self.journal.projection.call(frame_id, call_index)
-                if existing is not None:
-                    if existing.tool != tool or existing.call_hash != digest:
-                        raise CallConflictError(
-                            f"call {frame_id}:{call_index} content differs from its durable call"
-                        )
-                    if existing.response is not None:
-                        return existing.response
-                leader = self._inflight_calls.get(key)
-                if leader is not None:
-                    if leader != (tool, digest):
-                        raise CallConflictError(
-                            f"call {frame_id}:{call_index} conflicts with its live call"
-                        )
+                wait_for_leader = False
+                with self.journal.projection_transaction() as projection:
+                    existing = projection.call(frame_id, call_index)
+                    if existing is not None:
+                        if existing.tool != tool or existing.call_hash != digest:
+                            raise CallConflictError(
+                                f"call {frame_id}:{call_index} content differs from its durable call"
+                            )
+                        if existing.response is not None:
+                            return existing.response
+                    leader = self._inflight_calls.get(key)
+                    if leader is not None:
+                        if leader != (tool, digest):
+                            raise CallConflictError(
+                                f"call {frame_id}:{call_index} conflicts with its live call"
+                            )
+                        wait_for_leader = True
+                    elif any(
+                        owner == frame_id and index < call_index
+                        for owner, index in self._inflight_calls
+                    ):
+                        wait_for_leader = True
+                    else:
+                        lower_pending = [
+                            call
+                            for (owner, index), call in projection.calls.items()
+                            if owner == frame_id
+                            and index < call_index
+                            and not call.completed
+                        ]
+                        if lower_pending:
+                            lower_live = any(
+                                (frame_id, call.call_index) in self._inflight_calls
+                                for call in lower_pending
+                            )
+                            if lower_live:
+                                wait_for_leader = True
+                            else:
+                                raise CallConflictError(
+                                    "an earlier durable call is pending; replay it before later calls"
+                                )
+                        elif (
+                            existing is None
+                            and call_index != projection.next_call_index(frame_id)
+                        ):
+                            raise CallConflictError(
+                                f"call {frame_id}:{call_index} is not the next logical call"
+                            )
+                        else:
+                            self._inflight_calls[key] = (tool, digest)
+                            replaying = existing is not None
+                            break
+                if wait_for_leader:
                     self._call_condition.wait()
-                    continue
-                if any(
-                    owner == frame_id and index < call_index
-                    for owner, index in self._inflight_calls
-                ):
-                    self._call_condition.wait()
-                    continue
-                lower_pending = [
-                    call
-                    for (owner, index), call in self.journal.projection.calls.items()
-                    if owner == frame_id and index < call_index and not call.completed
-                ]
-                if lower_pending:
-                    lower_live = any(
-                        (frame_id, call.call_index) in self._inflight_calls
-                        for call in lower_pending
-                    )
-                    if lower_live:
-                        self._call_condition.wait()
-                        continue
-                    raise CallConflictError(
-                        "an earlier durable call is pending; replay it before later calls"
-                    )
-                if (
-                    existing is None
-                    and call_index != self.journal.projection.next_call_index(frame_id)
-                ):
-                    raise CallConflictError(
-                        f"call {frame_id}:{call_index} is not the next logical call"
-                    )
-                self._inflight_calls[key] = (tool, digest)
-                replaying = existing is not None
-                break
         try:
             if tool == "dispatch":
                 if not isinstance(request, DispatchRequest):
@@ -422,37 +428,40 @@ class Engine:
         return returned
 
     def _ancestor_ids(self, frame: FrameProjection) -> list[str]:
-        ancestors: list[str] = []
-        current: FrameProjection | None = frame
-        while current is not None:
-            ancestors.append(current.frame_id)
-            current = (
-                None
-                if current.parent_frame_id is None
-                else self.journal.projection.frame(current.parent_frame_id)
-            )
-        return ancestors
+        with self.journal.projection_transaction() as projection:
+            ancestors: list[str] = []
+            current: FrameProjection | None = frame
+            while current is not None:
+                ancestors.append(current.frame_id)
+                current = (
+                    None
+                    if current.parent_frame_id is None
+                    else projection.frame(current.parent_frame_id)
+                )
+            return ancestors
 
     def _subtree_admission_usage(self, frame_id: str) -> tuple[int, float]:
-        descendants = self.journal.projection.descendants(frame_id)
-        frames = len(descendants) + self._reservation_frames.get(frame_id, 0)
-        spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
-        spend += self._reservation_spend.get(frame_id, 0.0)
-        return frames, spend
+        with self.journal.projection_transaction() as projection:
+            descendants = projection.descendants(frame_id)
+            frames = len(descendants) + self._reservation_frames.get(frame_id, 0)
+            spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
+            spend += self._reservation_spend.get(frame_id, 0.0)
+            return frames, spend
 
     def _admission_headroom(self, frame: FrameProjection) -> _AdmissionHeadroom:
-        remaining_frames: list[int] = []
-        remaining_spend: list[float] = []
-        for ancestor_id in self._ancestor_ids(frame):
-            frames, spend = self._subtree_admission_usage(ancestor_id)
-            remaining_frames.append(self.policy.max_subtree_frames - frames)
-            remaining_spend.append(self.policy.max_subtree_spend - spend)
-        return _AdmissionHeadroom(
-            remaining_depth=max(0, self.policy.max_depth - frame.depth),
-            max_parallel_width=self.policy.max_breadth,
-            remaining_frames=max(0, min(remaining_frames)),
-            remaining_spend=max(0.0, min(remaining_spend)),
-        )
+        with self.journal.projection_transaction():
+            remaining_frames: list[int] = []
+            remaining_spend: list[float] = []
+            for ancestor_id in self._ancestor_ids(frame):
+                frames, spend = self._subtree_admission_usage(ancestor_id)
+                remaining_frames.append(self.policy.max_subtree_frames - frames)
+                remaining_spend.append(self.policy.max_subtree_spend - spend)
+            return _AdmissionHeadroom(
+                remaining_depth=max(0, self.policy.max_depth - frame.depth),
+                max_parallel_width=self.policy.max_breadth,
+                remaining_frames=max(0, min(remaining_frames)),
+                remaining_spend=max(0.0, min(remaining_spend)),
+            )
 
     def _dispatchable_rig_names(
         self,
@@ -473,35 +482,36 @@ class Engine:
 
     def _restore_dispatch_reservations(self) -> None:
         """Rebuild unconsumed admission reservations from durable pending calls."""
-        for call in self.journal.projection.calls.values():
-            if call.completed or call.tool != "dispatch":
-                continue
-            request = call.request
-            if not isinstance(request, DispatchRequest):
-                raise RuntimeError("dispatch call projection has the wrong request type")
-            launched = {
-                child.task_index
-                for child in self.journal.projection.frames.values()
-                if child.parent_frame_id == call.frame_id
-                and child.parent_call_index == call.call_index
-                and child.task_index is not None
-            }
-            remaining = len(request.tasks) - len(launched)
-            if remaining <= 0:
-                continue
-            frame = self.journal.projection.frame(call.frame_id)
-            ancestors = self._ancestor_ids(frame)
-            spend = remaining * self.policy.rig_cost(request.rig)
-            for ancestor_id in ancestors:
-                self._reservation_frames[ancestor_id] = (
-                    self._reservation_frames.get(ancestor_id, 0) + remaining
+        with self.journal.projection_transaction() as projection:
+            for call in projection.calls.values():
+                if call.completed or call.tool != "dispatch":
+                    continue
+                request = call.request
+                if not isinstance(request, DispatchRequest):
+                    raise RuntimeError("dispatch call projection has the wrong request type")
+                launched = {
+                    child.task_index
+                    for child in projection.frames.values()
+                    if child.parent_frame_id == call.frame_id
+                    and child.parent_call_index == call.call_index
+                    and child.task_index is not None
+                }
+                remaining = len(request.tasks) - len(launched)
+                if remaining <= 0:
+                    continue
+                frame = projection.frame(call.frame_id)
+                ancestors = self._ancestor_ids(frame)
+                spend = remaining * self.policy.rig_cost(request.rig)
+                for ancestor_id in ancestors:
+                    self._reservation_frames[ancestor_id] = (
+                        self._reservation_frames.get(ancestor_id, 0) + remaining
+                    )
+                    self._reservation_spend[ancestor_id] = (
+                        self._reservation_spend.get(ancestor_id, 0.0) + spend
+                    )
+                self._dispatch_reservations[(call.frame_id, call.call_index)] = (
+                    ancestors, remaining, spend
                 )
-                self._reservation_spend[ancestor_id] = (
-                    self._reservation_spend.get(ancestor_id, 0.0) + spend
-                )
-            self._dispatch_reservations[(call.frame_id, call.call_index)] = (
-                ancestors, remaining, spend
-            )
 
     def _admit_and_reserve(
         self,
@@ -509,65 +519,68 @@ class Engine:
         call_index: int,
         request: DispatchRequest,
     ) -> None:
-        ancestors = self._ancestor_ids(frame)
-        for ancestor_id in ancestors:
-            ancestor = self.journal.projection.frame(ancestor_id)
-            frames, spend = self._subtree_admission_usage(ancestor_id)
-            admit_dispatch(
-                request,
-                caller_depth=frame.depth,
-                subtree_frames=frames,
-                subtree_spend=spend,
-                subtree_deadline=ancestor.subtree_deadline,
-                policy=self.policy,
-                registry=self.registry,
+        with self.journal.projection_transaction() as projection:
+            ancestors = self._ancestor_ids(frame)
+            for ancestor_id in ancestors:
+                ancestor = projection.frame(ancestor_id)
+                frames, spend = self._subtree_admission_usage(ancestor_id)
+                admit_dispatch(
+                    request,
+                    caller_depth=frame.depth,
+                    subtree_frames=frames,
+                    subtree_spend=spend,
+                    subtree_deadline=ancestor.subtree_deadline,
+                    policy=self.policy,
+                    registry=self.registry,
+                )
+            frames = len(request.tasks)
+            spend = frames * self.policy.rig_cost(request.rig)
+            for ancestor_id in ancestors:
+                self._reservation_frames[ancestor_id] = (
+                    self._reservation_frames.get(ancestor_id, 0) + frames
+                )
+                self._reservation_spend[ancestor_id] = (
+                    self._reservation_spend.get(ancestor_id, 0.0) + spend
+                )
+            self._dispatch_reservations[(frame.frame_id, call_index)] = (
+                ancestors, frames, spend
             )
-        frames = len(request.tasks)
-        spend = frames * self.policy.rig_cost(request.rig)
-        for ancestor_id in ancestors:
-            self._reservation_frames[ancestor_id] = (
-                self._reservation_frames.get(ancestor_id, 0) + frames
-            )
-            self._reservation_spend[ancestor_id] = (
-                self._reservation_spend.get(ancestor_id, 0.0) + spend
-            )
-        self._dispatch_reservations[(frame.frame_id, call_index)] = (
-            ancestors, frames, spend
-        )
 
     def _consume_dispatch_reservation(
         self, frame_id: str, call_index: int, rig: str
     ) -> None:
         with self._admission_lock:
-            key = (frame_id, call_index)
-            reservation = self._dispatch_reservations.get(key)
-            if reservation is None:
-                return
-            ancestors, frames, spend = reservation
-            unit = self.policy.rig_cost(rig)
-            for ancestor_id in ancestors:
-                self._reservation_frames[ancestor_id] -= 1
-                self._reservation_spend[ancestor_id] -= unit
-            remaining_frames = frames - 1
-            remaining_spend = spend - unit
-            if remaining_frames <= 0:
-                self._dispatch_reservations.pop(key, None)
-            else:
-                self._dispatch_reservations[key] = (
-                    ancestors, remaining_frames, remaining_spend
-                )
+            with self.journal.projection_transaction():
+                key = (frame_id, call_index)
+                reservation = self._dispatch_reservations.get(key)
+                if reservation is None:
+                    return
+                ancestors, frames, spend = reservation
+                unit = self.policy.rig_cost(rig)
+                for ancestor_id in ancestors:
+                    self._reservation_frames[ancestor_id] -= 1
+                    self._reservation_spend[ancestor_id] -= unit
+                remaining_frames = frames - 1
+                remaining_spend = spend - unit
+                if remaining_frames <= 0:
+                    self._dispatch_reservations.pop(key, None)
+                else:
+                    self._dispatch_reservations[key] = (
+                        ancestors, remaining_frames, remaining_spend
+                    )
 
     def _clear_dispatch_reservation(self, frame_id: str, call_index: int) -> None:
         with self._admission_lock:
-            reservation = self._dispatch_reservations.pop(
-                (frame_id, call_index), None
-            )
-            if reservation is None:
-                return
-            ancestors, frames, spend = reservation
-            for ancestor_id in ancestors:
-                self._reservation_frames[ancestor_id] -= frames
-                self._reservation_spend[ancestor_id] -= spend
+            with self.journal.projection_transaction():
+                reservation = self._dispatch_reservations.pop(
+                    (frame_id, call_index), None
+                )
+                if reservation is None:
+                    return
+                ancestors, frames, spend = reservation
+                for ancestor_id in ancestors:
+                    self._reservation_frames[ancestor_id] -= frames
+                    self._reservation_spend[ancestor_id] -= spend
 
     def _serial_children(
         self,
@@ -595,19 +608,20 @@ class Engine:
     def _parallel_owned_paths(
         self, parent_frame_id: str, call_index: int
     ) -> set[str]:
-        owned: set[str] = set()
-        for child in self.journal.projection.frames.values():
-            if (
-                child.parent_frame_id != parent_frame_id
-                or child.parent_call_index != call_index
-            ):
-                continue
-            claim = child.integrated or child.integrating
-            if claim is not None:
-                owned.update(
-                    path for commit in claim.source_commits for path in commit.paths
-                )
-        return owned
+        with self.journal.projection_transaction() as projection:
+            owned: set[str] = set()
+            for child in projection.frames.values():
+                if (
+                    child.parent_frame_id != parent_frame_id
+                    or child.parent_call_index != call_index
+                ):
+                    continue
+                claim = child.integrated or child.integrating
+                if claim is not None:
+                    owned.update(
+                        path for commit in claim.source_commits for path in commit.paths
+                    )
+            return owned
 
     def _parallel_children(
         self,
@@ -618,18 +632,19 @@ class Engine:
     ) -> list[ChildResult]:
         base = self.repository.branch_tip(parent.branch)
         by_index: dict[int, ChildResult] = {}
-        owned = self._parallel_owned_paths(parent.frame_id, call_index)
-        launching = sum(
-            1
-            for task_index in range(len(request.tasks))
-            if (
-                (existing := self.journal.projection.frames.get(
-                    self._child_id(parent.frame_id, call_index, task_index)
-                ))
-                is None
-                or existing.outcome is None
+        with self.journal.projection_transaction() as projection:
+            owned = self._parallel_owned_paths(parent.frame_id, call_index)
+            launching = sum(
+                1
+                for task_index in range(len(request.tasks))
+                if (
+                    (existing := projection.frames.get(
+                        self._child_id(parent.frame_id, call_index, task_index)
+                    ))
+                    is None
+                    or existing.outcome is None
+                )
             )
-        )
         start_barrier = threading.Barrier(launching) if launching > 1 else None
         with ThreadPoolExecutor(max_workers=len(request.tasks)) as executor:
             futures: dict[Future[FrameProjection], int] = {}
@@ -676,19 +691,22 @@ class Engine:
         start_barrier: threading.Barrier | None = None,
     ) -> FrameProjection:
         frame_id = self._child_id(parent.frame_id, call_index, task_index)
-        existing = self.journal.projection.frames.get(frame_id)
-        if existing is not None:
-            if (
-                existing.parent_frame_id != parent.frame_id
-                or existing.parent_call_index != call_index
-                or existing.task_index != task_index
-                or existing.prompt != task
-                or existing.rig != rig
-                or existing.skills != skills
-            ):
-                raise CallConflictError(f"durable child identity differs for {frame_id}")
-            if existing.outcome is not None:
-                return existing
+        with self.journal.projection_transaction() as projection:
+            existing = projection.frames.get(frame_id)
+            if existing is not None:
+                if (
+                    existing.parent_frame_id != parent.frame_id
+                    or existing.parent_call_index != call_index
+                    or existing.task_index != task_index
+                    or existing.prompt != task
+                    or existing.rig != rig
+                    or existing.skills != skills
+                ):
+                    raise CallConflictError(
+                        f"durable child identity differs for {frame_id}"
+                    )
+                if existing.outcome is not None:
+                    return existing
         return self._launch_frame(
             frame_id=frame_id,
             parent_frame_id=parent.frame_id,
@@ -770,19 +788,24 @@ class Engine:
         subtree_deadline: float,
         start_barrier: threading.Barrier | None = None,
     ) -> FrameProjection:
-        existing = self.journal.projection.frames.get(frame_id)
-        branch = existing.branch if existing is not None else self.repository.frame_branch(frame_id)
-        if existing is None and self.repository.ref_exists(branch):
-            raise FrameOwnershipError(
-                f"frame branch {branch!r} exists without a durable frame owner"
+        with self.journal.projection_transaction() as projection:
+            existing = projection.frames.get(frame_id)
+            branch = (
+                existing.branch
+                if existing is not None
+                else self.repository.frame_branch(frame_id)
             )
-        resume = existing is not None
+            if existing is None and self.repository.ref_exists(branch):
+                raise FrameOwnershipError(
+                    f"frame branch {branch!r} exists without a durable frame owner"
+                )
+            resume = existing is not None
         with self._workspace_lock:
             worktree = self.repository.create_frame_worktree(
                 frame_id, branch, base_commit, resume=resume
             )
         attempt = 0 if existing is None else existing.push_count
-        self.journal.append(FramePushed(
+        pushed = FramePushed(
             run_id=self.run_id,
             frame_id=frame_id,
             parent_frame_id=parent_frame_id,
@@ -797,15 +820,19 @@ class Engine:
             base_commit=base_commit,
             worktree=str(worktree.path),
             subtree_deadline=subtree_deadline,
-        ))
+        )
         if (
             existing is None
             and parent_frame_id is not None
             and parent_call_index is not None
         ):
-            self._consume_dispatch_reservation(
-                parent_frame_id, parent_call_index, rig
-            )
+            with self._admission_lock:
+                self.journal.append(pushed)
+                self._consume_dispatch_reservation(
+                    parent_frame_id, parent_call_index, rig
+                )
+        else:
+            self.journal.append(pushed)
         with self._active_lock:
             self._active[frame_id] = worktree
         capability = self.server.register_frame(frame_id)
@@ -815,23 +842,27 @@ class Engine:
             runtime_dir = self.run_dir / "runtime" / frame_id / f"attempt-{attempt}"
             runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(runtime_dir, 0o700)
-            replay_calls = [
-                (
-                    call.call_index,
-                    call.tool,
-                    cast(dict[str, object], call.request.model_dump(mode="json")),
-                )
-                for (owner, _), call in sorted(
-                    self.journal.projection.calls.items(), key=lambda item: item[0][1]
-                )
-                if owner == frame_id
-            ]
+            with self.journal.projection_transaction() as projection:
+                replay_calls = [
+                    (
+                        call.call_index,
+                        call.tool,
+                        cast(
+                            dict[str, object], call.request.model_dump(mode="json")
+                        ),
+                    )
+                    for (owner, _), call in sorted(
+                        projection.calls.items(), key=lambda item: item[0][1]
+                    )
+                    if owner == frame_id
+                ]
+                next_call_index = projection.next_call_index(frame_id)
             shim = write_pi_shim(
                 runtime_dir,
                 self.server.endpoint,
                 capability,
                 frame_id,
-                self.journal.projection.next_call_index(frame_id),
+                next_call_index,
                 replay_calls,
             )
             runtime = FrameRuntime(
@@ -840,7 +871,7 @@ class Engine:
                 frame_id=frame_id,
                 shim_path=shim,
                 runtime_dir=runtime_dir,
-                next_call_index=self.journal.projection.next_call_index(frame_id),
+                next_call_index=next_call_index,
             )
             result = self.registry.resolve(rig).run(
                 self._frame_prompt(frame_id, prompt, skills, worktree.path),
@@ -902,16 +933,17 @@ class Engine:
         worktree: Path,
     ) -> str:
         skills = self.skill_library.resolve(assigned_skills)
-        calls = self.journal.projection.resume_digest(frame_id)
-        resume = bool(calls) or self.journal.projection.frame(frame_id).push_count > 1
+        with self.journal.projection_transaction() as projection:
+            calls = projection.resume_digest(frame_id)
+            frame = projection.frame(frame_id)
+            resume = bool(calls) or frame.push_count > 1
+            headroom = self._admission_headroom(frame)
         progress_path = worktree / "progress.md"
         progress_note = (
             progress_path.read_text(encoding="utf-8")
             if resume and progress_path.is_file()
             else None
         )
-        frame = self.journal.projection.frame(frame_id)
-        headroom = self._admission_headroom(frame)
         rig_lines: list[str] = []
         for name in self._dispatchable_rig_names(frame, headroom):
             description = self.registry.description(name)
@@ -1126,15 +1158,18 @@ class Engine:
         frame_id: str | None = None,
         call_index: int | None = None,
     ) -> tuple[str, int]:
-        pending = self.journal.projection.pending_questions()
-        selected = [
-            call for call in pending
-            if (frame_id is None or call.frame_id == frame_id)
-            and (call_index is None or call.call_index == call_index)
-        ]
-        if len(selected) != 1:
-            raise ValueError(f"answer target is ambiguous or absent ({len(selected)} matches)")
-        call = selected[0]
+        with self.journal.projection_transaction() as projection:
+            pending = projection.pending_questions()
+            selected = [
+                call for call in pending
+                if (frame_id is None or call.frame_id == frame_id)
+                and (call_index is None or call.call_index == call_index)
+            ]
+            if len(selected) != 1:
+                raise ValueError(
+                    f"answer target is ambiguous or absent ({len(selected)} matches)"
+                )
+            call = selected[0]
         path = self._answer_path(call.frame_id, call.call_index)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path.parent, 0o700)

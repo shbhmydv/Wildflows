@@ -1896,3 +1896,12 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      only a projected frame may enter resume mode. The branch-format digest rename and
      deeper resumed-tip validation recommended by H3 are consciously deferred because
      UUID run ids make the naming collision itself a non-issue for the configured use.
+
+141. **Projection transactions serialize complete live decisions (closes audit M1).**
+     The journal append lock is now also the explicit projection transaction lock, with
+     engine coordination locks ordered outside it. Call-frontier checks, ancestor and
+     descendant admission reads plus reservation mutation, dispatch child/replay scans,
+     parallel ownership scans, and prompt headroom reads hold that lock for their complete
+     read/check/reserve decision rather than copying a racing snapshot. Semantic event
+     transition validation/append poisoning (M4) remains consciously deferred; this call
+     closes concurrent access to the existing projection vocabulary, not its validation.

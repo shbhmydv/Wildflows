@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -83,6 +85,16 @@ class Journal:
             self._events.append(assigned)
             self.projection.apply(assigned)
             return seq
+
+    @contextmanager
+    def projection_transaction(self) -> Iterator[RunProjection]:
+        """Exclude projection mutation for a complete engine read/check/reserve.
+
+        Engine coordination locks are always acquired before this lock. Projection
+        transactions never acquire an engine lock, which makes the lock order explicit.
+        """
+        with self._lock:
+            yield self.projection
 
     def events(self) -> list[Event]:
         with self._lock:
