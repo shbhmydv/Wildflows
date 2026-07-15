@@ -1877,3 +1877,15 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      parent remains DONE and carries a direct `N failed children` count. Dispatch
      summaries use those same own-outcome states, reserving FAILED chips and red card
      borders for frames whose own exit failed.
+
+### Hand-36 calls — audited boundary closures
+
+143. **Lifecycle ownership precedes repair-capable construction (closes audit H1).**
+     `Run` acquires `run.lock` without waiting before reading or creating durable run
+     metadata, constructing/loading/repairing the journal, verifying integration state,
+     or constructing the engine, and retains that ownership through engine execution and
+     completion-file publication. A competing constructor receives a typed
+     `LifecycleLockError` without observing or repairing the journal. The explicit
+     `Run.deliver_live_answer` complete-record snapshot remains the read-only live-owner
+     exception. Disconnected-call lifetime (H2) and frame completion reconciliation
+     (H4) are consciously deferred rather than folded into lifecycle locking.

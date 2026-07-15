@@ -6,10 +6,8 @@ import json
 import os
 import subprocess
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator
 from typing import cast
 from uuid import uuid4
 
@@ -45,6 +43,10 @@ def _atomic_write(path: Path, data: bytes) -> None:
         os.fsync(stream.fileno())
     os.replace(temporary, path)
     _sync_dir(path.parent)
+
+
+class LifecycleLockError(RuntimeError):
+    """Another process owns this run's repair-capable lifecycle."""
 
 
 class Run:
@@ -88,18 +90,24 @@ class Run:
         self._meta_path = self.run_dir / "run.json"
         self._completed_path = self.run_dir / "completed.json"
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self._load_or_create_meta()
-        self.engine = Engine(
-            self.run_dir,
-            self.workdir,
-            registry,
-            run_id=self.run_id,
-            root_rig=root_rig,
-            root_prompt=self.job,
-            run_branch=run_branch,
-            policy=policy,
-            worktrees_root=worktrees_root,
-        )
+        self._lifecycle_descriptor: int | None = None
+        self._acquire_lifecycle()
+        try:
+            self._load_or_create_meta()
+            self.engine = Engine(
+                self.run_dir,
+                self.workdir,
+                registry,
+                run_id=self.run_id,
+                root_rig=root_rig,
+                root_prompt=self.job,
+                run_branch=run_branch,
+                policy=policy,
+                worktrees_root=worktrees_root,
+            )
+        except BaseException:
+            self._release_lifecycle()
+            raise
 
     @staticmethod
     def deliver_live_answer(
@@ -196,28 +204,39 @@ class Run:
         )
         _atomic_write(self.run_dir / "job.md", self.job.encode("utf-8"))
 
-    @contextmanager
-    def _lifecycle_guard(self, *, blocking: bool = True) -> Iterator[bool]:
+    def _acquire_lifecycle(self) -> None:
         descriptor = os.open(self.run_dir / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        acquired = False
         try:
-            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-            try:
-                fcntl.flock(descriptor, operation)
-                acquired = True
-            except BlockingIOError:
-                yield False
-                return
-            yield True
-        finally:
-            if acquired:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
             os.close(descriptor)
+            raise LifecycleLockError(
+                f"run {self.run_id!r} is owned by another lifecycle"
+            ) from exc
+        self._lifecycle_descriptor = descriptor
+
+    def _release_lifecycle(self) -> None:
+        descriptor = getattr(self, "_lifecycle_descriptor", None)
+        if descriptor is None:
+            return
+        self._lifecycle_descriptor = None
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+    def close(self) -> None:
+        """Release a constructed run that will not be driven."""
+        self._release_lifecycle()
+
+    def __del__(self) -> None:
+        self._release_lifecycle()
 
     def run(self) -> RunCompleted:
-        with self._lifecycle_guard() as acquired:
-            assert acquired
+        if self._lifecycle_descriptor is None:
+            raise LifecycleLockError("run lifecycle is no longer owned")
+        try:
             return self._drive()
+        finally:
+            self._release_lifecycle()
 
     def resume(
         self,
@@ -228,14 +247,6 @@ class Run:
     ) -> RunCompleted:
         if answer is not None:
             self.engine.answer(answer, frame_id=frame_id, call_index=call_index)
-            with self._lifecycle_guard(blocking=False) as acquired:
-                if not acquired:
-                    return RunCompleted(
-                        summary="owner answer delivered; resident run continues",
-                        frames=len(self.engine.projection.frames),
-                        outcome="ok",
-                    )
-                return self._drive()
         return self.run()
 
     def _drive(self) -> RunCompleted:
