@@ -1905,3 +1905,11 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      read/check/reserve decision rather than copying a racing snapshot. Semantic event
      transition validation/append poisoning (M4) remains consciously deferred; this call
      closes concurrent access to the existing projection vocabulary, not its validation.
+
+142. **Serial and parallel child-launch faults share one durable boundary (closes
+     audit M5).** Both traversal modes classify an ordinary failure before any durable
+     `frame_pushed` as the same failed `ChildResult`, allowing the enclosing dispatch
+     return to memoize it. An unexpected failure after a push is not guessed safe: the
+     dispatch remains pending for replay, and a poisoned journal always escapes
+     fail-closed. Full frame-completion certification (H4) and semantic journal
+     transition poisoning (M4) remain consciously deferred.

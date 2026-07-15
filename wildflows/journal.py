@@ -105,6 +105,11 @@ class Journal:
         with self._lock:
             return len(self._events)
 
+    @property
+    def poisoned(self) -> bool:
+        with self._lock:
+            return self._poisoned
+
     @classmethod
     def load(cls, run_dir: Path) -> "Journal":
         journal = cls.__new__(cls)

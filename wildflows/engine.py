@@ -591,18 +591,24 @@ class Engine:
     ) -> list[ChildResult]:
         results: list[ChildResult] = []
         for task_index, task in enumerate(request.tasks):
-            child = self._execute_child(
-                parent,
-                call_index,
-                task_index,
-                task,
-                request.rig,
-                request.skill_bundle(task_index),
-                base_commit=self.repository.branch_tip(parent.branch),
-            )
-            results.append(self._finish_child(
-                child, parent, parent_worktree, owned=set()
-            ))
+            try:
+                child = self._execute_child(
+                    parent,
+                    call_index,
+                    task_index,
+                    task,
+                    request.rig,
+                    request.skill_bundle(task_index),
+                    base_commit=self.repository.branch_tip(parent.branch),
+                )
+                result = self._finish_child(
+                    child, parent, parent_worktree, owned=set()
+                )
+            except Exception as exc:
+                result = self._classify_child_exception(
+                    parent.frame_id, call_index, task_index, exc
+                )
+            results.append(result)
         return results
 
     def _parallel_owned_paths(
@@ -669,14 +675,34 @@ class Engine:
                         child, parent, parent_worktree, owned=owned
                     )
                 except Exception as exc:
-                    frame_id = self._child_id(parent.frame_id, call_index, task_index)
-                    result = ChildResult(
-                        frame_id=frame_id,
-                        outcome="failed",
-                        text=f"child execution failed: {exc}",
+                    result = self._classify_child_exception(
+                        parent.frame_id, call_index, task_index, exc
                     )
                 by_index[task_index] = result
         return [by_index[index] for index in range(len(request.tasks))]
+
+    def _classify_child_exception(
+        self,
+        parent_frame_id: str,
+        call_index: int,
+        task_index: int,
+        exc: Exception,
+    ) -> ChildResult:
+        """Memoize only failures proven to precede a durable frame push."""
+        if self.journal.poisoned:
+            raise exc
+        frame_id = self._child_id(parent_frame_id, call_index, task_index)
+        with self.journal.projection_transaction() as projection:
+            pushed = frame_id in projection.frames
+        if pushed:
+            # Once a frame exists, an unexpected failure may follow an effect whose
+            # outcome is not durable. Leave the dispatch pending for explicit replay.
+            raise exc
+        return ChildResult(
+            frame_id=frame_id,
+            outcome="failed",
+            text=f"child launch failed before frame push: {exc}",
+        )
 
     def _execute_child(
         self,
