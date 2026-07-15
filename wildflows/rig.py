@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,7 @@ class ExternalResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    cancelled: bool = False
 
 
 def _kill_group(process: subprocess.Popen[str]) -> None:
@@ -103,6 +105,7 @@ def _capture(
     timeout_s: float,
     shell: bool,
     env: dict[str, str] | None = None,
+    cancellation: threading.Event | None = None,
 ) -> ExternalResult:
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
@@ -121,16 +124,29 @@ def _capture(
             preexec_fn=(lambda: _guarded_child(parent_pid)) if _PRCTL else None,
         )
         timed_out = False
+        cancelled = False
+        returncode: int | None = None
+        deadline = time.monotonic() + timeout_s
         try:
-            returncode: int | None = process.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            returncode = None
+            while returncode is None:
+                if cancellation is not None and cancellation.is_set():
+                    cancelled = True
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    returncode = process.wait(timeout=min(0.05, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
         finally:
             _kill_group(process)
         stdout.seek(0)
         stderr.seek(0)
-        return ExternalResult(returncode, stdout.read(), stderr.read(), timed_out)
+        return ExternalResult(
+            returncode, stdout.read(), stderr.read(), timed_out, cancelled
+        )
 
 
 def run_shell(
@@ -138,8 +154,16 @@ def run_shell(
     workdir: Path,
     timeout_s: float,
     env: dict[str, str] | None = None,
+    cancellation: threading.Event | None = None,
 ) -> ExternalResult:
-    return _capture(command, cwd=workdir, timeout_s=timeout_s, shell=True, env=env)
+    return _capture(
+        command,
+        cwd=workdir,
+        timeout_s=timeout_s,
+        shell=True,
+        env=env,
+        cancellation=cancellation,
+    )
 
 
 def _runtime_env(runtime: FrameRuntime) -> dict[str, str]:
@@ -186,7 +210,15 @@ class ShellRig:
             workdir,
             self.timeout_s,
             env={**os.environ, **_runtime_env(runtime)},
+            cancellation=runtime.cancellation,
         )
+        if result.cancelled:
+            return FrameResult(
+                text="[cancelled] frame execution stopped before teardown",
+                outcome="failed",
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
         if result.timed_out:
             return FrameResult(
                 text=f"[timeout] command exceeded {self.timeout_s}s\n{result.stderr}",
@@ -269,9 +301,17 @@ class ScriptRig:
             timeout_s=self.timeout_s,
             shell=False,
             env={**os.environ, **self.env, **_runtime_env(runtime)},
+            cancellation=runtime.cancellation,
         )
         (dispatch_dir / "agent.stdout.log").write_text(result.stdout, encoding="utf-8")
         (dispatch_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
+        if result.cancelled:
+            return FrameResult(
+                text="[cancelled] frame execution stopped before teardown",
+                outcome="failed",
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
         if result.timed_out:
             return FrameResult(
                 text=f"[timeout] script exceeded {self.timeout_s}s\n{result.stderr}",

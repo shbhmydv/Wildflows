@@ -1946,3 +1946,24 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      named environment variables; exact ask replay emits no duplicate. Spawn failure or
      nonzero notifier exit cannot affect the run. Delivery acknowledgement, retry, and
      a second durable notification vocabulary are consciously not introduced.
+
+### Hand-37 calls — frame-lifetime closures
+
+151. **Validated MCP workers join their caller frame (closes audit H2).** Every
+     id-bearing call that passes MCP validation enters a per-frame server join set before
+     its independent worker starts. Once the resident rig returns, the engine closes that
+     set to effectful admission and spends at most **5 seconds total**: half as a natural
+     durable-return grace, then the remainder after requesting cooperative cancellation.
+     External gate/frame process groups observe that cancellation and are reaped; an ask
+     wakes without inventing an answer. Cancellation requested or merely recorded is not
+     joined: execution must stop. A worker that has stopped without its tool-specific
+     return is closed by a durable typed `call_failed` result; an uncooperative worker
+     that does not confirm stop within the bound raises typed `FrameCallJoinTimeoutError`,
+     retains the live process's lifecycle lock, and leaves the frame uncommitted, unexited,
+     capable, and unremoved rather than racing teardown. Thus every durable return precedes
+     frame commit, `frame_exited`, capability
+     revocation, worktree removal, and root `run_finished`. The five-second grace is long
+     relative to local append/fsync scheduling but short enough to expose a wedged adapter;
+     process work itself remains governed by its larger rig/subtree timeout. Arbitrary
+     external-effect exactly-once remains deferred, as does audit H4's full frame
+     completion-certificate/reconciliation subsystem.

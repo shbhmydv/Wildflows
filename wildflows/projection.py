@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from wildflows.events import (
     Answered,
     Asked,
+    CallFailed,
     DispatchCalled,
     DispatchReturned,
     Event,
@@ -140,6 +141,21 @@ class RunProjection:
             call = self.calls[(event.frame_id, event.call_index)]
             call.response = AskResult(answer=event.answer)
             call.finished_seq = event.seq
+        elif isinstance(event, CallFailed):
+            key = (event.frame_id, event.call_index)
+            failed_call = self.calls.get(key)
+            if failed_call is None:
+                failed_call = CallProjection(
+                    frame_id=event.frame_id,
+                    call_index=event.call_index,
+                    call_hash=event.call_hash,
+                    tool=event.tool,
+                    request=event.request,
+                    started_seq=event.seq,
+                )
+                self.calls[key] = failed_call
+            failed_call.response = event.result
+            failed_call.finished_seq = event.seq
         elif isinstance(event, FrameExited):
             frame = self.frames[event.frame_id]
             frame.outcome = event.outcome

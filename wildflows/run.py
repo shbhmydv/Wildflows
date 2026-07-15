@@ -12,7 +12,7 @@ from typing import cast
 from uuid import uuid4
 
 from wildflows.admission import AdmissionPolicy
-from wildflows.engine import Engine
+from wildflows.engine import Engine, FrameCallJoinTimeoutError
 from wildflows.events import parse_event
 from wildflows.frame import FrameOutcome
 from wildflows.projection import RunProjection
@@ -235,10 +235,18 @@ class Run:
     def run(self) -> RunCompleted:
         if self._lifecycle_descriptor is None:
             raise LifecycleLockError("run lifecycle is no longer owned")
+        release_lifecycle = True
         try:
             return self._drive()
+        except FrameCallJoinTimeoutError:
+            # The uncooperative worker still belongs to this live Engine. Keep
+            # cross-process lifecycle ownership until the caller retries/closes
+            # or this process exits and takes its process groups with it.
+            release_lifecycle = False
+            raise
         finally:
-            self._release_lifecycle()
+            if release_lifecycle:
+                self._release_lifecycle()
 
     def resume(
         self,

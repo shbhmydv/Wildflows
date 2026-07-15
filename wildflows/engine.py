@@ -15,6 +15,7 @@ from wildflows.admission import AdmissionError, AdmissionPolicy, admit_dispatch
 from wildflows.events import (
     Answered,
     Asked,
+    CallFailed,
     DispatchCalled,
     DispatchReturned,
     FrameExited,
@@ -38,13 +39,14 @@ from wildflows.frame import (
     FrameRuntime,
     GateRequest,
     GateResult,
+    ToolFailure,
     ToolName,
     ToolRequest,
     ToolResponse,
     call_hash,
 )
 from wildflows.journal import Journal
-from wildflows.mcp import MCPServer, ToolProtocolError
+from wildflows.mcp import MCPServer, ToolProtocolError, ValidatedToolCall
 from wildflows.projection import FrameProjection, RunProjection
 from wildflows.result import CommitReceipt
 from wildflows.rig import RigRegistry, run_shell
@@ -76,6 +78,21 @@ class CallConflictError(ToolProtocolError):
 
 class FrameNotActiveError(ToolProtocolError):
     """A token-authenticated request did not name a live caller frame."""
+
+
+class FrameCallJoinTimeoutError(RuntimeError):
+    """A frame's effectful MCP worker did not acknowledge cancellation."""
+
+
+FRAME_CALL_JOIN_TIMEOUT_S = 5.0
+"""Maximum natural-return plus confirmed-cancellation wait at frame exit."""
+
+
+@dataclass(frozen=True)
+class _LiveCall:
+    tool: ToolName
+    digest: str
+    cancellation: threading.Event
 
 
 @dataclass(frozen=True)
@@ -123,7 +140,9 @@ class Engine:
         ] = {}
         self._answer_condition = threading.Condition(threading.RLock())
         self._call_condition = threading.Condition(threading.RLock())
-        self._inflight_calls: dict[tuple[str, int], tuple[ToolName, str]] = {}
+        self._inflight_calls: dict[tuple[str, int], _LiveCall] = {}
+        self._terminating_frames: set[str] = set()
+        self._call_context = threading.local()
         journal_path = self.run_dir / "events.ndjson"
         continuing = journal_path.exists() and journal_path.stat().st_size > 0
         self.journal = Journal.load(self.run_dir) if continuing else Journal(self.run_dir)
@@ -301,7 +320,7 @@ class Engine:
                             return existing.response
                     leader = self._inflight_calls.get(key)
                     if leader is not None:
-                        if leader != (tool, digest):
+                        if leader.tool != tool or leader.digest != digest:
                             raise CallConflictError(
                                 f"call {frame_id}:{call_index} conflicts with its live call"
                             )
@@ -338,11 +357,16 @@ class Engine:
                                 f"call {frame_id}:{call_index} is not the next logical call"
                             )
                         else:
-                            self._inflight_calls[key] = (tool, digest)
+                            cancellation = threading.Event()
+                            if frame_id in self._terminating_frames:
+                                cancellation.set()
+                            live_call = _LiveCall(tool, digest, cancellation)
+                            self._inflight_calls[key] = live_call
                             replaying = existing is not None
                             break
                 if wait_for_leader:
                     self._call_condition.wait()
+        self._call_context.cancellation = live_call.cancellation
         try:
             if tool == "dispatch":
                 if not isinstance(request, DispatchRequest):
@@ -362,9 +386,81 @@ class Engine:
                 frame, worktree, call_index, digest, request, replaying
             )
         finally:
+            del self._call_context.cancellation
             with self._call_condition:
                 self._inflight_calls.pop(key, None)
                 self._call_condition.notify_all()
+
+    def _current_call_cancellation(self) -> threading.Event:
+        cancellation = getattr(self._call_context, "cancellation", None)
+        if not isinstance(cancellation, threading.Event):
+            raise RuntimeError("tool execution has no live call context")
+        return cancellation
+
+    def _cancel_frame_calls(self, frame_id: str) -> None:
+        with self._call_condition:
+            self._terminating_frames.add(frame_id)
+            for (owner, _), call in self._inflight_calls.items():
+                if owner == frame_id:
+                    call.cancellation.set()
+            self._call_condition.notify_all()
+        with self._answer_condition:
+            self._answer_condition.notify_all()
+
+    def _durabilize_stopped_calls(
+        self, frame_id: str, calls: tuple[ValidatedToolCall, ...]
+    ) -> None:
+        unique: dict[tuple[int, str], ValidatedToolCall] = {}
+        for call in calls:
+            if call.frame_id == frame_id:
+                unique[(call.call_index, call_hash(call.tool, call.request))] = call
+        for (call_index, digest), call in unique.items():
+            with self.journal.projection_transaction() as projection:
+                existing = projection.call(frame_id, call_index)
+                if existing is not None and existing.completed:
+                    continue
+                if existing is not None and (
+                    existing.tool != call.tool or existing.call_hash != digest
+                ):
+                    raise CallConflictError(
+                        f"stopped call {frame_id}:{call_index} conflicts with its durable call"
+                    )
+                self.journal.append(CallFailed(
+                    run_id=self.run_id,
+                    frame_id=frame_id,
+                    call_index=call_index,
+                    call_hash=digest,
+                    tool=call.tool,
+                    request=call.request,
+                    result=ToolFailure(
+                        error_code="worker_stopped_without_return",
+                        message=(
+                            "validated MCP worker stopped without a durable "
+                            "tool-specific return"
+                        ),
+                    ),
+                ))
+
+    def _join_frame_calls(self, frame_id: str) -> None:
+        started = time.monotonic()
+        natural_grace = FRAME_CALL_JOIN_TIMEOUT_S / 2
+        joined = self.server.join_frame(frame_id, natural_grace)
+        if joined.active:
+            self._cancel_frame_calls(frame_id)
+            remaining = max(
+                0.0, FRAME_CALL_JOIN_TIMEOUT_S - (time.monotonic() - started)
+            )
+            joined = self.server.join_frame(frame_id, remaining)
+        if joined.active:
+            identities = ", ".join(
+                f"{call.frame_id}:{call.call_index}" for call in joined.active
+            )
+            raise FrameCallJoinTimeoutError(
+                "frame call join exceeded "
+                f"{FRAME_CALL_JOIN_TIMEOUT_S:g}s without confirmed execution stop: "
+                f"{identities}"
+            )
+        self._durabilize_stopped_calls(frame_id, joined.completed)
 
     def _active_worktree(self, frame_id: str) -> FrameWorktree:
         with self._active_lock:
@@ -619,6 +715,7 @@ class Engine:
         request: DispatchRequest,
     ) -> list[ChildResult]:
         results: list[ChildResult] = []
+        cancellation = self._current_call_cancellation()
         for task_index, task in enumerate(request.tasks):
             try:
                 child = self._execute_child(
@@ -629,6 +726,7 @@ class Engine:
                     request.rig,
                     request.skill_bundle(task_index),
                     base_commit=self.repository.branch_tip(parent.branch),
+                    cancellation=cancellation,
                 )
                 result = self._finish_child(
                     child, parent, parent_worktree, owned=set()
@@ -666,6 +764,7 @@ class Engine:
         request: DispatchRequest,
     ) -> list[ChildResult]:
         base = self.repository.branch_tip(parent.branch)
+        cancellation = self._current_call_cancellation()
         by_index: dict[int, ChildResult] = {}
         with self.journal.projection_transaction() as projection:
             owned = self._parallel_owned_paths(parent.frame_id, call_index)
@@ -694,6 +793,7 @@ class Engine:
                     request.skill_bundle(task_index),
                     base_commit=base,
                     start_barrier=start_barrier,
+                    cancellation=cancellation,
                 )
                 futures[future] = task_index
             for future in as_completed(futures):
@@ -744,8 +844,11 @@ class Engine:
         *,
         base_commit: str,
         start_barrier: threading.Barrier | None = None,
+        cancellation: threading.Event | None = None,
     ) -> FrameProjection:
         frame_id = self._child_id(parent.frame_id, call_index, task_index)
+        if cancellation is not None and cancellation.is_set():
+            raise RuntimeError("dispatch cancelled before child frame push")
         with self.journal.projection_transaction() as projection:
             existing = projection.frames.get(frame_id)
             if existing is not None:
@@ -774,6 +877,7 @@ class Engine:
             base_commit=existing.base_commit if existing is not None else base_commit,
             subtree_deadline=parent.subtree_deadline,
             start_barrier=start_barrier,
+            cancellation=cancellation,
         )
 
     @staticmethod
@@ -842,6 +946,7 @@ class Engine:
         base_commit: str,
         subtree_deadline: float,
         start_barrier: threading.Barrier | None = None,
+        cancellation: threading.Event | None = None,
     ) -> FrameProjection:
         with self.journal.projection_transaction() as projection:
             existing = projection.frames.get(frame_id)
@@ -855,6 +960,12 @@ class Engine:
                     f"frame branch {branch!r} exists without a durable frame owner"
                 )
             resume = existing is not None
+        if existing is not None:
+            # A same-process retry after a bounded join timeout must rejoin the
+            # old attempt before stale-owner cleanup can touch its worktree.
+            self._join_frame_calls(frame_id)
+            with self._call_condition:
+                self._terminating_frames.discard(frame_id)
         with self._workspace_lock:
             worktree = self.repository.create_frame_worktree(
                 frame_id, branch, base_commit, resume=resume
@@ -891,48 +1002,61 @@ class Engine:
         with self._active_lock:
             self._active[frame_id] = worktree
         capability = self.server.register_frame(frame_id)
+        terminalized = False
         try:
-            if start_barrier is not None:
-                start_barrier.wait(timeout=30)
-            runtime_dir = self.run_dir / "runtime" / frame_id / f"attempt-{attempt}"
-            runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(runtime_dir, 0o700)
-            with self.journal.projection_transaction() as projection:
-                replay_calls = [
-                    (
-                        call.call_index,
-                        call.tool,
-                        cast(
-                            dict[str, object], call.request.model_dump(mode="json")
-                        ),
-                    )
-                    for (owner, _), call in sorted(
-                        projection.calls.items(), key=lambda item: item[0][1]
-                    )
-                    if owner == frame_id
-                ]
-                next_call_index = projection.next_call_index(frame_id)
-            shim = write_pi_shim(
-                runtime_dir,
-                self.server.endpoint,
-                capability,
-                frame_id,
-                next_call_index,
-                replay_calls,
-            )
-            runtime = FrameRuntime(
-                endpoint=self.server.endpoint,
-                token=capability,
-                frame_id=frame_id,
-                shim_path=shim,
-                runtime_dir=runtime_dir,
-                next_call_index=next_call_index,
-            )
-            result = self.registry.resolve(rig).run(
-                self._frame_prompt(frame_id, prompt, skills, worktree.path),
-                worktree.path,
-                runtime,
-            )
+            try:
+                if start_barrier is not None:
+                    start_barrier.wait(timeout=30)
+                runtime_dir = self.run_dir / "runtime" / frame_id / f"attempt-{attempt}"
+                runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(runtime_dir, 0o700)
+                with self.journal.projection_transaction() as projection:
+                    replay_calls = [
+                        (
+                            call.call_index,
+                            call.tool,
+                            cast(
+                                dict[str, object], call.request.model_dump(mode="json")
+                            ),
+                        )
+                        for (owner, _), call in sorted(
+                            projection.calls.items(), key=lambda item: item[0][1]
+                        )
+                        if owner == frame_id
+                    ]
+                    next_call_index = projection.next_call_index(frame_id)
+                shim = write_pi_shim(
+                    runtime_dir,
+                    self.server.endpoint,
+                    capability,
+                    frame_id,
+                    next_call_index,
+                    replay_calls,
+                )
+                runtime = FrameRuntime(
+                    endpoint=self.server.endpoint,
+                    token=capability,
+                    frame_id=frame_id,
+                    shim_path=shim,
+                    runtime_dir=runtime_dir,
+                    next_call_index=next_call_index,
+                    cancellation=cancellation,
+                )
+                result = self.registry.resolve(rig).run(
+                    self._frame_prompt(frame_id, prompt, skills, worktree.path),
+                    worktree.path,
+                    runtime,
+                )
+            except Exception as exc:
+                result = FrameResult(
+                    outcome="failed",
+                    text=f"frame rig failed: {exc}",
+                    stderr=str(exc),
+                )
+
+            # MCP validation transfers lifetime ownership to the engine. No frame
+            # effect below may race a detached worker from this attempt.
+            self._join_frame_calls(frame_id)
             if result.outcome == "ok":
                 try:
                     head = self.repository.commit_all(
@@ -960,25 +1084,17 @@ class Engine:
                 stderr=result.stderr,
                 head=head,
             ))
-            return self.journal.projection.frame(frame_id)
-        except Exception as exc:
-            head = self.repository.head(worktree.path)
-            self.journal.append(FrameExited(
-                run_id=self.run_id,
-                frame_id=frame_id,
-                attempt=attempt,
-                outcome="failed",
-                text=f"frame rig failed: {exc}",
-                stderr=str(exc),
-                head=head,
-            ))
+            terminalized = True
             return self.journal.projection.frame(frame_id)
         finally:
-            self.server.revoke_frame(capability)
-            with self._active_lock:
-                self._active.pop(frame_id, None)
-            with self._workspace_lock:
-                self.repository.remove_worktree(worktree)
+            if terminalized:
+                self.server.revoke_frame(capability)
+                with self._call_condition:
+                    self._terminating_frames.discard(frame_id)
+                with self._active_lock:
+                    self._active.pop(frame_id, None)
+                with self._workspace_lock:
+                    self.repository.remove_worktree(worktree)
 
     def _frame_prompt(
         self,
@@ -1172,21 +1288,40 @@ class Engine:
                 request=request,
                 caller_head=caller_head,
             ))
+        cancellation = self._current_call_cancellation()
         remaining = max(0.01, frame.subtree_deadline - time.time())
-        result = run_shell(request.cmd, worktree.path, remaining)
-        if result.timed_out:
+        if cancellation.is_set():
             gate = GateResult(
-                exit_code=124,
-                stdout=result.stdout,
-                stderr=result.stderr + f"\n[timeout] gate exceeded {remaining:g}s",
+                exit_code=125,
+                stdout="",
+                stderr="[cancelled] frame call stopped before command launch",
             )
         else:
-            assert result.returncode is not None
-            gate = GateResult(
-                exit_code=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
+            result = run_shell(
+                request.cmd,
+                worktree.path,
+                remaining,
+                cancellation=cancellation,
             )
+            if result.cancelled:
+                gate = GateResult(
+                    exit_code=125,
+                    stdout=result.stdout,
+                    stderr=result.stderr + "\n[cancelled] frame call execution stopped",
+                )
+            elif result.timed_out:
+                gate = GateResult(
+                    exit_code=124,
+                    stdout=result.stdout,
+                    stderr=result.stderr + f"\n[timeout] gate exceeded {remaining:g}s",
+                )
+            else:
+                assert result.returncode is not None
+                gate = GateResult(
+                    exit_code=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
         self.journal.append(GateReturned(
             run_id=self.run_id,
             frame_id=frame.frame_id,
@@ -1204,7 +1339,7 @@ class Engine:
         digest: str,
         request: AskRequest,
         replaying: bool,
-    ) -> AskResult:
+    ) -> AskResult | ToolFailure:
         self.repository.ensure_clean(worktree.path, frame.branch)
         if not replaying:
             asked = Asked(
@@ -1217,9 +1352,25 @@ class Engine:
             self.journal.append(asked)
             self._notify_asked(asked)
         answer_path = self._answer_path(frame.frame_id, call_index)
+        cancellation = self._current_call_cancellation()
         with self._answer_condition:
-            while not answer_path.is_file():
+            while not answer_path.is_file() and not cancellation.is_set():
                 self._answer_condition.wait(timeout=0.25)
+        if cancellation.is_set() and not answer_path.is_file():
+            failure = ToolFailure(
+                error_code="frame_terminating",
+                message="owner ask stopped because its caller frame terminated",
+            )
+            self.journal.append(CallFailed(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                tool="ask",
+                request=request,
+                result=failure,
+            ))
+            return failure
         answer = answer_path.read_text(encoding="utf-8")
         self.journal.append(Answered(
             run_id=self.run_id,

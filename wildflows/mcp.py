@@ -7,12 +7,13 @@ the frame engine.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hmac
 import json
 import math
 import secrets
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,7 @@ from wildflows.frame import (
     DispatchResult,
     GateRequest,
     GateResult,
+    ToolFailure,
     ToolName,
     ToolRequest,
     ToolResponse,
@@ -35,8 +37,10 @@ from wildflows.frame import (
 __all__ = [
     "DEFAULT_HEARTBEAT_INTERVAL",
     "MAX_BODY_BYTES",
+    "FrameCallJoin",
     "MCPServer",
     "ToolHandler",
+    "ValidatedToolCall",
     "ToolProtocolError",
 ]
 
@@ -73,14 +77,29 @@ class ToolHandler(Protocol):
 
 
 @dataclass(frozen=True)
-class _PreparedToolCall:
-    """A validated tool request ready for independent execution."""
+class ValidatedToolCall:
+    """An id-bearing request admitted to an independent MCP worker."""
 
     frame_id: str
     call_index: int
     tool: ToolName
     request: ToolRequest
     request_id: object
+
+
+@dataclass
+class _TrackedToolCall:
+    call: ValidatedToolCall
+    execute_handler: bool
+    completed: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass(frozen=True)
+class FrameCallJoin:
+    """Snapshot returned after closing one frame's MCP worker frontier."""
+
+    completed: tuple[ValidatedToolCall, ...]
+    active: tuple[ValidatedToolCall, ...]
 
 
 class _MCPHTTPServer(ThreadingHTTPServer):
@@ -181,6 +200,9 @@ class MCPServer:
         self._lock = threading.RLock()
         self._context_depth = 0
         self._frame_capabilities: dict[str, str] = {}
+        self._call_condition = threading.Condition(self._lock)
+        self._frame_calls: dict[str, list[_TrackedToolCall]] = {}
+        self._closing_frames: set[str] = set()
 
     @property
     def endpoint(self) -> str:
@@ -201,13 +223,48 @@ class MCPServer:
         if not frame_id:
             raise ValueError("frame id must be non-empty")
         capability = secrets.token_urlsafe(32)
-        with self._lock:
+        with self._call_condition:
+            if any(
+                not tracked.completed.is_set()
+                for tracked in self._frame_calls.get(frame_id, [])
+            ):
+                raise RuntimeError(f"frame {frame_id!r} still has active MCP calls")
+            self._frame_calls.pop(frame_id, None)
+            self._closing_frames.discard(frame_id)
             self._frame_capabilities[capability] = frame_id
         return capability
 
+    def join_frame(self, frame_id: str, timeout: float) -> FrameCallJoin:
+        """Close call admission and wait at most ``timeout`` for its workers."""
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("frame call join timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+        with self._call_condition:
+            self._closing_frames.add(frame_id)
+            while True:
+                tracked = list(self._frame_calls.get(frame_id, []))
+                active = [item for item in tracked if not item.completed.is_set()]
+                if not active:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._call_condition.wait(timeout=remaining)
+            return FrameCallJoin(
+                completed=tuple(
+                    item.call for item in tracked if item.completed.is_set()
+                ),
+                active=tuple(
+                    item.call for item in tracked if not item.completed.is_set()
+                ),
+            )
+
     def revoke_frame(self, capability: str) -> None:
-        with self._lock:
-            self._frame_capabilities.pop(capability, None)
+        with self._call_condition:
+            frame_id = self._frame_capabilities.pop(capability, None)
+            if frame_id is not None:
+                self._frame_calls.pop(frame_id, None)
+                self._closing_frames.discard(frame_id)
 
     def start(self) -> "MCPServer":
         """Start serving on a fresh loopback ephemeral port, if not running."""
@@ -408,8 +465,8 @@ class MCPServer:
 
     def _streamable_tool_call(
         self, payload: object, frame_id: str | None
-    ) -> _PreparedToolCall | None:
-        """Return an id-bearing, valid call that needs a streaming response."""
+    ) -> _TrackedToolCall | None:
+        """Validate and join-track an id-bearing call before returning it."""
         if not isinstance(payload, dict):
             return None
         if payload.get("jsonrpc") != _JSON_RPC_VERSION:
@@ -422,7 +479,17 @@ class MCPServer:
         params = payload.get("params", {})
         if not isinstance(params, dict):
             return None
-        return self._prepare_tool_call(params, frame_id, request_id)
+        call = self._prepare_tool_call(params, frame_id, request_id)
+        if call is None:
+            return None
+        with self._call_condition:
+            execute_handler = call.frame_id not in self._closing_frames
+            tracked = _TrackedToolCall(call, execute_handler)
+            self._frame_calls.setdefault(call.frame_id, []).append(tracked)
+            if not execute_handler:
+                # A call validated after closure is a completed no-effect refusal.
+                tracked.completed.set()
+            return tracked
 
     def _call_tool(
         self,
@@ -440,7 +507,7 @@ class MCPServer:
         params: dict[str, object],
         frame_id: str | None,
         request_id: object,
-    ) -> _PreparedToolCall | None:
+    ) -> ValidatedToolCall | None:
         if not isinstance(frame_id, str) or not frame_id:
             return None
         name = params.get("name")
@@ -454,9 +521,9 @@ class MCPServer:
             tool, validated = self._validate_tool(name, arguments)
         except (KeyError, ValidationError, ValueError):
             return None
-        return _PreparedToolCall(frame_id, call_index, tool, validated, request_id)
+        return ValidatedToolCall(frame_id, call_index, tool, validated, request_id)
 
-    def _complete_tool_call(self, call: _PreparedToolCall) -> dict[str, object]:
+    def _complete_tool_call(self, call: ValidatedToolCall) -> dict[str, object]:
         try:
             tool_response = self._handler.handle_tool(
                 call.frame_id, call.call_index, call.tool, call.request
@@ -467,25 +534,30 @@ class MCPServer:
             # Tool failures that are meaningful to a frame are values returned
             # by its handler. An exception is a transport/server fault instead.
             return self._error(call.request_id, -32603, "Internal error")
-        if not isinstance(tool_response, (DispatchResult, GateResult, AskResult)):
+        if not isinstance(
+            tool_response, (DispatchResult, GateResult, AskResult, ToolFailure)
+        ):
             return self._error(call.request_id, -32603, "Internal error")
 
         result = {
             "content": [{"type": "text", "text": tool_response.as_text()}],
             "structuredContent": tool_response.model_dump(mode="json"),
             "isError": (
-                isinstance(tool_response, DispatchResult)
-                and tool_response.outcome == "refused"
+                isinstance(tool_response, ToolFailure)
+                or (
+                    isinstance(tool_response, DispatchResult)
+                    and tool_response.outcome == "refused"
+                )
             ),
         }
         return self._result(call.request_id, result)
 
     def _stream_tool_call(
-        self, request: _MCPRequestHandler, call: _PreparedToolCall
+        self, request: _MCPRequestHandler, tracked: _TrackedToolCall
     ) -> None:
-        """Stream a pending call without coupling execution to the client socket."""
+        """Stream a tracked call without coupling execution to the client socket."""
         started = threading.Event()
-        completed = threading.Event()
+        call = tracked.call
         response: dict[str, object] = self._error(
             call.request_id, -32603, "Internal error"
         )
@@ -494,9 +566,18 @@ class MCPServer:
             nonlocal response
             try:
                 started.wait()
-                response = self._complete_tool_call(call)
+                if tracked.execute_handler:
+                    response = self._complete_tool_call(call)
+                else:
+                    response = self._error(
+                        call.request_id,
+                        -32602,
+                        f"frame {call.frame_id!r} is terminating",
+                    )
             finally:
-                completed.set()
+                with self._call_condition:
+                    tracked.completed.set()
+                    self._call_condition.notify_all()
 
         worker = threading.Thread(
             target=execute,
@@ -512,7 +593,7 @@ class MCPServer:
             started.set()
 
         try:
-            while not completed.wait(self._heartbeat_interval):
+            while not tracked.completed.wait(self._heartbeat_interval):
                 self._write_chunk(request, b" ")
             raw = json.dumps(
                 response, separators=(",", ":"), ensure_ascii=True

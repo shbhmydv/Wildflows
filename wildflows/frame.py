@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
@@ -127,7 +128,18 @@ class AskResult(BaseModel):
         return self.answer
 
 
-ToolResponse: TypeAlias = DispatchResult | GateResult | AskResult
+class ToolFailure(BaseModel):
+    """Engine-owned durable failure for a validated call with no tool return."""
+
+    outcome: Literal["failed"] = "failed"
+    error_code: str
+    message: str
+
+    def as_text(self) -> str:
+        return f"tool call failed [{self.error_code}]: {self.message}"
+
+
+ToolResponse: TypeAlias = DispatchResult | GateResult | AskResult | ToolFailure
 
 
 def call_hash(tool: ToolName, request: ToolRequest) -> str:
@@ -150,3 +162,4 @@ class FrameRuntime:
     shim_path: Path
     runtime_dir: Path
     next_call_index: int
+    cancellation: threading.Event | None = None

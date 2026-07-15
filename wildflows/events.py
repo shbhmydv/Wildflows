@@ -14,6 +14,9 @@ from wildflows.frame import (
     FrameOutcome,
     GateRequest,
     GateResult,
+    ToolFailure,
+    ToolName,
+    ToolRequest,
 )
 from wildflows.result import CommitReceipt
 
@@ -105,6 +108,18 @@ class Answered(_Header):
     answer: str
 
 
+class CallFailed(_Header):
+    """A validated call stopped without producing its tool-specific return."""
+
+    kind: Literal["call_failed"] = "call_failed"
+    frame_id: str
+    call_index: int
+    call_hash: str
+    tool: ToolName
+    request: ToolRequest
+    result: ToolFailure
+
+
 class FrameExited(_Header):
     kind: Literal["frame_exited"] = "frame_exited"
     frame_id: str
@@ -162,6 +177,7 @@ Event: TypeAlias = Annotated[
     | GateReturned
     | Asked
     | Answered
+    | CallFailed
     | FrameExited
     | FrameIntegrating
     | FrameIntegrated
