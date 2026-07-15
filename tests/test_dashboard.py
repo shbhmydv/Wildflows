@@ -364,17 +364,24 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     assert dark == _DARK_TOKENS
     assert automatic_dark == _DARK_TOKENS
     assert "border-left" not in css
-    assert "const FRAME_COLUMN_MIN = 260;" in javascript
+    assert "const FRAME_COLUMN_MIN = 280;" in javascript
     assert (
         'const node = el("section", `frame-node frame-card ${frame.state}'
         '${collapsed ? " collapsed-container" : ""}`);'
     ) in javascript
     assert 'node.append(calls);' in javascript
     assert "if (collapsed) return node;" in javascript
-    assert ".canvas { min-height: 0; overflow-x: auto; overflow-y: auto;" in css
-    assert (
-        "grid-template-columns: repeat(var(--call-columns), "
-        "minmax(260px, 1fr));"
-    ) in css
-    assert ".frame-card.collapsed-container { padding: 0; }" in css
+    assert ".canvas { position: relative; min-height: 0; overflow: auto;" in css
+    assert ".canvas-surface { position: absolute;" in css
+    assert "transform: scale(var(--canvas-zoom, 1));" in css
+    assert ".canvas-controls { position: absolute;" in css
+    assert "grid-auto-columns: max-content;" in css
+    assert "grid-auto-flow: column;" in css
+    assert ".frame-card.collapsed-container { width: var(--frame-column-min);" in css
+    assert ".clamped.expanded { display: block; max-height: 150px;" in css
+    assert 'const space = el("div", "canvas-space");' in javascript
+    assert 'const surface = el("div", "canvas-surface");' in javascript
+    assert "event.ctrlKey" in javascript
+    assert "fitCanvasToWidth" in javascript
+    assert 'id="canvas-controls"' in index
     assert ".ask-card { position: absolute" not in css

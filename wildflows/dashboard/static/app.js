@@ -7,10 +7,13 @@ const el = (tag, className, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
-const FRAME_COLUMN_MIN = 260;
-const CALL_COLUMN_GAP = 8;
-const CALL_COLUMN_LIMIT = 5;
-let callLayoutFrame = null;
+const FRAME_COLUMN_MIN = 280;
+const CANVAS_PADDING = 18;
+const MIN_CANVAS_ZOOM = 0.01;
+const MAX_CANVAS_ZOOM = 2;
+const CANVAS_ZOOM_STEP = 0.1;
+let canvasLayoutFrame = null;
+let canvasPan = null;
 
 const state = {
   runs: [],
@@ -18,6 +21,8 @@ const state = {
   run: null,
   source: null,
   canvasRoot: null,
+  canvasZoom: 1,
+  resetCanvasView: true,
   expandedFrames: new Set(),
   expandedCalls: new Set(),
   token: sessionStorage.getItem("wf-token") || "",
@@ -56,6 +61,28 @@ function short(value, size = 8) {
 function firstLine(value, fallback = "—") {
   const line = String(value || "").split("\n").find(item => item.trim());
   return line ? line.trim() : fallback;
+}
+
+function expandableCopy(className, value, title = "Expand text") {
+  const control = el("button", className);
+  control.type = "button";
+  control.setAttribute("aria-expanded", "false");
+  const copy = el("span", "clamped", value);
+  control.append(copy);
+  control.title = title;
+  control.addEventListener("click", () => {
+    copy.classList.toggle("expanded");
+    control.setAttribute("aria-expanded", String(copy.classList.contains("expanded")));
+  });
+  return control;
+}
+
+function failedChildrenChip(frame, reserve = false) {
+  const count = Number(frame.failed_children || 0);
+  const chip = el("span", `failed-children-chip${count ? "" : " empty"}`);
+  if (count) chip.textContent = `${count} failed ${count === 1 ? "child" : "children"}`;
+  if (!count && !reserve) return null;
+  return chip;
 }
 
 function formatDuration(seconds) {
@@ -173,6 +200,8 @@ async function selectRun(key, updateUrl = true) {
   state.run = run;
   state.expandedFrames.clear();
   state.expandedCalls.clear();
+  state.canvasZoom = 1;
+  state.resetCanvasView = true;
   const requestedRoot = new URLSearchParams(location.search).get("frame");
   state.canvasRoot = requestedRoot && run.frames[requestedRoot] ? requestedRoot : run.root_frame_id;
   $("#run-picker").value = key;
@@ -295,41 +324,109 @@ function defaultCollapsed(frame) {
   return call?.status === "completed" || (!nested && !state.run.active);
 }
 
-function layoutCallRows(root) {
-  root.querySelectorAll(".call-children:not(.serial)").forEach(row => {
-    const slots = row.children.length;
-    if (!slots) return;
-    const available = row.parentElement?.clientWidth || FRAME_COLUMN_MIN;
-    const fit = Math.max(1, Math.floor((available + CALL_COLUMN_GAP) / (FRAME_COLUMN_MIN + CALL_COLUMN_GAP)));
-    const columns = Math.min(slots, CALL_COLUMN_LIMIT, fit);
-    const minimum = columns * FRAME_COLUMN_MIN + (columns - 1) * CALL_COLUMN_GAP;
-    row.dataset.columns = String(columns);
-    row.style.setProperty("--call-columns", String(columns));
-    row.style.setProperty("--call-row-min", `${minimum}px`);
+function canvasSurface() {
+  return $("#canvas .canvas-surface");
+}
+
+function clampCanvasZoom(value) {
+  return Math.min(MAX_CANVAS_ZOOM, Math.max(MIN_CANVAS_ZOOM, value));
+}
+
+function updateZoomControls() {
+  const enabled = Boolean(state.run && canvasSurface());
+  $("#zoom-value").textContent = `${Math.round(state.canvasZoom * 100)}%`;
+  $("#zoom-out").disabled = !enabled || state.canvasZoom <= MIN_CANVAS_ZOOM;
+  $("#zoom-in").disabled = !enabled || state.canvasZoom >= MAX_CANVAS_ZOOM;
+  $("#zoom-fit").disabled = !enabled;
+}
+
+function updateCanvasGeometry() {
+  const viewport = $("#canvas");
+  const surface = canvasSurface();
+  const space = viewport.querySelector(".canvas-space");
+  if (!surface || !space) {
+    updateZoomControls();
+    return;
+  }
+  surface.style.setProperty("--canvas-zoom", String(state.canvasZoom));
+  const naturalWidth = Math.max(surface.offsetWidth, surface.scrollWidth);
+  const naturalHeight = Math.max(surface.offsetHeight, surface.scrollHeight);
+  space.style.width = `${Math.max(viewport.clientWidth, Math.ceil(naturalWidth * state.canvasZoom + CANVAS_PADDING * 2))}px`;
+  space.style.height = `${Math.max(viewport.clientHeight, Math.ceil(naturalHeight * state.canvasZoom + CANVAS_PADDING * 2))}px`;
+  updateZoomControls();
+}
+
+function scheduleCanvasGeometry() {
+  if (canvasLayoutFrame !== null) window.cancelAnimationFrame(canvasLayoutFrame);
+  canvasLayoutFrame = window.requestAnimationFrame(() => {
+    canvasLayoutFrame = null;
+    updateCanvasGeometry();
   });
 }
 
-function scheduleCallRowLayout() {
-  if (callLayoutFrame !== null) window.cancelAnimationFrame(callLayoutFrame);
-  callLayoutFrame = window.requestAnimationFrame(() => {
-    callLayoutFrame = null;
-    layoutCallRows($("#canvas"));
+function setCanvasZoom(value, anchor = null, animate = true) {
+  const viewport = $("#canvas");
+  const surface = canvasSurface();
+  if (!surface) return;
+  const oldZoom = state.canvasZoom;
+  const nextZoom = clampCanvasZoom(value);
+  if (Math.abs(nextZoom - oldZoom) < 0.0001) return;
+  const rect = viewport.getBoundingClientRect();
+  const anchorX = anchor ? anchor.clientX - rect.left : viewport.clientWidth / 2;
+  const anchorY = anchor ? anchor.clientY - rect.top : viewport.clientHeight / 2;
+  const naturalX = (viewport.scrollLeft + anchorX - CANVAS_PADDING) / oldZoom;
+  const naturalY = (viewport.scrollTop + anchorY - CANVAS_PADDING) / oldZoom;
+  if (animate) {
+    surface.classList.remove("zoom-animate");
+    void surface.offsetWidth;
+    surface.classList.add("zoom-animate");
+  }
+  state.canvasZoom = nextZoom;
+  updateCanvasGeometry();
+  viewport.scrollLeft = CANVAS_PADDING + naturalX * nextZoom - anchorX;
+  viewport.scrollTop = CANVAS_PADDING + naturalY * nextZoom - anchorY;
+  if (animate) window.setTimeout(() => surface.classList.remove("zoom-animate"), 180);
+}
+
+function fitCanvasToWidth() {
+  const viewport = $("#canvas");
+  const surface = canvasSurface();
+  if (!surface) return;
+  const naturalWidth = Math.max(surface.offsetWidth, surface.scrollWidth);
+  if (!naturalWidth) return;
+  const fitted = (viewport.clientWidth - CANVAS_PADDING * 2) / naturalWidth;
+  setCanvasZoom(fitted, {
+    clientX: viewport.getBoundingClientRect().left + CANVAS_PADDING,
+    clientY: viewport.getBoundingClientRect().top + CANVAS_PADDING,
   });
+  viewport.scrollLeft = 0;
 }
 
 function renderCanvas() {
   const target = $("#canvas");
+  const previousLeft = target.scrollLeft;
+  const previousTop = target.scrollTop;
+  const resetView = state.resetCanvasView;
+  state.resetCanvasView = false;
   target.replaceChildren();
   if (!state.run || !state.run.frames[state.canvasRoot]) {
     target.append(el("div", "empty-state", "Select a run to inspect its call stack."));
+    updateZoomControls();
     return;
   }
   $("#frame-count").textContent = `${state.run.frame_order.length} frame${state.run.frame_order.length === 1 ? "" : "s"}`;
   renderBreadcrumb();
+  const space = el("div", "canvas-space");
+  const surface = el("div", "canvas-surface");
+  surface.style.setProperty("--canvas-zoom", String(state.canvasZoom));
+  surface.style.setProperty("--frame-column-min", `${FRAME_COLUMN_MIN}px`);
   const root = el("div", "stack-root");
   root.append(renderFrame(state.canvasRoot, 0));
-  target.append(root);
-  layoutCallRows(root);
+  surface.append(root);
+  space.append(surface);
+  target.append(space);
+  updateCanvasGeometry();
+  target.scrollTo(resetView ? 0 : previousLeft, resetView ? 0 : previousTop);
 }
 
 function ancestors(frameId) {
@@ -357,9 +454,9 @@ function renderBreadcrumb() {
 
 function rebase(frameId) {
   state.canvasRoot = frameId;
+  state.resetCanvasView = true;
   updateQuery(state.run, frameId);
   renderCanvas();
-  $("#canvas").scrollTo(0, 0);
 }
 
 function renderFrame(frameId, relativeDepth) {
@@ -397,7 +494,7 @@ function renderCollapsedFrame(frame) {
   card.type = "button";
   card.title = `Expand ${frame.path}`;
   const result = frame.state === "failed" ? frame.reason : firstLine(frame.text, "completed");
-  card.append(dot(frame.state), el("span", "frame-name", frame.name), el("span", "rig-chip", frame.rig), timed(el("span"), frame), el("span", `collapsed-result${frame.state === "failed" ? " failure-reason" : ""}`, result));
+  card.append(dot(frame.state), el("span", "frame-name", frame.name), el("span", "rig-chip", frame.rig), timed(el("span"), frame), failedChildrenChip(frame, true), el("span", `collapsed-result${frame.state === "failed" ? " failure-reason" : ""}`, result));
   card.addEventListener("click", () => { state.expandedFrames.add(frame.frame_id); renderCanvas(); });
   return card;
 }
@@ -411,24 +508,21 @@ function renderFullFrame(frame) {
   const pendingDispatch = frame.calls.find(call => call.tool === "dispatch" && call.status === "pending");
   let label = frame.state;
   if (frame.state === "banked" && pendingDispatch) label = `banked · waiting on call ${pendingDispatch.call_index}`;
-  top.append(el("span", `state-chip ${frame.state}`, label), timed(el("span"), frame));
+  top.append(el("span", `state-chip ${frame.state}`, label));
+  const failedChip = failedChildrenChip(frame);
+  if (failedChip) top.append(failedChip);
+  top.append(timed(el("span"), frame));
   card.append(top, el("p", "frame-prompt", frame.prompt));
   const meta = el("div", "frame-meta");
   meta.append(el("span", "", `depth ${frame.depth}`), el("span", "", `attempt branch ${short(frame.branch, 18)}`));
   if (frame.skills.length) meta.append(el("span", "", `skills · ${frame.skills.join(", ")}`));
   card.append(meta);
   if (frame.text || frame.reason) {
-    const result = el("button", `frame-result${frame.state === "failed" ? " failure-reason" : ""}`);
-    result.type = "button";
-    result.setAttribute("aria-expanded", "false");
-    const copy = el("span", "clamped", frame.state === "failed" ? frame.reason : frame.text);
-    result.append(copy);
-    result.title = "Expand result text";
-    result.addEventListener("click", () => {
-      copy.classList.toggle("expanded");
-      result.setAttribute("aria-expanded", String(copy.classList.contains("expanded")));
-    });
-    card.append(result);
+    card.append(expandableCopy(
+      `frame-result${frame.state === "failed" ? " failure-reason" : ""}`,
+      frame.state === "failed" ? frame.reason : frame.text,
+      "Expand result text",
+    ));
   }
   if (collapsible) {
     top.title = "Collapse the completed frame";
@@ -447,7 +541,11 @@ function renderCall(frame, call, relativeDepth) {
   heading.append(el("span", "call-command", taskLabel), el("span", "call-counts", callSummary(call)));
   block.append(heading);
   if (call.result?.outcome === "refused") {
-    block.append(el("div", "failure-reason", firstLine(call.result.message, "dispatch refused")));
+    block.append(expandableCopy(
+      "call-error failure-reason",
+      call.result.message || "dispatch refused",
+      "Expand dispatch error",
+    ));
     return block;
   }
   const callKey = `${frame.frame_id}:${call.call_index}`;
@@ -532,9 +630,12 @@ function streamBox(label, value) {
 
 function renderAsk(frame, call) {
   const card = el("section", "ask-card");
-  card.append(el("span", "micro-label", call.status === "pending" ? "Owner input required" : "Owner answered"), el("p", "ask-question", call.request.question));
+  card.append(
+    el("span", "micro-label", call.status === "pending" ? "Owner input required" : "Owner answered"),
+    expandableCopy("ask-question", call.request.question, "Expand owner question"),
+  );
   if (call.status === "completed") {
-    card.append(el("div", "frame-result", call.result?.answer || "answered"));
+    card.append(expandableCopy("frame-result", call.result?.answer || "answered", "Expand owner answer"));
     return card;
   }
   if (!state.run.controls.answer) {
@@ -675,8 +776,44 @@ $("#token-form").addEventListener("submit", event => {
   sessionStorage.setItem("wf-token", state.token);
   toast("Control token saved for this tab");
 });
+const canvas = $("#canvas");
+canvas.addEventListener("wheel", event => {
+  if (!event.ctrlKey && !event.metaKey) return;
+  event.preventDefault();
+  setCanvasZoom(state.canvasZoom * Math.exp(-event.deltaY * 0.002), event);
+}, { passive: false });
+canvas.addEventListener("pointerdown", event => {
+  const space = canvas.querySelector(".canvas-space");
+  if (event.button !== 0 || (event.target !== canvas && event.target !== space)) return;
+  canvasPan = {
+    pointerId: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+    left: canvas.scrollLeft,
+    top: canvas.scrollTop,
+  };
+  canvas.setPointerCapture(event.pointerId);
+  canvas.classList.add("panning");
+  event.preventDefault();
+});
+canvas.addEventListener("pointermove", event => {
+  if (!canvasPan || canvasPan.pointerId !== event.pointerId) return;
+  canvas.scrollLeft = canvasPan.left - (event.clientX - canvasPan.x);
+  canvas.scrollTop = canvasPan.top - (event.clientY - canvasPan.y);
+});
+function endCanvasPan(event) {
+  if (!canvasPan || canvasPan.pointerId !== event.pointerId) return;
+  canvasPan = null;
+  canvas.classList.remove("panning");
+}
+canvas.addEventListener("pointerup", endCanvasPan);
+canvas.addEventListener("pointercancel", endCanvasPan);
+canvas.addEventListener("lostpointercapture", endCanvasPan);
+$("#zoom-out").addEventListener("click", () => setCanvasZoom(state.canvasZoom - CANVAS_ZOOM_STEP));
+$("#zoom-in").addEventListener("click", () => setCanvasZoom(state.canvasZoom + CANVAS_ZOOM_STEP));
+$("#zoom-fit").addEventListener("click", fitCanvasToWidth);
 window.addEventListener("beforeunload", closeStream);
-window.addEventListener("resize", scheduleCallRowLayout);
+window.addEventListener("resize", scheduleCanvasGeometry);
 window.setInterval(updateLiveClocks, 1000);
 applyQueryTheme();
 updateThemeButton();

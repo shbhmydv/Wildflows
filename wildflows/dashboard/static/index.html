@@ -67,6 +67,12 @@
               <nav id="canvas-breadcrumb" class="canvas-breadcrumb" aria-label="Canvas root"></nav>
             </header>
             <div id="canvas" class="canvas"><div class="empty-state">Select a run to inspect its call stack.</div></div>
+            <div id="canvas-controls" class="canvas-controls" aria-label="Canvas zoom controls">
+              <button id="zoom-out" type="button" aria-label="Zoom out" title="Zoom out">−</button>
+              <output id="zoom-value" aria-live="polite">100%</output>
+              <button id="zoom-in" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+              <button id="zoom-fit" type="button" aria-label="Fit canvas to width" title="Fit canvas to width">↔</button>
+            </div>
           </section>
 
           <section id="journal-panel" class="panel journal-panel" aria-labelledby="journal-title">
