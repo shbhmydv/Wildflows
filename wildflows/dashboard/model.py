@@ -12,7 +12,7 @@ from typing import cast
 from fastapi import HTTPException, status
 
 from wildflows.events import Event, FrameExited, FramePushed, parse_event
-from wildflows.frame import DispatchRequest, GateResult
+from wildflows.frame import DispatchRequest, FrameOutcome, GateResult
 from wildflows.projection import CallProjection, FrameProjection, RunProjection
 
 
@@ -195,9 +195,24 @@ class DashboardModel:
         ]
         return min(pending, key=lambda call: call.call_index) if pending else None
 
-    def _frame_state(self, frame: FrameProjection, projection: RunProjection) -> str:
-        if frame.outcome is not None:
-            return "done" if frame.outcome == "ok" else "failed"
+    @staticmethod
+    def _own_outcomes(events: list[Event]) -> dict[str, FrameOutcome]:
+        """Keep frame-exit outcomes separate from aggregate pop outcomes."""
+        outcomes: dict[str, FrameOutcome] = {}
+        for event in events:
+            if isinstance(event, FrameExited):
+                outcomes[event.frame_id] = event.outcome
+        return outcomes
+
+    def _frame_state(
+        self,
+        frame: FrameProjection,
+        projection: RunProjection,
+        own_outcomes: dict[str, FrameOutcome],
+    ) -> str:
+        own_outcome = own_outcomes.get(frame.frame_id)
+        if own_outcome is not None:
+            return "done" if own_outcome == "ok" else "failed"
         if self._pending_ask(frame.frame_id, projection) is not None:
             return "parked"
         if self._pending_dispatch(frame.frame_id, projection) is not None:
@@ -209,6 +224,7 @@ class DashboardModel:
         call: CallProjection,
         projection: RunProjection,
         event_times: dict[int, float],
+        own_outcomes: dict[str, FrameOutcome],
     ) -> dict[str, object]:
         children = sorted(
             (
@@ -230,7 +246,9 @@ class DashboardModel:
             gate_language = f"gate: {disposition} (exit {call.response.exit_code})"
         started_at = event_times.get(call.started_seq)
         ended_at = event_times.get(call.finished_seq) if call.finished_seq >= 0 else None
-        counts = Counter(self._frame_state(child, projection) for child in children)
+        counts = Counter(
+            self._frame_state(child, projection, own_outcomes) for child in children
+        )
         return {
             "call_index": call.call_index,
             "tool": call.tool,
@@ -262,9 +280,11 @@ class DashboardModel:
         started: dict[str, float],
         ended: dict[str, float],
         event_times: dict[int, float],
+        own_outcomes: dict[str, FrameOutcome],
     ) -> dict[str, object]:
         frame_started = started.get(frame.frame_id)
         frame_ended = ended.get(frame.frame_id)
+        own_outcome = own_outcomes.get(frame.frame_id)
         calls = sorted(
             (
                 call
@@ -274,7 +294,12 @@ class DashboardModel:
             key=lambda call: call.call_index,
         )
         reason_source = frame.stderr or frame.text or (
-            "frame exited without a result" if frame.outcome is not None else ""
+            "frame exited without a result" if own_outcome is not None else ""
+        )
+        failed_children = sum(
+            own_outcomes.get(child.frame_id) == "failed"
+            for child in projection.frames.values()
+            if child.parent_frame_id == frame.frame_id
         )
         return {
             "frame_id": frame.frame_id,
@@ -287,8 +312,9 @@ class DashboardModel:
             "prompt": frame.prompt,
             "name": self._first_line(frame.prompt, frame.frame_id),
             "skills": list(frame.skills),
-            "state": self._frame_state(frame, projection),
-            "outcome": frame.outcome,
+            "state": self._frame_state(frame, projection, own_outcomes),
+            "outcome": own_outcome,
+            "failed_children": failed_children,
             "text": frame.text,
             "stdout": frame.stdout,
             "stderr": frame.stderr,
@@ -304,7 +330,10 @@ class DashboardModel:
             "branch": frame.branch,
             "base_commit": frame.base_commit,
             "head": frame.head,
-            "calls": [self._call_data(call, projection, event_times) for call in calls],
+            "calls": [
+                self._call_data(call, projection, event_times, own_outcomes)
+                for call in calls
+            ],
         }
 
     def _state_line(self, projection: RunProjection, frames: list[dict[str, object]]) -> str:
@@ -377,8 +406,11 @@ class DashboardModel:
             raise HTTPException(status.HTTP_409_CONFLICT, "run has no run_opened event")
         started, ended = self._times(snapshot.events)
         event_times = {event.seq: event.ts for event in snapshot.events}
+        own_outcomes = self._own_outcomes(snapshot.events)
         frame_values = [
-            self._frame_data(frame, projection, started, ended, event_times)
+            self._frame_data(
+                frame, projection, started, ended, event_times, own_outcomes
+            )
             for frame in sorted(
                 projection.frames.values(),
                 key=lambda item: (item.depth, item.frame_id),

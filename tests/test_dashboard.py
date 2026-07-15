@@ -1,6 +1,7 @@
 """Server and static-asset contract coverage for the v2 dashboard."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 from typing import cast
@@ -101,6 +102,30 @@ def _write_fixture_run(repo: Path, *, tail: bytes = b"") -> Path:
     run_dir = repo / ".wildflows" / "runs" / _RUN_ID
     run_dir.mkdir(parents=True)
     (run_dir / "events.ndjson").write_bytes(_FIXTURE_JOURNAL.read_bytes() + tail)
+    return run_dir
+
+
+def _write_failed_child_parent_run(repo: Path) -> Path:
+    records: list[bytes] = []
+    for line in _FIXTURE_JOURNAL.read_bytes().splitlines():
+        event = cast(dict[str, object], json.loads(line))
+        seq = event["seq"]
+        if seq in {20, 23}:
+            event["outcome"] = "failed"
+            if seq == 20:
+                event["exit_code"] = 1
+        elif seq == 24:
+            result = _object(event["result"])
+            result["outcome"] = "failed"
+            child = _objects(result["children"])[0]
+            child["outcome"] = "failed"
+            child["exit_code"] = 1
+        elif seq == 28:
+            event["outcome"] = "failed"
+        records.append(json.dumps(event, separators=(",", ":")).encode() + b"\n")
+    run_dir = repo / ".wildflows" / "runs" / _RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.ndjson").write_bytes(b"".join(records))
     return run_dir
 
 
@@ -242,6 +267,26 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
         "parked": 1,
         "running": 1,
     }
+
+
+def test_frame_state_uses_own_exit_outcome_not_failed_child_pop(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _write_failed_child_parent_run(repo)
+    client = TestClient(create_app(repo))
+
+    detail = _json_object(client.get(_run_url(client)))
+    frames = _object(detail["frames"])
+    parent = _object(frames["f0.c0.t0"])
+    child = _object(frames["f0.c0.t0.c0.t0"])
+
+    assert parent["state"] == "done"
+    assert parent["outcome"] == "ok"
+    assert parent["failed_children"] == 1
+    assert child["state"] == "failed"
+    assert _object(_call(parent, 0)["counts"]) == {"failed": 1}
+    assert _object(_call(_object(frames["f0"]), 0)["counts"]) == {"done": 1}
 
 
 def test_unfinished_run_stays_live_after_a_child_failure(tmp_path: Path) -> None:
