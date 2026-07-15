@@ -53,11 +53,13 @@ cat > rigs.yaml <<'EOF'
 rigs:
   senior:
     kind: script
+    description: deep architecture and review lane
     script: rigs/worker-picodex.sh
     log_dir: /tmp/wildflows/senior
     timeout_s: 1800
   worker:
     kind: script
+    description: bounded implementation lane
     # For pooled dual-GPU workers, set script: rigs/worker-local.sh.
     script: rigs/worker-picodex.sh
     log_dir: /tmp/wildflows/worker
@@ -110,9 +112,12 @@ Markdown bundles; target-local `.wildflows/skills/*.md` files add skills or shad
 bundled file with the same stem. Skills steer prompts—they do not grant capability or
 change admission.
 
-Every frame receives its assigned skill texts in order, then its job, the resolved skill
-manifest, and finally the engine tool/replay preamble. A skill starts with
-`# title — one-line description`; no plugin code or frontmatter is involved.
+Every frame receives its assigned skill texts in order, then its job, then one engine
+`RESOURCES` preamble. That block gives the currently dispatchable rig registry keys and
+operator descriptions, effective depth/width/frame/spend limits, the resolved skill
+manifest, and tool/refusal/replay guidance. Rig keys—not adapter script filenames—are
+passed to dispatch. A skill starts with `# title — one-line description`; no plugin code
+or frontmatter is involved.
 
 ## Dashboard
 

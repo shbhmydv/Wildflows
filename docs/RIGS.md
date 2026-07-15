@@ -1,7 +1,10 @@
 # Frame rig adapters
 
 A v2 frame rig is an agent process that receives a prompt, works in one engine-created
-CWD, can call the run's MCP tools, and exits with final text. `rigs.yaml` supports:
+CWD, can call the run's MCP tools, and exits with final text. Every entry may set an
+optional, short, single-line `description`; the engine shows it beside that registry key
+in frame resource preambles. An entry without `description` renders name-only.
+`rigs.yaml` supports:
 
 - `echo`: deterministic no-tool test rig;
 - `shell`: a bounded shell command (useful for test/fake frame binaries);
@@ -61,15 +64,18 @@ provider override bypasses lock creation and acquisition entirely.
 rigs:
   senior:
     kind: script
+    description: deep architecture and review lane
     script: rigs/worker-picodex.sh
     log_dir: /tmp/wildflows-logs/senior
     timeout_s: 1800
   local:
     kind: script
+    description: pooled dual-GPU Qwen lane for concretely-specced junior work
     script: rigs/worker-local.sh
     log_dir: /tmp/wildflows-logs/local
     timeout_s: 900
 ```
 
 Relative script/log paths resolve from the YAML file. Every dispatch rig name must be in
-this registry; the registry is the per-run allowlist.
+this registry; the registry is the per-run allowlist. Rig names are the keys (`senior`,
+`local` above), not adapter script filenames such as `worker-local.sh`.

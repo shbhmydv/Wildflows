@@ -1818,3 +1818,31 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      interior, including a depth-cutoff drill affordance; clicking the row restores
      the same contained subtree. Depth remains capped at three relative levels and
      drill-in still rebases the canvas root.
+### Hand-35 calls — resource-aware frame preambles
+
+136. **A frame is told its effective resources before it chooses a tool call.** The
+     engine's final `RESOURCES` block contains currently dispatchable registry keys in
+     operator order, their optional operator-authored single-line descriptions,
+     effective remaining depth, immediate parallel width, and the minimum remaining
+     descendant-frame/spend headroom across the frame and every ancestor subtree. A
+     rig that cannot fund even one child under that headroom is omitted. The existing
+     deterministic skill manifest follows in the same block, then tool, durable
+     refusal, owner-ask, and replay guidance. Registry keys are explicitly distinguished
+     from adapter script filenames.
+
+137. **Admission failures teach the valid registry without side effects.** Every typed
+     admission refusal includes the complete per-run registry allowlist in operator
+     order. It remains a journalled `dispatch_returned` no-effect result, so an unknown
+     key self-corrects from the returned text without parking the caller on `ask`.
+     `description` is optional on every discriminated `rigs.yaml` entry and is prompt
+     metadata only; old registry files remain valid.
+
+138. **Engine prompt materialization is outside durable call identity.** The canonical
+     call SHA-256 covers the tool name and canonical validated request (including a
+     dispatch's task text, rig, parallel flag, and normalized per-task skills), never
+     assigned skill bodies, the generated resource/tool/replay preamble, descriptions,
+     or live headroom. Child replay identity separately compares the durable original
+     task, rig, structural position, and assigned skill names from `frame_pushed`.
+     Therefore a pre-Hand-35 journal resumes without a hash conflict and receives the
+     stronger preamble on a restarted attempt; no event kind or field is added. An
+     already memoized old refusal retains its old text, as all durable results do.
