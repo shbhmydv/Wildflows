@@ -2,7 +2,7 @@
 
 **A durable call stack for resident agents: tool calls become banked work, branches stack with frames, and replay never pays twice.**
 
-![Completed 19-frame WILDFLOWS self-audit run with a four-worker audit dispatch and live journal](docs/images/selfaudit-light.png)
+![Completed 19-frame WILDFLOWS self-audit run with a four-worker audit dispatch and live journal](docs/images/run-selfaudit-light.png)
 
 ## What is this?
 
@@ -89,7 +89,7 @@ Answer a pending `ask` in the dashboard with its startup control token, or add
 
 For a small two-leaf example, see [`examples/toy-run`](examples/toy-run/).
 
-![Completed three-frame toy run with a parallel two-child dispatch and passing gate](docs/images/toy-light.png)
+![Completed three-frame toy run with a parallel two-child dispatch and passing gate](docs/images/run-toy-light.png)
 
 ## The journal is the stack
 
@@ -150,7 +150,7 @@ owner question.
 
 | Light | Dark |
 |---|---|
-| ![Completed 19-frame WILDFLOWS self-audit run in light mode](docs/images/selfaudit-light.png) | ![Completed 19-frame WILDFLOWS self-audit run in dark mode](docs/images/selfaudit-dark.png) |
+| ![Completed 19-frame WILDFLOWS self-audit run in light mode](docs/images/run-selfaudit-light.png) | ![Completed 19-frame WILDFLOWS self-audit run in dark mode](docs/images/run-selfaudit-dark.png) |
 
 The pair above is the real 19-frame WILDFLOWS self-audit in both themes, including its
 four-worker audit dispatch, one failed descendant, and final pytest and mypy gates.
