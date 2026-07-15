@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
 
 from tests.conftest import git
+from wildflows.admission import AdmissionPolicy
 from wildflows.engine import Engine
 from wildflows.events import DispatchCalled, DispatchReturned, FramePushed
 from wildflows.frame import ChildResult, DispatchRequest, DispatchResult, FrameResult, FrameRuntime, call_hash
@@ -152,7 +154,7 @@ def test_dispatch_call_hash_includes_each_skill_bundle_canonically() -> None:
     assert call_hash("dispatch", omitted) != call_hash("dispatch", changed_second_task)
 
 
-def test_frame_prompt_orders_assigned_skill_texts_before_job_manifest_and_preamble(
+def test_frame_prompt_orders_assigned_skill_texts_before_job_and_resources(
     repo: Path, tmp_path: Path
 ) -> None:
     rig = CapturingRig()
@@ -175,25 +177,177 @@ def test_frame_prompt_orders_assigned_skill_texts_before_job_manifest_and_preamb
         )
 
     preamble = (
+        "--- RESOURCES ---\n"
         "You are a WILDFLOWS frame. Work only in your CWD. Commit useful changes "
-        "before calling an engine tool or exiting. The only engine tools are "
-        "wildflows_dispatch, wildflows_gate, and wildflows_ask. Tool calls block; "
-        "child commits are present in your branch when dispatch returns. Dispatch "
-        "skills is optional and contains one ordered skill-name list per task.\n"
+        "before calling an engine tool or exiting.\n\n"
+        "RIGS:\n"
+        "- capture\n"
+        "Rig names are these registry keys; script filenames are not rig names.\n\n"
+        "LIMITS:\n"
+        "- Remaining depth below this frame: 4.\n"
+        "- Maximum parallel width: 8 tasks per dispatch.\n"
+        "- Remaining descendant frame capacity: 64.\n"
+        "- Remaining subtree spend capacity: 64 admission units.\n\n"
+        "SKILL MANIFEST:\n"
+        "- long: Long — Run a disciplined, multi-hour senior implementation frame\n"
+        "- plan-compress-execute: Plan, compress, execute — Turn a bounded junior "
+        "task into verified delivery\n"
+        "- skill-selection: Skill selection — Route a small, role-appropriate bundle "
+        "to each frame\n\n"
+        "TOOLS:\n"
+        "The only engine tools are wildflows_dispatch, wildflows_gate, and "
+        "wildflows_ask. Tool calls block; child commits are present in your branch "
+        "when dispatch returns. Dispatch skills is optional and contains one "
+        "ordered skill-name list per task. Admission refusals are durable, no-effect "
+        "tool results: nothing was launched, and replay returns the same refusal for "
+        "that call. Correct the request before making a new dispatch. Use "
+        "wildflows_ask only when progress requires owner-only information or a "
+        "decision; never use it to discover rigs, limits, or skills listed here.\n"
     )
     library = SkillLibrary(repo)
     expected = "\n\n".join([
         library.resolve(["skill-selection"])[0].text,
         library.resolve(["long"])[0].text,
         "--- FRAME JOB ---\nimplement the assigned task",
-        library.manifest(),
-        f"--- TOOL PREAMBLE ---\n{preamble}",
+        preamble,
     ])
     assert rig.prompts == [expected]
     pushed = [
         event for event in engine.journal.events() if isinstance(event, FramePushed)
     ]
     assert [event.skills for event in pushed] == [assigned]
+
+
+def test_child_resource_preamble_uses_effective_attenuated_rigs_and_limits(
+    repo: Path, tmp_path: Path
+) -> None:
+    rig = CapturingRig()
+    registry = RigRegistry(
+        {"senior": rig, "local": rig},
+        descriptions={
+            "senior": "deep architecture and review lane",
+            "local": "pooled dual-GPU Qwen lane for concretely-specced junior work",
+        },
+    )
+    engine = Engine(
+        tmp_path / "run",
+        repo,
+        registry,
+        run_id="resources",
+        root_rig="senior",
+        root_prompt="root job",
+        policy=AdmissionPolicy(
+            max_depth=3,
+            max_breadth=2,
+            max_subtree_frames=4,
+            max_subtree_spend=2,
+            rig_costs={"senior": 2, "local": 1},
+        ),
+        worktrees_root=tmp_path / "worktrees",
+    )
+    base = engine.repository.branch_tip()
+    engine.journal.append(FramePushed(
+        run_id=engine.run_id,
+        frame_id=Engine.ROOT_FRAME_ID,
+        attempt=0,
+        depth=0,
+        rig="senior",
+        prompt="root job",
+        skills=[],
+        branch=engine.repository.frame_branch(Engine.ROOT_FRAME_ID),
+        base_commit=base,
+        worktree=str(repo),
+        subtree_deadline=9_999_999_999.0,
+    ))
+    root_prompt = engine._frame_prompt(  # noqa: SLF001 - prompt contract regression
+        Engine.ROOT_FRAME_ID, "root job", [], repo
+    )
+    assert "RIGS:\n- senior: deep architecture and review lane\n- local: " in root_prompt
+    assert "Rig names are these registry keys; script filenames are not rig names." in root_prompt
+
+    child_id = "f0.c0.t0"
+    engine.journal.append(FramePushed(
+        run_id=engine.run_id,
+        frame_id=child_id,
+        parent_frame_id=Engine.ROOT_FRAME_ID,
+        parent_call_index=0,
+        task_index=0,
+        attempt=0,
+        depth=1,
+        rig="local",
+        prompt="bounded child task",
+        skills=[],
+        branch=engine.repository.frame_branch(child_id),
+        base_commit=base,
+        worktree=str(repo),
+        subtree_deadline=9_999_999_999.0,
+    ))
+    child_prompt = engine._frame_prompt(  # noqa: SLF001 - attenuation regression
+        child_id, "bounded child task", [], repo
+    )
+    resources = child_prompt.split("--- RESOURCES ---", maxsplit=1)[1]
+    rigs, limits = resources.split("LIMITS:", maxsplit=1)
+    assert rigs == (
+        "\nYou are a WILDFLOWS frame. Work only in your CWD. Commit useful changes "
+        "before calling an engine tool or exiting.\n\n"
+        "RIGS:\n"
+        "- local: pooled dual-GPU Qwen lane for concretely-specced junior work\n"
+        "Rig names are these registry keys; script filenames are not rig names.\n\n"
+    )
+    assert "- Remaining depth below this frame: 2." in limits
+    assert "- Maximum parallel width: 2 tasks per dispatch." in limits
+    assert "- Remaining descendant frame capacity: 3." in limits
+    assert "- Remaining subtree spend capacity: 1 admission unit." in limits
+
+
+def test_pre_resources_journal_fixture_replays_without_call_hash_conflict(
+    repo: Path, tmp_path: Path
+) -> None:
+    fixture = Path(__file__).with_name("fixtures") / "pre_resources_journal.ndjson"
+    records = [
+        cast(dict[str, object], json.loads(line))
+        for line in fixture.read_text(encoding="utf-8").splitlines()
+    ]
+    base = git(repo, "rev-parse", "HEAD")
+    worktrees = tmp_path / "replay-worktrees"
+    for record in records:
+        if record["kind"] == "run_opened":
+            record["repository"] = str(repo)
+            record["base_commit"] = base
+            record["worktrees_root"] = str(worktrees)
+        elif record["kind"] == "frame_pushed":
+            record["base_commit"] = base
+            record["worktree"] = str(tmp_path / "lost-root-worktree")
+        elif record["kind"] == "dispatch_called":
+            record["caller_head"] = base
+    run_dir = tmp_path / "pre-resources-run"
+    run_dir.mkdir()
+    (run_dir / "events.ndjson").write_text(
+        "".join(f"{json.dumps(record, separators=(',', ':'))}\n" for record in records),
+        encoding="utf-8",
+    )
+    git(repo, "branch", "wildflows/pre-resources/f0", base)
+
+    rig = CapturingRig()
+    engine = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"capture": rig}),
+        run_id="pre-resources",
+        root_rig="capture",
+        root_prompt="root job",
+    )
+    request = DispatchRequest(
+        tasks=["bounded child"], rig="capture", skills=[["long"]]
+    )
+    durable_call = engine.projection.call(Engine.ROOT_FRAME_ID, 0)
+    assert durable_call is not None
+    assert durable_call.call_hash == call_hash("dispatch", request)
+
+    assert engine.run().outcome == "ok"
+    assert len(rig.prompts) == 1
+    assert "--- RESOURCES ---" in rig.prompts[0]
+    assert "RESUME REPLAY:" in rig.prompts[0]
 
 
 def test_completed_dispatch_resume_digest_includes_skills_and_committed_progress(

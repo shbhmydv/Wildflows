@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -62,6 +63,14 @@ class CallConflictError(ToolProtocolError):
 
 class FrameNotActiveError(ToolProtocolError):
     """A token-authenticated request did not name a live caller frame."""
+
+
+@dataclass(frozen=True)
+class _AdmissionHeadroom:
+    remaining_depth: int
+    max_parallel_width: int
+    remaining_frames: int
+    remaining_spend: float
 
 
 class Engine:
@@ -423,6 +432,44 @@ class Engine:
             )
         return ancestors
 
+    def _subtree_admission_usage(self, frame_id: str) -> tuple[int, float]:
+        descendants = self.journal.projection.descendants(frame_id)
+        frames = len(descendants) + self._reservation_frames.get(frame_id, 0)
+        spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
+        spend += self._reservation_spend.get(frame_id, 0.0)
+        return frames, spend
+
+    def _admission_headroom(self, frame: FrameProjection) -> _AdmissionHeadroom:
+        remaining_frames: list[int] = []
+        remaining_spend: list[float] = []
+        for ancestor_id in self._ancestor_ids(frame):
+            frames, spend = self._subtree_admission_usage(ancestor_id)
+            remaining_frames.append(self.policy.max_subtree_frames - frames)
+            remaining_spend.append(self.policy.max_subtree_spend - spend)
+        return _AdmissionHeadroom(
+            remaining_depth=max(0, self.policy.max_depth - frame.depth),
+            max_parallel_width=self.policy.max_breadth,
+            remaining_frames=max(0, min(remaining_frames)),
+            remaining_spend=max(0.0, min(remaining_spend)),
+        )
+
+    def _dispatchable_rig_names(
+        self,
+        frame: FrameProjection,
+        headroom: _AdmissionHeadroom,
+    ) -> tuple[str, ...]:
+        if (
+            headroom.remaining_depth == 0
+            or headroom.remaining_frames == 0
+            or time.time() >= frame.subtree_deadline
+        ):
+            return ()
+        return tuple(
+            name
+            for name in self.registry.ordered_names
+            if self.policy.rig_cost(name) <= headroom.remaining_spend
+        )
+
     def _restore_dispatch_reservations(self) -> None:
         """Rebuild unconsumed admission reservations from durable pending calls."""
         for call in self.journal.projection.calls.values():
@@ -464,17 +511,12 @@ class Engine:
         ancestors = self._ancestor_ids(frame)
         for ancestor_id in ancestors:
             ancestor = self.journal.projection.frame(ancestor_id)
-            descendants = self.journal.projection.descendants(ancestor_id)
-            spend = sum(self.policy.rig_cost(item.rig) for item in descendants)
+            frames, spend = self._subtree_admission_usage(ancestor_id)
             admit_dispatch(
                 request,
                 caller_depth=frame.depth,
-                subtree_frames=(
-                    len(descendants) + self._reservation_frames.get(ancestor_id, 0)
-                ),
-                subtree_spend=(
-                    spend + self._reservation_spend.get(ancestor_id, 0.0)
-                ),
+                subtree_frames=frames,
+                subtree_spend=spend,
                 subtree_deadline=ancestor.subtree_deadline,
                 policy=self.policy,
                 registry=self.registry,
@@ -863,12 +905,40 @@ class Engine:
             if resume and progress_path.is_file()
             else None
         )
+        frame = self.journal.projection.frame(frame_id)
+        headroom = self._admission_headroom(frame)
+        rig_lines: list[str] = []
+        for name in self._dispatchable_rig_names(frame, headroom):
+            description = self.registry.description(name)
+            rig_lines.append(
+                f"- {name}" if description is None else f"- {name}: {description}"
+            )
+        if not rig_lines:
+            rig_lines.append("- (none within current admission headroom)")
+        spend_unit = "unit" if headroom.remaining_spend == 1 else "units"
         preamble = (
+            "--- RESOURCES ---\n"
             "You are a WILDFLOWS frame. Work only in your CWD. Commit useful changes "
-            "before calling an engine tool or exiting. The only engine tools are "
-            "wildflows_dispatch, wildflows_gate, and wildflows_ask. Tool calls block; "
-            "child commits are present in your branch when dispatch returns. Dispatch "
-            "skills is optional and contains one ordered skill-name list per task.\n"
+            "before calling an engine tool or exiting.\n\n"
+            "RIGS:\n"
+            f"{'\n'.join(rig_lines)}\n"
+            "Rig names are these registry keys; script filenames are not rig names.\n\n"
+            "LIMITS:\n"
+            f"- Remaining depth below this frame: {headroom.remaining_depth}.\n"
+            f"- Maximum parallel width: {headroom.max_parallel_width} tasks per dispatch.\n"
+            f"- Remaining descendant frame capacity: {headroom.remaining_frames}.\n"
+            "- Remaining subtree spend capacity: "
+            f"{headroom.remaining_spend:g} admission {spend_unit}.\n\n"
+            f"{self.skill_library.manifest()}\n\n"
+            "TOOLS:\n"
+            "The only engine tools are wildflows_dispatch, wildflows_gate, and "
+            "wildflows_ask. Tool calls block; child commits are present in your branch "
+            "when dispatch returns. Dispatch skills is optional and contains one "
+            "ordered skill-name list per task. Admission refusals are durable, no-effect "
+            "tool results: nothing was launched, and replay returns the same refusal for "
+            "that call. Correct the request before making a new dispatch. Use "
+            "wildflows_ask only when progress requires owner-only information or a "
+            "decision; never use it to discover rigs, limits, or skills listed here.\n"
         )
         if resume:
             digest: dict[str, object] = {
@@ -886,8 +956,7 @@ class Engine:
         sections = [skill.text for skill in skills]
         sections.extend([
             f"--- FRAME JOB ---\n{original}",
-            self.skill_library.manifest(),
-            f"--- TOOL PREAMBLE ---\n{preamble}",
+            preamble,
         ])
         return "\n\n".join(sections)
 

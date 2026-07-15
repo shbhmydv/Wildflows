@@ -46,6 +46,15 @@ class AdmissionError(RuntimeError):
         self.code = code
 
 
+def _refusal(
+    code: AdmissionCode,
+    message: str,
+    registry: RigRegistry,
+) -> AdmissionError:
+    allowed = ", ".join(registry.ordered_names) or "(none)"
+    return AdmissionError(code, f"{message}; allowed rigs: {allowed}")
+
+
 def admit_dispatch(
     request: DispatchRequest,
     *,
@@ -61,33 +70,39 @@ def admit_dispatch(
     observed = time.time() if now is None else now
     child_depth = caller_depth + 1
     if child_depth > policy.max_depth:
-        raise AdmissionError(
+        raise _refusal(
             "depth_cap",
             f"child depth {child_depth} exceeds cap {policy.max_depth}",
+            registry,
         )
     if len(request.tasks) > policy.max_breadth:
-        raise AdmissionError(
+        raise _refusal(
             "breadth_cap",
             f"dispatch breadth {len(request.tasks)} exceeds cap {policy.max_breadth}",
+            registry,
         )
     if subtree_frames + len(request.tasks) > policy.max_subtree_frames:
-        raise AdmissionError(
+        raise _refusal(
             "subtree_frame_cap",
             f"subtree frames would exceed cap {policy.max_subtree_frames}",
+            registry,
         )
     if observed >= subtree_deadline:
-        raise AdmissionError(
+        raise _refusal(
             "subtree_time_cap",
             "caller subtree deadline has elapsed",
+            registry,
         )
     if request.rig not in registry:
-        raise AdmissionError(
+        raise _refusal(
             "rig_not_allowed",
             f"rig {request.rig!r} is not in this run's allowlist",
+            registry,
         )
     projected = subtree_spend + len(request.tasks) * policy.rig_cost(request.rig)
     if projected > policy.max_subtree_spend:
-        raise AdmissionError(
+        raise _refusal(
             "subtree_spend_cap",
             f"subtree spend {projected:g} would exceed cap {policy.max_subtree_spend:g}",
+            registry,
         )

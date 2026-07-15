@@ -10,7 +10,7 @@ import pytest
 from tests.conftest import executable
 from wildflows.frame import FrameRuntime
 from wildflows.rig import ScriptRig
-from wildflows.rigconfig import load_rigs
+from wildflows.rigconfig import RigsFile, load_rigs
 from wildflows.shim import write_pi_shim
 
 
@@ -350,6 +350,7 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
     timeout_s: 10
   local:
     kind: shell
+    description: pooled dual-GPU Qwen lane for concretely-specced junior work
     template: "printf done"
     timeout_s: 5
 """,
@@ -357,3 +358,13 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
     )
     registry = load_rigs(config)
     assert registry.names == frozenset({"root", "local"})
+    assert registry.ordered_names == ("root", "local")
+    assert registry.description("root") is None
+    assert registry.description("local") == (
+        "pooled dual-GPU Qwen lane for concretely-specced junior work"
+    )
+
+    old_style = RigsFile.model_validate({
+        "rigs": {"echo": {"kind": "echo"}},
+    })
+    assert old_style.rigs["echo"].description is None

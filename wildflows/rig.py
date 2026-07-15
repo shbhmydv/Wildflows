@@ -292,8 +292,24 @@ class ScriptRig:
 
 
 class RigRegistry:
-    def __init__(self, rigs: dict[str, Rig]) -> None:
+    def __init__(
+        self,
+        rigs: dict[str, Rig],
+        descriptions: dict[str, str] | None = None,
+    ) -> None:
         self._rigs = dict(rigs)
+        supplied = descriptions or {}
+        unknown = supplied.keys() - self._rigs.keys()
+        if unknown:
+            raise ValueError(
+                f"descriptions name unknown rigs: {', '.join(sorted(unknown))}"
+            )
+        self._descriptions: dict[str, str] = {}
+        for name, description in supplied.items():
+            normalized = description.strip()
+            if not normalized or "\n" in normalized or "\r" in normalized:
+                raise ValueError("rig descriptions must be non-blank single lines")
+            self._descriptions[name] = normalized
 
     def __contains__(self, name: object) -> bool:
         return name in self._rigs
@@ -302,6 +318,16 @@ class RigRegistry:
         if name not in self._rigs:
             raise KeyError(f"unknown rig: {name!r}")
         return self._rigs[name]
+
+    def description(self, name: str) -> str | None:
+        if name not in self._rigs:
+            raise KeyError(f"unknown rig: {name!r}")
+        return self._descriptions.get(name)
+
+    @property
+    def ordered_names(self) -> tuple[str, ...]:
+        """Registry keys in operator-authored YAML/mapping order."""
+        return tuple(self._rigs)
 
     @property
     def names(self) -> frozenset[str]:

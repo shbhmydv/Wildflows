@@ -74,6 +74,32 @@ def test_dispatch_rails_refuse_before_effects(
             registry=RigRegistry({"ok": EchoRig()}),
         )
     assert raised.value.code == code
+    assert str(raised.value).endswith("allowed rigs: ok")
+
+
+def test_unknown_rig_refusal_lists_registry_keys_in_operator_order() -> None:
+    registry = RigRegistry({
+        "senior": EchoRig(),
+        "senior-terra": EchoRig(),
+        "local": EchoRig(),
+    })
+
+    with pytest.raises(AdmissionError) as raised:
+        admit_dispatch(
+            DispatchRequest(tasks=["bounded work"], rig="worker-local"),
+            caller_depth=0,
+            subtree_frames=0,
+            subtree_spend=0.0,
+            subtree_deadline=time.time() + 60,
+            policy=AdmissionPolicy(),
+            registry=registry,
+        )
+
+    assert raised.value.code == "rig_not_allowed"
+    assert str(raised.value) == (
+        "rig 'worker-local' is not in this run's allowlist; "
+        "allowed rigs: senior, senior-terra, local"
+    )
 
 
 def test_pending_dispatch_reservation_is_rebuilt_on_restart(

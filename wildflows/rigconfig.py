@@ -5,19 +5,33 @@ from pathlib import Path
 from typing import Annotated, Literal, Union
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from wildflows.rig import EchoRig, Rig, RigRegistry, ScriptRig, ShellRig
 
 
-class EchoRigConfig(BaseModel):
+class _RigConfigBase(BaseModel):
+    description: str | None = None
+
+    @field_validator("description")
+    @classmethod
+    def _single_line_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or "\n" in normalized or "\r" in normalized:
+            raise ValueError("rig descriptions must be non-blank single lines")
+        return normalized
+
+
+class EchoRigConfig(_RigConfigBase):
     kind: Literal["echo"] = "echo"
 
     def build(self) -> Rig:
         return EchoRig()
 
 
-class ShellRigConfig(BaseModel):
+class ShellRigConfig(_RigConfigBase):
     kind: Literal["shell"] = "shell"
     template: str
     timeout_s: float = Field(gt=0)  # required + positive — no unbounded/degenerate rig
@@ -26,7 +40,7 @@ class ShellRigConfig(BaseModel):
         return ShellRig(template=self.template, timeout_s=self.timeout_s)
 
 
-class ScriptRigConfig(BaseModel):
+class ScriptRigConfig(_RigConfigBase):
     kind: Literal["script"] = "script"
     script: Path
     log_dir: Path
@@ -62,7 +76,10 @@ def load_rigs(path: Path) -> RigRegistry:
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     parsed = RigsFile.model_validate(data)
     built: dict[str, Rig] = {}
+    descriptions: dict[str, str] = {}
     for name, config in parsed.rigs.items():
+        if config.description is not None:
+            descriptions[name] = config.description
         if isinstance(config, ScriptRigConfig):
             base = config_path.parent
             config = config.model_copy(update={
@@ -70,4 +87,4 @@ def load_rigs(path: Path) -> RigRegistry:
                 "log_dir": (base / config.log_dir).resolve(),
             })
         built[name] = config.build()
-    return RigRegistry(built)
+    return RigRegistry(built, descriptions)

@@ -297,6 +297,7 @@ def test_dispatch_admission_refusal_is_typed_and_has_no_child(
     data = json.loads((repo / "admission.json").read_text(encoding="utf-8"))
     assert data["outcome"] == "refused"
     assert data["error_code"] == "depth_cap"
+    assert data["message"].endswith("allowed rigs: fake")
     assert len(engine.projection.frames) == 1
     returned = [
         event for event in engine.journal.events() if isinstance(event, DispatchReturned)
