@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# ScriptRig adapter for an OpenAI-compatible local server (llama.cpp/nginx).
+# ScriptRig adapter for a flock-pinned local pi worker in its disposable worktree.
 set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_pin_backend.sh
+source "$script_dir/_pin_backend.sh"
 
 worktree=""; prompt=""; log_dir=""; handle_out=""; timeout=""
 while [[ $# -gt 0 ]]; do
@@ -23,37 +27,43 @@ handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
 echo "$(ps -o pgid= -p $$ | tr -d '[:space:]')" > "$handle_out"
 export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
 
-url="${WILDFLOWS_LOCAL_URL:-http://127.0.0.1:8080/v1/chat/completions}"
-model="${WILDFLOWS_LOCAL_MODEL:-local}"
-request="$log_dir/request.json"; response="$log_dir/response.json"; err="$log_dir/curl.stderr.log"
-python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"messages":[{"role":"user","content":sys.stdin.read()}]}))' \
-  "$model" < "$prompt" > "$request"
-headers=(-H 'Content-Type: application/json')
-curl_args=(--silent --show-error --fail-with-body)
-[[ -n "$timeout" ]] && curl_args+=(--max-time "$timeout")
-
-set +e
-(
-  cd "$worktree"
-  curl "${curl_args[@]}" "${headers[@]}" --data-binary "@$request" "$url" \
-    > "$response" 2> "$err"
+provider="${GRINDSTONE_SENIOR_PROVIDER:-}"
+model="${GRINDSTONE_SENIOR_MODEL:-qwen-3-6-27b-dense}"
+thinking="${GRINDSTONE_SENIOR_EFFORT:-medium}"
+extension="${WILDFLOWS_PI_EXTENSION:-}"
+[[ -n "$extension" && -f "$extension" ]] || {
+  echo "worker-local: WILDFLOWS_PI_EXTENSION is missing or unreadable" >&2
+  exit 2
+}
+pin_local_backend provider "$provider"
+system_prompt='You are a WILDFLOWS frame. Work only inside this worktree (your CWD), use relative paths, commit useful changes before engine tool calls or exit, and return a concise final report.'
+out="$log_dir/pi.stdout.log"; err="$log_dir/pi.stderr.log"
+limit=()
+if [[ -n "$timeout" ]] && command -v timeout >/dev/null 2>&1; then
+  limit=(timeout --signal=KILL "$timeout")
+elif [[ -n "$timeout" ]] && command -v gtimeout >/dev/null 2>&1; then
+  limit=(gtimeout --signal=KILL "$timeout")
+fi
+pi_args=(
+  -e "$extension" --provider "$provider" --model "$model" --thinking "$thinking"
+  --mode text --print --no-session --append-system-prompt "$system_prompt"
 )
+
+cd "$worktree"
+set +e
+if [[ -n "${_WILDFLOWS_PIN_FD:-}" ]]; then
+  # The wrapper retains its lock while foreground pi runs; pi does not inherit it.
+  "${limit[@]}" pi "${pi_args[@]}" < "$prompt" > "$out" 2> "$err" {_WILDFLOWS_PIN_FD}>&-
+else
+  "${limit[@]}" pi "${pi_args[@]}" < "$prompt" > "$out" 2> "$err"
+fi
 rc=$?
 set -e
+tail -c 65536 "$err" >&2 || true
+tail -c 262144 "$out" || true
 if [[ "$rc" -ne 0 ]]; then
-  tail -c 65536 "$err" >&2 || true
-  tail -c 65536 "$response" >&2 || true
-  echo "worker-local: curl exited $rc ($url)" >&2
-  exit "$rc"
+  echo "worker-local: pi exited $rc (provider=$provider model=$model)" >&2
+  grep -hiE 'rate.?limit|429|quota|usage limit|session limit|weekly limit|plan limit|too many requests' \
+    "$out" "$err" 2>/dev/null | head -3 >&2 || true
 fi
-python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-try:
-    text = data["choices"][0]["message"]["content"]
-except (KeyError, IndexError, TypeError) as exc:
-    raise SystemExit(f"worker-local: malformed completion response: {exc}") from exc
-if not isinstance(text, str):
-    raise SystemExit("worker-local: completion content is not text")
-print(text, end="")
-' < "$response"
+exit "$rc"
