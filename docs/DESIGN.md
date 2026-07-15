@@ -1931,3 +1931,10 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      leftovers whose integration completed), while retaining refs for pending intents.
      The audit's deeper pending/completed receipt, candidate-equality, and target-owner
      resume validation extension is consciously deferred.
+
+145. **Frame preambles name agent-authored control-flow shapes (owner-directed;
+     no audit finding).** The tools block now states that sequences are consecutive
+     dispatches, loops are caller-owned redispatch, and fan-out is one parallel
+     multi-task dispatch, with dependency-based guidance for choosing serial versus
+     parallel. This adds vocabulary only: engine-owned loop/sequence primitives remain
+     consciously out of scope, preserving the v2 frame model.
