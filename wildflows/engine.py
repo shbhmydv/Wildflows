@@ -55,6 +55,7 @@ from wildflows.workspace import (
     IntegrationError,
     Repository,
     RepositoryError,
+    RootIntegrationOwnershipError,
 )
 
 
@@ -1042,7 +1043,23 @@ class Engine:
                 if target_frame_id is None
                 else self.journal.projection.frame(target_frame_id).branch
             )
-            if target_worktree is None:
+            if target_frame_id is None:
+                owner = self.repository.checked_out_owner(target_ref)
+                if owner is not None and owner != self.repository.root:
+                    raise RootIntegrationOwnershipError(
+                        f"run branch {target_ref!r} is checked out by another "
+                        f"worktree: {owner}"
+                    )
+                if (
+                    target_worktree is not None
+                    and target_worktree.resolve() != self.repository.root
+                ):
+                    raise RootIntegrationOwnershipError(
+                        "root integration target is not the configured repository "
+                        f"worktree: {target_worktree}"
+                    )
+                target_worktree = owner
+            elif target_worktree is None:
                 target_worktree = self.repository.checked_out_owner(target_ref)
             intent = frame.integrating
             if intent is None:

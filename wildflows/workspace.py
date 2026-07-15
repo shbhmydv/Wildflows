@@ -28,6 +28,10 @@ class FrameOwnershipError(RepositoryError):
     """A frame branch exists without durable ownership by this run."""
 
 
+class RootIntegrationOwnershipError(IntegrationError):
+    """The run branch is checked out by a worktree this run does not own."""
+
+
 @dataclass(frozen=True)
 class FrameWorktree:
     frame_id: str

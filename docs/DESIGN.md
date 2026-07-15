@@ -1913,3 +1913,12 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      dispatch remains pending for replay, and a poisoned journal always escapes
      fail-closed. Full frame-completion certification (H4) and semantic journal
      transition poisoning (M4) remain consciously deferred.
+
+143. **The configured repository is the sole checked-out root owner (closes audit
+     M6).** Root unwind accepts the run ref only when it is unowned (the existing
+     compare-and-swap path) or checked out by the repository worktree configured for
+     this run. A different linked-worktree owner raises typed
+     `RootIntegrationOwnershipError`; the failed root unwind is journalled without
+     touching that owner. Child integration retains its explicit active-parent-worktree
+     contract. Broader pending-intent/receipt resume validation from M2 remains
+     consciously deferred.
