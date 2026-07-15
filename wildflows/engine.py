@@ -50,6 +50,7 @@ from wildflows.rig import RigRegistry, run_shell
 from wildflows.shim import write_pi_shim
 from wildflows.skill import SkillLibrary, SkillLibraryError
 from wildflows.workspace import (
+    FrameOwnershipError,
     FrameWorktree,
     IntegrationError,
     Repository,
@@ -771,7 +772,11 @@ class Engine:
     ) -> FrameProjection:
         existing = self.journal.projection.frames.get(frame_id)
         branch = existing.branch if existing is not None else self.repository.frame_branch(frame_id)
-        resume = existing is not None or self.repository.ref_exists(branch)
+        if existing is None and self.repository.ref_exists(branch):
+            raise FrameOwnershipError(
+                f"frame branch {branch!r} exists without a durable frame owner"
+            )
+        resume = existing is not None
         with self._workspace_lock:
             worktree = self.repository.create_frame_worktree(
                 frame_id, branch, base_commit, resume=resume

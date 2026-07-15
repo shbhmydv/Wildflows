@@ -1889,3 +1889,10 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      `Run.deliver_live_answer` complete-record snapshot remains the read-only live-owner
      exception. Disconnected-call lifetime (H2) and frame completion reconciliation
      (H4) are consciously deferred rather than folded into lifecycle locking.
+
+140. **Fresh frame refs require durable ownership (closes the H3 guard).** A launch
+     with no projected `frame_pushed` owner refuses a pre-existing deterministic frame
+     ref with typed `FrameOwnershipError` before worktree creation or rig execution;
+     only a projected frame may enter resume mode. The branch-format digest rename and
+     deeper resumed-tip validation recommended by H3 are consciously deferred because
+     UUID run ids make the naming collision itself a non-issue for the configured use.

@@ -24,6 +24,10 @@ class IntegrationError(RepositoryError):
     """A candidate could not be integrated without changing its target branch."""
 
 
+class FrameOwnershipError(RepositoryError):
+    """A frame branch exists without durable ownership by this run."""
+
+
 @dataclass(frozen=True)
 class FrameWorktree:
     frame_id: str
@@ -166,7 +170,9 @@ class Repository:
             self.git(["worktree", "add", str(path), short])
         else:
             if self.ref_exists(branch):
-                raise RepositoryError(f"new frame branch already exists: {branch}")
+                raise FrameOwnershipError(
+                    f"new frame branch already exists without durable ownership: {branch}"
+                )
             self.git(["worktree", "add", "-b", short, str(path), base])
         return FrameWorktree(frame_id, path, branch, base)
 
