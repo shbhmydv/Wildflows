@@ -507,8 +507,8 @@ the single source of truth (§6), the dashboard reads the same ndjson resume rea
 The system is "done enough" when it closes both, each ending with an AUDIT run (the
 panel macro's first live exercise):
 
-- **DF1 (loop shape).** The banked arc-stage clipping family in the RN app
-  (KNOWN-DEFECTS @ 06452897): retina/short-viewport clipping + remount-on-remeasure.
+- **DF1 (loop shape).** A banked arc-stage clipping defect family in a React Native
+  app target: retina/short-viewport clipping + remount-on-remeasure.
   Expression: `loop(senior with a live dev server + export; render → measure real DOM →
   fix → re-render, until the viewport matrix + hang-guard are green, cap N)`. **Success
   bar:** closed in ≤ ~30 min wall-clock (grindstone baseline: 8 epochs / ~5h, failed).

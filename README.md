@@ -2,7 +2,7 @@
 
 **A durable call stack for resident agents: tool calls become banked work, branches stack with frames, and replay never pays twice.**
 
-![Completed DF2 asset-quality run with a seven-frame call stack and live journal](docs/images/df2-light.png)
+![Completed 19-frame WILDFLOWS self-audit run with a four-worker audit dispatch and live journal](docs/images/selfaudit-light.png)
 
 ## What is this?
 
@@ -152,9 +152,8 @@ owner question.
 |---|---|
 | ![Completed 19-frame WILDFLOWS self-audit run in light mode](docs/images/selfaudit-light.png) | ![Completed 19-frame WILDFLOWS self-audit run in dark mode](docs/images/selfaudit-dark.png) |
 
-The hero is the completed seven-frame DF2 asset-quality run. The pair above is the real
-19-frame WILDFLOWS self-audit in both themes, including its four-worker audit dispatch,
-one failed descendant, and final pytest and mypy gates.
+The pair above is the real 19-frame WILDFLOWS self-audit in both themes, including its
+four-worker audit dispatch, one failed descendant, and final pytest and mypy gates.
 
 ## Dogfood and reference
 
@@ -162,8 +161,7 @@ The [design ledger](docs/DESIGN.md#evidence) records the owner-run results:
 
 - **DF1:** the resident-frame pivot fixed a real React Native clipping family in
   **20m40s**; the predecessor spent roughly five hours and did not close it.
-- **DF2:** the asset-quality swarm shown above is live dogfood of the parallel frame
-  path.
+- **DF2:** a 36-asset quality swarm ran live dogfood of the parallel frame path.
 - [`docs/DESIGN.md` §12](docs/DESIGN.md#12-v2--the-frame-architecture-call-stack-pivot-2026-07-14) — decision ledger and durability model
 - [`docs/RIGS.md`](docs/RIGS.md) — YAML registry and process/environment contract
 - [`docs/DASHBOARD.md`](docs/DASHBOARD.md) — watchlists, deep links, fixture, and answer seam
