@@ -394,7 +394,7 @@ function fitCanvasToWidth() {
   if (!surface) return;
   const naturalWidth = Math.max(surface.offsetWidth, surface.scrollWidth);
   if (!naturalWidth) return;
-  const fitted = (viewport.clientWidth - CANVAS_PADDING * 2) / naturalWidth;
+  const fitted = Math.min(1, (viewport.clientWidth - CANVAS_PADDING * 2) / naturalWidth);
   setCanvasZoom(fitted, {
     clientX: viewport.getBoundingClientRect().left + CANVAS_PADDING,
     clientY: viewport.getBoundingClientRect().top + CANVAS_PADDING,

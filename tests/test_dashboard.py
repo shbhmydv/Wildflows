@@ -286,7 +286,9 @@ def test_frame_state_uses_own_exit_outcome_not_failed_child_pop(
     assert parent["failed_children"] == 1
     assert child["state"] == "failed"
     assert _object(_call(parent, 0)["counts"]) == {"failed": 1}
-    assert _object(_call(_object(frames["f0"]), 0)["counts"]) == {"done": 1}
+    outer = _object(frames["f0"])
+    assert outer["failed_children"] == 1
+    assert _object(_call(outer, 0)["counts"]) == {"done": 1}
 
 
 def test_unfinished_run_stays_live_after_a_child_failure(tmp_path: Path) -> None:
