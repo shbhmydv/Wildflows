@@ -44,6 +44,10 @@ _LIGHT_TOKENS = {
     "--transparent": "#ffffff00",
     "--result-inset": "#17181a",
     "--result-ink": "#e8eaed",
+    "--frame-surface": "color-mix(in srgb, var(--violet-chip) 4%, var(--surface))",
+    "--call-surface": "color-mix(in srgb, var(--blue-chip) 4%, var(--surface))",
+    "--gate-surface": "color-mix(in srgb, var(--teal-chip) 4%, var(--surface))",
+    "--journal-surface": "color-mix(in srgb, var(--blue-chip) 4%, var(--surface))",
 }
 _DARK_TOKENS = {
     "--ground": "#101114",
@@ -66,6 +70,10 @@ _DARK_TOKENS = {
     "--transparent": "#10111400",
     "--result-inset": "#101114",
     "--result-ink": "#e8eaed",
+    "--frame-surface": "color-mix(in srgb, var(--violet-chip) 8%, var(--surface))",
+    "--call-surface": "color-mix(in srgb, var(--blue-chip) 8%, var(--surface))",
+    "--gate-surface": "color-mix(in srgb, var(--teal-chip) 8%, var(--surface))",
+    "--journal-surface": "color-mix(in srgb, var(--blue-chip) 8%, var(--surface))",
 }
 
 
@@ -139,16 +147,27 @@ def _run_url(client: TestClient) -> str:
     return f"/api/repos/{_text(run['repo_id'])}/runs/{_text(run['run_id'])}"
 
 
-def _css_tokens(css: str, selector: str) -> dict[str, str]:
+def _css_declarations(css: str, selector: str) -> dict[str, str]:
     match = re.search(
         rf"{re.escape(selector)}\s*\{{(?P<body>.*?)\}}", css, flags=re.DOTALL
     )
     assert match is not None
+    declarations: dict[str, str] = {}
+    for declaration in match.group("body").split(";"):
+        if ":" not in declaration:
+            continue
+        name, value = declaration.split(":", 1)
+        name = name.strip()
+        if re.fullmatch(r"[\w-]+", name):
+            declarations[name] = value.strip()
+    return declarations
+
+
+def _css_tokens(css: str, selector: str) -> dict[str, str]:
     return {
-        name: value.strip()
-        for name, value in re.findall(
-            r"^\s*(--[\w-]+):\s*([^;]+);", match.group("body"), flags=re.MULTILINE
-        )
+        name: value
+        for name, value in _css_declarations(css, selector).items()
+        if name.startswith("--")
     }
 
 
@@ -365,6 +384,38 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     assert {name: light[name] for name in _LIGHT_TOKENS} == _LIGHT_TOKENS
     assert dark == _DARK_TOKENS
     assert automatic_dark == _DARK_TOKENS
+
+    pill_selector = (
+        ".state-pill, .state-line .micro-label, .cap-chip, .count-chip, "
+        ".rig-chip, .state-chip, .failed-children-chip, .call-chip, .kind-badge"
+    )
+    pill = _css_declarations(css, pill_selector)
+    assert pill["display"] == "inline-flex"
+    assert pill["align-items"] == "center"
+    assert pill["justify-content"] == "center"
+    assert pill["line-height"] == "1"
+    assert pill["padding"] == "var(--pill-pad-y) var(--pill-pad-x)"
+    assert pill["vertical-align"] == "middle"
+    for selector in (
+        ".state-pill",
+        ".state-line .micro-label",
+        ".cap-chip",
+        ".count-chip",
+        ".rig-chip",
+        ".state-chip",
+        ".failed-children-chip",
+        ".call-chip",
+        ".kind-badge",
+    ):
+        assert "height" not in _css_declarations(css, selector)
+    for selector, token in {
+        ".frame-card": "--frame-surface",
+        ".call-block": "--call-surface",
+        ".gate-row": "--gate-surface",
+        ".journal-row": "--journal-surface",
+    }.items():
+        assert _css_declarations(css, selector)["background"] == f"var({token})"
+
     assert "border-left" not in css
     assert "const FRAME_COLUMN_MIN = 280;" in javascript
     assert (
