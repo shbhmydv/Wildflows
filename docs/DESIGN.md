@@ -1982,3 +1982,20 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      completion certificate: automatic recovery of the commit-to-`frame_exited` window,
      rig-result reconciliation, and arbitrary external-effect exactly-once remain
      deferred and require the full H4 certificate/idempotency protocol.
+
+### Hand-39 calls — pill geometry and zoned surface depth
+
+153. **Every dashboard text pill shares one explicit centering primitive
+     (owner visual review; no audit finding).** Run-state, current-state, cap/count,
+     rig/state/failure, dispatch, and journal-kind chips all use `inline-flex` with
+     centered alignment on both axes, unit line-height, explicit block/inline padding,
+     and middle outer alignment. Variants may adjust padding through primitive custom
+     properties, but fixed heights and font shorthands cannot reintroduce inherited
+     line boxes or baseline-dependent text placement.
+
+154. **Card hierarchy is a tokenized wash of the existing zone tints (owner visual
+     review; no audit finding).** Frame, dispatch, gate, and journal surfaces consume
+     dedicated semantic surface tokens mixed from their violet, blue, teal, and blue
+     chip tokens. Light uses a 4% tint and dark uses an 8% tint: enough to separate
+     nested cards and rows from their ground while keeping state borders and chips the
+     dominant, immediately legible color signals.
