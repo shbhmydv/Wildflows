@@ -58,6 +58,7 @@ rigs:
     timeout_s: 1800
   worker:
     kind: script
+    # For pooled dual-GPU workers, set script: rigs/worker-local.sh.
     script: rigs/worker-picodex.sh
     log_dir: /tmp/wildflows/worker
     timeout_s: 900

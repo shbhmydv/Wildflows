@@ -1780,3 +1780,19 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      only imports and helpers with no repository caller; explicitly exported
      compatibility spellings and protocol callbacks remain. There are no new design
      open items from this pass.
+
+### Hand-33 calls — frame-lifetime local GPU leases
+
+131. **A local GPU lane is leased per frame, not balanced per HTTP request.** The
+     bundled local adapter first tries non-blocking locks for 8081 and 8082 in that
+     order; if both are occupied, it blocks on 8081 rather than falling through to the
+     nginx router. The persistent wrapper descriptor covers the foreground Pi process
+     lifetime and is closed in the Pi child, so wrapper exit or SIGKILL cannot leave an
+     inherited lock behind. A non-empty operator provider override bypasses all lock
+     setup.
+
+132. **The established Pi adapter remains the compatibility baseline.**
+     `worker-local.sh` adopts its CLI, handle/PGID, extension, timeout, logging, tail,
+     and rate-limit behavior with local model/effort defaults. The small shell body is
+     duplicated rather than factored so `worker-picodex.sh` and its existing
+     environment/default contract remain byte-for-byte unchanged.

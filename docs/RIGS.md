@@ -28,14 +28,32 @@ as `busy`.
   calls or exit. Provider/model/effort overrides are
   `GRINDSTONE_SENIOR_PROVIDER`, `GRINDSTONE_SENIOR_MODEL`, and
   `GRINDSTONE_SENIOR_EFFORT`.
-- **`worker-local.sh`** calls an OpenAI-compatible chat-completions endpoint. It is a
-  one-shot junior and intentionally ignores the engine tools; a frame with no tool calls
-  is simply a leaf dispatch. Overrides are `WILDFLOWS_LOCAL_URL` and
-  `WILDFLOWS_LOCAL_MODEL`.
+- **`worker-local.sh`** runs the same resident Pi contract while flock-pinning the
+  frame to one local GPU backend. It defaults to model `qwen-3-6-27b-dense` at
+  `medium` effort; `GRINDSTONE_SENIOR_PROVIDER` is an explicit operator pin, and
+  the model/effort overrides match `worker-picodex.sh`.
 
 Both scripts keep prompts out of argv, write their process-group id to `--handle-out`,
 set a Git ceiling, return final text on stdout, diagnostics on stderr, and propagate the
 transport exit status.
+
+## Local GPU pool
+
+The local llama.cpp stack exposes two independent GPU backends behind an nginx
+least-connection router. Pi makes one HTTP request per turn, so the router sees no
+active connections between turns and alternates backends, making a multi-turn frame
+migrate GPUs and re-prefill its full prompt.
+
+Use a pooled `local` rig backed by `worker-local.sh` for normal local dispatches: it
+tries `local-reviewer-8081`, then `local-reviewer-8082`, and waits for 8081 when both
+are occupied, keeping its lock for Pi's entire lifetime. A third parallel frame queues
+rather than falling back to nginx. `WILDFLOWS_PIN_LOCK_DIR` overrides the lock directory
+(default `/tmp/llama-servers`) for isolated tests.
+
+Keep explicit `local-a`/`local-b` rigs only when an operator needs a fixed lane for
+benchmarking, diagnosis, or reservation. Configure those names with
+`GRINDSTONE_SENIOR_PROVIDER: local-reviewer-8081` or `local-reviewer-8082`; a non-empty
+provider override bypasses lock creation and acquisition entirely.
 
 ## Example YAML
 
