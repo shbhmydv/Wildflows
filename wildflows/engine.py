@@ -949,35 +949,65 @@ class Engine:
             commits=commits,
         )
 
-    @staticmethod
     def _explained_frame_tips(
-        projection: RunProjection, frame_id: str
+        self, projection: RunProjection, frame_id: str, branch_tip: str
     ) -> tuple[str, set[str]]:
         """Return the canonical and currently allowed journal-explained tips."""
         frame = projection.frame(frame_id)
         completed_tip = frame.base_commit
         pending: FrameIntegrating | None = None
+
+        def advance_observed_tip(observed: str, *, require_on_branch: bool) -> bool:
+            nonlocal completed_tip
+            if observed == completed_tip:
+                return True
+            if not self.repository.is_ancestor(completed_tip, observed):
+                return False
+            if require_on_branch and not self.repository.is_ancestor(
+                observed, branch_tip
+            ):
+                return False
+            completed_tip = observed
+            return True
+
         for event in projection.effective_events:
             if (
+                isinstance(event, (DispatchCalled, GateCalled, Asked))
+                and event.frame_id == frame_id
+            ):
+                caller_head = event.caller_head
+                if caller_head is not None and pending is None:
+                    advance_observed_tip(caller_head, require_on_branch=False)
+            elif (
                 isinstance(event, FrameIntegrating)
                 and event.target_frame_id == frame_id
-                and event.integration_base == completed_tip
+                and pending is None
+                and advance_observed_tip(
+                    event.integration_base, require_on_branch=True
+                )
             ):
                 pending = event
             elif (
                 isinstance(event, FrameIntegrated)
                 and event.target_frame_id == frame_id
-                and (
-                    event.integration_base == completed_tip
-                    or (
-                        pending is not None
-                        and event.integration_base == pending.integration_base
-                        and event.candidate_head == pending.candidate_head
-                    )
-                )
             ):
-                completed_tip = event.candidate_head
-                pending = None
+                matches_pending = (
+                    pending is not None
+                    and event.integration_base == pending.integration_base
+                    and event.candidate_head == pending.candidate_head
+                )
+                starts_at_completed_tip = event.integration_base == completed_tip
+                if (
+                    not starts_at_completed_tip
+                    and pending is None
+                    and advance_observed_tip(
+                        event.integration_base, require_on_branch=True
+                    )
+                ):
+                    starts_at_completed_tip = True
+                if starts_at_completed_tip or matches_pending:
+                    completed_tip = event.candidate_head
+                    pending = None
         if pending is None:
             return completed_tip, {completed_tip}
         return pending.candidate_head, {
@@ -988,10 +1018,10 @@ class Engine:
     def _guard_frame_relaunch(
         self, projection: RunProjection, frame: FrameProjection
     ) -> None:
-        expected_tip, allowed = self._explained_frame_tips(
-            projection, frame.frame_id
-        )
         found_tip = self.repository.branch_tip(frame.branch)
+        expected_tip, allowed = self._explained_frame_tips(
+            projection, frame.frame_id, found_tip
+        )
         if found_tip in allowed:
             return
         error = FrameRelaunchBlockedError(
@@ -1433,7 +1463,7 @@ class Engine:
         request: AskRequest,
         replaying: bool,
     ) -> AskResult | ToolFailure:
-        self.repository.ensure_clean(worktree.path, frame.branch)
+        caller_head = self.repository.ensure_clean(worktree.path, frame.branch)
         if not replaying:
             asked = Asked(
                 run_id=self.run_id,
@@ -1441,6 +1471,7 @@ class Engine:
                 call_index=call_index,
                 call_hash=digest,
                 request=request,
+                caller_head=caller_head,
             )
             self.journal.append(asked)
             self._notify_asked(asked)

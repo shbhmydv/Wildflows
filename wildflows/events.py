@@ -98,6 +98,7 @@ class Asked(_Header):
     call_index: int
     call_hash: str
     request: AskRequest
+    caller_head: str | None = None
 
 
 class Answered(_Header):

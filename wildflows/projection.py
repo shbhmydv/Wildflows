@@ -122,7 +122,7 @@ class RunProjection:
             else:
                 tool = "ask"
                 request = event.request
-                caller_head = None
+                caller_head = event.caller_head
             self.calls[(event.frame_id, event.call_index)] = CallProjection(
                 frame_id=event.frame_id,
                 call_index=event.call_index,

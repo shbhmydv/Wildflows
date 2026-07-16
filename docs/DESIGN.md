@@ -2018,3 +2018,17 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      `selfaudit-*`, with the DF2 and toy captions matched to their current runs. Canvas
      panning, two-axis scrolling, pointer-centered zoom, fit-to-width, and repeatable
      dashboard `--repo` usage were rechecked against the shipped frontend and CLI.
+
+### Hand-41 calls — call-observed frame tips
+
+156. **A clean tool-call boundary durably explains the caller's committed tip.**
+     Relaunch replay now walks the `caller_head` already recorded by dispatch and gate
+     call events before walking child integrations. Ask records the same optional field;
+     its default preserves existing v2 journals. This treats a linear self-committed
+     range observed by the engine as part of the frame frontier, including a pending
+     dispatch with no child integration. As a compatibility backstop, an integration
+     base may also advance the walk across such a range only when it descends from the
+     current explained tip and remains on the live frame branch. The relaunch guard is
+     not relaxed: a tip with neither a call-boundary observation nor that integration
+     ancestry remains unexplained and blocked. This keeps guard and receipt verification
+     consistent without adding a second frame-commit vocabulary.

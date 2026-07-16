@@ -169,6 +169,13 @@ class Repository:
             ["rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree
         ).stdout.strip()
 
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        return self.git(
+            ["merge-base", "--is-ancestor", ancestor, descendant], check=False
+        ).returncode == 0
+
     def _branch_owners(self, ref: str) -> list[Path]:
         fields = self.git(["worktree", "list", "--porcelain", "-z"]).stdout.split("\0")
         owners: list[Path] = []
