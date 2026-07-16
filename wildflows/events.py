@@ -157,6 +157,18 @@ class Answered(_Header):
     answer: str
 
 
+class CallRefused(_Header):
+    """A validated call failed before its tool-specific called event."""
+
+    kind: Literal["call_refused"] = "call_refused"
+    frame_id: str
+    call_index: int
+    call_hash: str
+    tool: ToolName
+    request: ToolRequest
+    reason: str
+
+
 class CallFailed(_Header):
     """A validated call stopped without producing its tool-specific return."""
 
@@ -253,6 +265,7 @@ Event: TypeAlias = Annotated[
     | GateReturned
     | Asked
     | Answered
+    | CallRefused
     | CallFailed
     | WorkerReaped
     | FrameRelaunchBlocked

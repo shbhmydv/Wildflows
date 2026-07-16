@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import logging
 import os
 import signal
 import subprocess as _subprocess
@@ -20,6 +21,7 @@ from wildflows.events import (
     Answered,
     Asked,
     CallFailed,
+    CallRefused,
     DispatchCalled,
     DispatchReturned,
     FrameExited,
@@ -89,6 +91,7 @@ class _NotifierSubprocess:
 
 
 subprocess = _NotifierSubprocess()
+logger = logging.getLogger(__name__)
 
 
 class CallConflictError(ToolProtocolError):
@@ -820,11 +823,18 @@ class Engine:
                 wait_for_leader = False
                 with self.journal.projection_transaction() as projection:
                     existing = projection.call(frame_id, call_index)
+                    refusal = projection.refusal(frame_id, call_index)
                     if existing is not None and (
                         existing.tool != tool or existing.call_hash != digest
                     ):
                         raise CallConflictError(
                             f"call {frame_id}:{call_index} content differs from its durable call"
+                        )
+                    if refusal is not None and (
+                        refusal.tool != tool or refusal.call_hash != digest
+                    ):
+                        raise CallConflictError(
+                            f"call {frame_id}:{call_index} content differs from its durable refusal"
                         )
                     leader = self._inflight_calls.get(key)
                     if leader is not None:
@@ -835,6 +845,10 @@ class Engine:
                         wait_for_leader = True
                     elif existing is not None and existing.response is not None:
                         return existing.response
+                    elif refusal is not None:
+                        return ToolFailure(
+                            error_code="call_refused", message=refusal.reason
+                        )
                     elif any(
                         owner == frame_id and index < call_index
                         for owner, index in self._inflight_calls
@@ -878,9 +892,9 @@ class Engine:
                     self._call_condition.wait()
         self._call_context.cancellation = live_call.cancellation
         parked = tool in ("dispatch", "ask")
-        if parked:
-            self._park_frame(frame_id, tool)
         try:
+            if parked:
+                self._park_frame(frame_id, tool)
             if tool == "dispatch":
                 if not isinstance(request, DispatchRequest):
                     raise TypeError("dispatch received the wrong request model")
@@ -898,6 +912,16 @@ class Engine:
             return self._ask(
                 frame, worktree, call_index, digest, request, replaying
             )
+        except Exception as exc:
+            with self.journal.projection_transaction() as projection:
+                called = projection.call(frame_id, call_index)
+            if called is not None:
+                raise
+            if tool == "dispatch":
+                self._clear_dispatch_reservation(frame_id, call_index)
+            return self._record_call_refusal(
+                frame_id, call_index, digest, tool, request, exc
+            )
         finally:
             if parked:
                 self._resume_frame(frame_id, live_call.cancellation)
@@ -905,6 +929,43 @@ class Engine:
             with self._call_condition:
                 self._inflight_calls.pop(key, None)
                 self._call_condition.notify_all()
+
+    def _record_call_refusal(
+        self,
+        frame_id: str,
+        call_index: int,
+        digest: str,
+        tool: ToolName,
+        request: ToolRequest,
+        error: Exception,
+    ) -> ToolFailure:
+        reason = str(error).strip() or type(error).__name__
+        with self.journal.projection_transaction() as projection:
+            existing = projection.refusal(frame_id, call_index)
+            if existing is None:
+                self.journal.append(CallRefused(
+                    run_id=self.run_id,
+                    frame_id=frame_id,
+                    call_index=call_index,
+                    call_hash=digest,
+                    tool=tool,
+                    request=request,
+                    reason=reason,
+                ))
+            elif existing.tool != tool or existing.call_hash != digest:
+                raise CallConflictError(
+                    f"call {frame_id}:{call_index} conflicts with its durable refusal"
+                )
+            else:
+                reason = existing.reason
+        logger.error(
+            "call refused before %s_called for %s:%d: %s",
+            tool,
+            frame_id,
+            call_index,
+            reason,
+        )
+        return ToolFailure(error_code="call_refused", message=reason)
 
     def _current_call_cancellation(self) -> threading.Event:
         cancellation = getattr(self._call_context, "cancellation", None)
@@ -936,6 +997,13 @@ class Engine:
                 unique[(call.call_index, call_hash(call.tool, call.request))] = call
         for (call_index, digest), call in unique.items():
             with self.journal.projection_transaction() as projection:
+                refusal = projection.refusal(frame_id, call_index)
+                if refusal is not None:
+                    if refusal.tool != call.tool or refusal.call_hash != digest:
+                        raise CallConflictError(
+                            f"stopped call {frame_id}:{call_index} conflicts with its durable refusal"
+                        )
+                    continue
                 existing = projection.call(frame_id, call_index)
                 if existing is not None and existing.completed:
                     continue

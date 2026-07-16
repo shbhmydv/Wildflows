@@ -270,7 +270,16 @@ def test_stopped_worker_without_a_durable_return_gets_typed_failed_result(
         request: GateRequest,
         replaying: bool,
     ) -> GateResult:
-        del frame, worktree, call_index, digest, request, replaying
+        assert not replaying
+        caller_head = engine.repository.ensure_clean(worktree.path, frame.branch)
+        engine.journal.append(GateCalled(
+            run_id=engine.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            request=request,
+            caller_head=caller_head,
+        ))
         rig.tool_entered.set()
         raise RuntimeError("execution was reaped before its return append")
 

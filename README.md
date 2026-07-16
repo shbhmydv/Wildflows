@@ -109,7 +109,7 @@ The durable frame/call history is an append-only stream of fsynced v2 records at
 `<target>/.wildflows/runs/<run-id>/events.ndjson`. The current event kinds are
 `run_opened`, `frame_pushed`, `frame_slot_queued`, `frame_slot_acquired`,
 `frame_slot_released`, `worktree_provisioned`, `dispatch_called`, `dispatch_returned`, `gate_called`,
-`gate_returned`, `asked`, `answered`, `call_failed`, `worker_reaped`,
+`gate_returned`, `asked`, `answered`, `call_refused`, `call_failed`, `worker_reaped`,
 `frame_relaunch_blocked`, `frame_exited`, `frame_integrating`, `frame_integrated`,
 `frame_popped`, and `run_finished`. `frame_relaunch_blocked` parks replay when a live frame branch has
 advanced beyond the journal-explained tip. Frame ids are structural breadcrumbs. This

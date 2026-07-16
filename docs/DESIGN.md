@@ -2192,3 +2192,14 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      terminalizes the frame with the exact status evidence and removes its worktree via
      the same path as setup failure, before an adapter or later engine call can observe
      the poisoned checkout.
+
+172. **A validated tool exception before `*_called` is a durable no-effect refusal,
+     never a silent transport fault.** The engine immediately appends `call_refused`
+     with frame/index/hash, typed tool request, and the exact reason, logs that reason at
+     error level, and returns a structured `ToolFailure`. Dirty-check reasons include the
+     complete porcelain status plus commit-or-clean-and-retry instructions. Refusals are
+     folded separately from effectful calls: they advance the logical index frontier but
+     create no memoized call or pending effect, so a corrected retry uses the next index.
+     Exact refetch of the refused index returns its durable reason, exit reconciliation
+     does not mislabel it `worker_stopped_without_return`, and resume exposes the refusal
+     in its digest while replaying a later successful retry normally.

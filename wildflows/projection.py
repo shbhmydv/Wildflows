@@ -7,6 +7,7 @@ from wildflows.events import (
     Answered,
     Asked,
     CallFailed,
+    CallRefused,
     DispatchCalled,
     DispatchReturned,
     Event,
@@ -89,6 +90,7 @@ class RunProjection:
     finished: RunFinished | None = None
     frames: dict[str, FrameProjection] = field(default_factory=dict)
     calls: dict[tuple[str, int], CallProjection] = field(default_factory=dict)
+    refused_calls: dict[tuple[str, int], CallRefused] = field(default_factory=dict)
     effective_events: list[Event] = field(default_factory=list)
 
     def apply(self, event: Event) -> None:
@@ -143,6 +145,8 @@ class RunProjection:
             frame.slot_active = False
             frame.slot = None
             frame.waiting_for_slot = False
+        elif isinstance(event, CallRefused):
+            self.refused_calls[(event.frame_id, event.call_index)] = event
         elif isinstance(event, (DispatchCalled, GateCalled, Asked)):
             if isinstance(event, DispatchCalled):
                 tool: ToolName = "dispatch"
@@ -225,8 +229,14 @@ class RunProjection:
     def call(self, frame_id: str, call_index: int) -> CallProjection | None:
         return self.calls.get((frame_id, call_index))
 
+    def refusal(self, frame_id: str, call_index: int) -> CallRefused | None:
+        return self.refused_calls.get((frame_id, call_index))
+
     def next_call_index(self, frame_id: str) -> int:
         indexes = [index for owner, index in self.calls if owner == frame_id]
+        indexes.extend(
+            index for owner, index in self.refused_calls if owner == frame_id
+        )
         return max(indexes, default=-1) + 1
 
     def descendants(self, frame_id: str) -> list[FrameProjection]:
@@ -253,11 +263,27 @@ class RunProjection:
 
     def resume_digest(self, frame_id: str) -> list[dict[str, object]]:
         digest: list[dict[str, object]] = []
-        calls = sorted(
-            (call for (owner, _), call in self.calls.items() if owner == frame_id),
-            key=lambda call: call.call_index,
+        indexes = sorted(
+            {index for owner, index in self.calls if owner == frame_id}
+            | {index for owner, index in self.refused_calls if owner == frame_id}
         )
-        for call in calls:
+        for index in indexes:
+            call = self.calls.get((frame_id, index))
+            if call is None:
+                refusal = self.refused_calls[(frame_id, index)]
+                digest.append({
+                    "call_index": refusal.call_index,
+                    "tool": refusal.tool,
+                    "content_hash": refusal.call_hash,
+                    "request": refusal.request.model_dump(mode="json"),
+                    "status": "refused",
+                    "result": {
+                        "outcome": "failed",
+                        "error_code": "call_refused",
+                        "message": refusal.reason,
+                    },
+                })
+                continue
             response = call.response
             response_data = None if response is None else response.model_dump(mode="json")
             item: dict[str, object] = {

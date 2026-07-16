@@ -751,6 +751,7 @@ function eventInfo(event) {
   }
   if (event.kind === "asked") return { kind: "ask", tone: "owner", detail: event.request.question, ref: `${ref} / request`, expandable: String(event.request.question).length > 100 };
   if (event.kind === "answered") return { kind: "answer", tone: "owner", detail: event.answer, ref: `${ref} / result`, expandable: String(event.answer).length > 100 };
+  if (event.kind === "call_refused") return { kind: "call refused", tone: "failure", detail: event.reason, ref, expandable: String(event.reason).length > 100 };
   return { kind: event.kind, tone: "", detail: event.kind, ref: `seq / ${event.seq}` };
 }
 
