@@ -13,6 +13,7 @@ from wildflows.rig import EchoRig, Rig, RigRegistry, ScriptRig, ShellRig
 class _RigConfigBase(BaseModel):
     description: str | None = None
     slots: int | None = Field(default=None, strict=True, gt=0)
+    gate_timeout_s: float | None = Field(default=None, gt=0)
 
     @field_validator("description")
     @classmethod
@@ -119,11 +120,14 @@ def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
     built: dict[str, Rig] = {}
     descriptions: dict[str, str] = {}
     slots: dict[str, int] = {}
+    gate_timeouts: dict[str, float] = {}
     for name, config in parsed.rigs.items():
         if config.description is not None:
             descriptions[name] = config.description
         if config.slots is not None:
             slots[name] = config.slots
+        if config.gate_timeout_s is not None:
+            gate_timeouts[name] = config.gate_timeout_s
         if isinstance(config, ScriptRigConfig):
             base = config_path.parent
             config = config.model_copy(update={
@@ -132,7 +136,11 @@ def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
             })
         built[name] = config.build()
     return RigRegistry(
-        built, descriptions, slots=slots, kinds=parsed.kinds
+        built,
+        descriptions,
+        slots=slots,
+        kinds=parsed.kinds,
+        gate_timeouts=gate_timeouts,
     ), parsed.notify
 
 

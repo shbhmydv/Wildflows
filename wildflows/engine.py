@@ -8,7 +8,7 @@ import signal
 import subprocess as _subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -153,7 +153,9 @@ class _FrameExecution:
     used_s: float
     worker: WorkerLease
     lane: int | None = None
+    lease_held: bool = False
     active_started: float | None = None
+    lease_active_s: float = 0.0
     timer: threading.Timer | None = None
     generation: int = 0
     timed_out: bool = False
@@ -320,6 +322,28 @@ class Engine:
                     "engine_resume_sweep",
                 )
 
+    @staticmethod
+    def _gate_wait_s(
+        events: Sequence[object], frame_id: str, started_at: float, ended_at: float
+    ) -> float:
+        returned = {
+            (event.frame_id, event.call_index): event.ts
+            for event in events
+            if isinstance(event, GateReturned)
+        }
+        waited = 0.0
+        for event in events:
+            if (
+                not isinstance(event, GateCalled)
+                or event.frame_id != frame_id
+                or event.ts < started_at
+                or event.ts > ended_at
+            ):
+                continue
+            returned_at = returned.get((event.frame_id, event.call_index), ended_at)
+            waited += max(0.0, min(ended_at, returned_at) - event.ts)
+        return min(waited, max(0.0, ended_at - started_at))
+
     def _close_orphaned_slot_intervals(self) -> None:
         """Stop an interrupted active interval before a frame is relaunched."""
         with self.journal.projection_transaction() as projection:
@@ -335,13 +359,17 @@ class Engine:
                 if isinstance(event, FrameSlotAcquired)
                 and event.frame_id == frame.frame_id
             )
+            elapsed = max(0.0, observed - acquired.ts)
+            gate_wait = self._gate_wait_s(
+                events, frame.frame_id, acquired.ts, observed
+            )
             self.journal.append(FrameSlotReleased(
                 run_id=self.run_id,
                 frame_id=frame.frame_id,
                 attempt=acquired.attempt,
                 rig=acquired.rig,
                 slot=acquired.slot,
-                active_s=max(0.0, observed - acquired.ts),
+                active_s=max(0.0, elapsed - gate_wait),
                 reason="engine_resume_sweep",
             ))
 
@@ -423,7 +451,9 @@ class Engine:
             stopped = execution.closed or execution.timed_out
             if not stopped:
                 execution.lane = lane
+                execution.lease_held = True
                 execution.active_started = time.monotonic()
+                execution.lease_active_s = 0.0
                 execution.generation += 1
                 generation = execution.generation
                 timer = threading.Timer(
@@ -463,9 +493,13 @@ class Engine:
                 return
             active_s = max(0.0, time.monotonic() - execution.active_started)
             execution.used_s += active_s
+            execution.lease_active_s += active_s
+            journalled_active_s = execution.lease_active_s
             lane = execution.lane
             execution.lane = None
+            execution.lease_held = False
             execution.active_started = None
+            execution.lease_active_s = 0.0
             execution.timer = None
             execution.timed_out = True
             execution.generation += 1
@@ -478,7 +512,7 @@ class Engine:
                     attempt=execution.attempt,
                     rig=execution.rig,
                     slot=lane,
-                    active_s=active_s,
+                    active_s=journalled_active_s,
                     reason="self_time_timeout",
                 ))
             finally:
@@ -497,18 +531,25 @@ class Engine:
         with self._execution_lock:
             if close:
                 execution.closed = True
-            if execution.active_started is None:
+            if not execution.lease_held:
                 if close:
                     self._executions.pop(execution.frame_id, None)
                 return
             timer = execution.timer
             if timer is not None:
                 timer.cancel()
-            active_s = max(0.0, time.monotonic() - execution.active_started)
-            execution.used_s += active_s
+            if execution.active_started is not None:
+                active_s = max(
+                    0.0, time.monotonic() - execution.active_started
+                )
+                execution.used_s += active_s
+                execution.lease_active_s += active_s
+            journalled_active_s = execution.lease_active_s
             lane = execution.lane
             execution.lane = None
+            execution.lease_held = False
             execution.active_started = None
+            execution.lease_active_s = 0.0
             execution.timer = None
             execution.generation += 1
             if close:
@@ -520,11 +561,58 @@ class Engine:
                 attempt=execution.attempt,
                 rig=execution.rig,
                 slot=lane,
-                active_s=active_s,
+                active_s=journalled_active_s,
                 reason=reason,
             ))
         finally:
             self._slot_scheduler.release(execution.rig, execution.frame_id, lane)
+
+    def _pause_frame_self_time(self, frame_id: str) -> None:
+        """Pause one caller clock without surrendering its resident slot."""
+        with self._execution_lock:
+            execution = self._executions.get(frame_id)
+            if (
+                execution is None
+                or execution.closed
+                or execution.timed_out
+                or not execution.lease_held
+                or execution.active_started is None
+            ):
+                return
+            timer = execution.timer
+            if timer is not None:
+                timer.cancel()
+            active_s = max(0.0, time.monotonic() - execution.active_started)
+            execution.used_s += active_s
+            execution.lease_active_s += active_s
+            execution.active_started = None
+            execution.timer = None
+            execution.generation += 1
+
+    def _resume_frame_self_time(self, frame_id: str) -> None:
+        """Resume a gate-waiting caller clock on its retained slot."""
+        with self._execution_lock:
+            execution = self._executions.get(frame_id)
+            if (
+                execution is None
+                or execution.closed
+                or execution.timed_out
+                or not execution.lease_held
+                or execution.active_started is not None
+            ):
+                return
+            remaining = max(0.0, execution.budget_s - execution.used_s)
+            execution.active_started = time.monotonic()
+            execution.generation += 1
+            generation = execution.generation
+            timer = threading.Timer(
+                remaining,
+                self._expire_frame_self_time,
+                args=(execution, generation),
+            )
+            timer.daemon = True
+            execution.timer = timer
+            timer.start()
 
     def _park_frame(self, frame_id: str, reason: str) -> None:
         with self._execution_lock:
@@ -2222,47 +2310,58 @@ class Engine:
                 caller_head=caller_head,
             ))
         cancellation = self._current_call_cancellation()
-        remaining = max(0.01, frame.subtree_deadline - time.time())
-        if cancellation.is_set():
-            gate = GateResult(
-                exit_code=125,
-                stdout="",
-                stderr="[cancelled] frame call stopped before command launch",
-            )
-        else:
-            result = run_shell(
-                request.cmd,
-                worktree.path,
-                remaining,
-                cancellation=cancellation,
-            )
-            if result.cancelled:
+        timeout_s = self.registry.gate_timeout(frame.rig)
+        self._pause_frame_self_time(frame.frame_id)
+        try:
+            if cancellation.is_set():
                 gate = GateResult(
                     exit_code=125,
-                    stdout=result.stdout,
-                    stderr=result.stderr + "\n[cancelled] frame call execution stopped",
-                )
-            elif result.timed_out:
-                gate = GateResult(
-                    exit_code=124,
-                    stdout=result.stdout,
-                    stderr=result.stderr + f"\n[timeout] gate exceeded {remaining:g}s",
+                    stdout="",
+                    stderr="[cancelled] frame call stopped before command launch",
                 )
             else:
-                assert result.returncode is not None
-                gate = GateResult(
-                    exit_code=result.returncode,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
+                result = run_shell(
+                    request.cmd,
+                    worktree.path,
+                    timeout_s,
+                    cancellation=cancellation,
                 )
-        self._append_tool_return(GateReturned(
-            run_id=self.run_id,
-            frame_id=frame.frame_id,
-            call_index=call_index,
-            call_hash=digest,
-            result=gate,
-        ))
-        return gate
+                if result.cancelled:
+                    gate = GateResult(
+                        exit_code=125,
+                        stdout=result.stdout,
+                        stderr=(
+                            result.stderr
+                            + "\n[cancelled] frame call execution stopped"
+                        ),
+                    )
+                elif result.timed_out:
+                    assert timeout_s is not None
+                    gate = GateResult(
+                        exit_code=124,
+                        stdout=result.stdout,
+                        stderr=(
+                            result.stderr
+                            + f"\n[timeout] gate exceeded {timeout_s:g}s"
+                        ),
+                    )
+                else:
+                    assert result.returncode is not None
+                    gate = GateResult(
+                        exit_code=result.returncode,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                    )
+            self._append_tool_return(GateReturned(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                result=gate,
+            ))
+            return gate
+        finally:
+            self._resume_frame_self_time(frame.frame_id)
 
     def _ask(
         self,

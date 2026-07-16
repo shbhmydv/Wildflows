@@ -474,7 +474,7 @@ def _capture(
     command: str | list[str],
     *,
     cwd: Path,
-    timeout_s: float,
+    timeout_s: float | None,
     shell: bool,
     env: dict[str, str] | None = None,
     cancellation: threading.Event | None = None,
@@ -510,18 +510,21 @@ def _capture(
         timed_out = False
         cancelled = False
         returncode: int | None = None
-        deadline = time.monotonic() + timeout_s
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         try:
             while returncode is None:
                 if cancellation is not None and cancellation.is_set():
                     cancelled = True
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
                     timed_out = True
                     break
+                wait_s = 0.05 if remaining is None else min(0.05, remaining)
                 try:
-                    returncode = process.wait(timeout=min(0.05, remaining))
+                    returncode = process.wait(timeout=wait_s)
                 except subprocess.TimeoutExpired:
                     continue
         except BaseException:
@@ -553,7 +556,7 @@ def _capture(
 def run_shell(
     command: str,
     workdir: Path,
-    timeout_s: float,
+    timeout_s: float | None,
     env: dict[str, str] | None = None,
     cancellation: threading.Event | None = None,
     worker: WorkerLease | None = None,
@@ -752,6 +755,7 @@ class RigRegistry:
         *,
         slots: dict[str, int] | None = None,
         kinds: dict[str, str] | None = None,
+        gate_timeouts: dict[str, float] | None = None,
     ) -> None:
         self._rigs = dict(rigs)
         supplied = descriptions or {}
@@ -768,6 +772,15 @@ class RigRegistry:
             )
         if any(type(value) is not int or value <= 0 for value in configured_slots.values()):
             raise ValueError("rig slots must be positive integers")
+        configured_gate_timeouts = gate_timeouts or {}
+        unknown_gate_timeouts = configured_gate_timeouts.keys() - self._rigs.keys()
+        if unknown_gate_timeouts:
+            raise ValueError(
+                "gate timeouts name unknown rigs: "
+                f"{', '.join(sorted(unknown_gate_timeouts))}"
+            )
+        if any(value <= 0 for value in configured_gate_timeouts.values()):
+            raise ValueError("gate timeouts must be positive")
         configured_kinds = kinds or {}
         unknown_kind_rigs = set(configured_kinds.values()) - self._rigs.keys()
         if unknown_kind_rigs:
@@ -779,6 +792,7 @@ class RigRegistry:
             raise ValueError("kind mappings must use non-blank names")
         self._slots = dict(configured_slots)
         self._kinds = dict(configured_kinds)
+        self._gate_timeouts = dict(configured_gate_timeouts)
         self._descriptions: dict[str, str] = {}
         for name, description in supplied.items():
             normalized = description.strip()
@@ -806,6 +820,11 @@ class RigRegistry:
 
     def default_rig(self, kind: str) -> str | None:
         return self._kinds.get(kind)
+
+    def gate_timeout(self, name: str) -> float | None:
+        if name not in self._rigs:
+            raise KeyError(f"unknown rig: {name!r}")
+        return self._gate_timeouts.get(name)
 
     def task_rigs(
         self,

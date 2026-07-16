@@ -355,6 +355,7 @@ rigs:
     kind: shell
     description: pooled dual-GPU Qwen lane for concretely-specced junior work
     slots: 2
+    gate_timeout_s: 3600
     template: "printf done"
     timeout_s: 5
 """,
@@ -372,6 +373,8 @@ rigs:
     )
     assert registry.slots("root") is None
     assert registry.slots("local") == 2
+    assert registry.gate_timeout("root") is None
+    assert registry.gate_timeout("local") == 3600
     assert registry.default_rig("implement") == "local"
 
     old_style = RigsFile.model_validate({
@@ -379,6 +382,7 @@ rigs:
     })
     assert old_style.rigs["echo"].description is None
     assert old_style.rigs["echo"].slots is None
+    assert old_style.rigs["echo"].gate_timeout_s is None
     assert old_style.kinds == {}
 
     with pytest.raises(ValueError, match="unknown rigs"):
