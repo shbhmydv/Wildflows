@@ -6,13 +6,19 @@ import pytest
 
 from wildflows.engine import Engine, FrameRelaunchBlockedError
 from wildflows.events import (
+    DispatchCalled,
     FrameExited,
     FrameIntegrated,
     FrameIntegrating,
     FramePushed,
     FrameRelaunchBlocked,
 )
-from wildflows.frame import FrameResult, FrameRuntime
+from wildflows.frame import (
+    DispatchRequest,
+    FrameResult,
+    FrameRuntime,
+    call_hash,
+)
 from wildflows.journal import Journal
 from wildflows.rig import RigRegistry
 from wildflows.workspace import FrameWorktree, Repository
@@ -261,6 +267,187 @@ def test_resume_relaunches_outcome_less_frame_at_unadvanced_tip(
         if isinstance(event, FramePushed) and event.frame_id == Engine.ROOT_FRAME_ID
     ]
     assert [event.attempt for event in pushes] == [0, 1]
+    assert not any(
+        isinstance(event, FrameRelaunchBlocked)
+        for event in resumed.journal.events()
+    )
+
+
+def test_resume_relaunches_self_committed_frame_after_child_integration(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A call-observed self-commit is part of the parent's durable frontier."""
+    run_dir = tmp_path / "self-commit-child-run"
+    worktrees = tmp_path / "self-commit-child-worktrees"
+    rig = ObservableRig()
+    initial = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"observable": rig}),
+        run_id="self-commit-child",
+        root_rig="observable",
+        root_prompt="root job",
+        worktrees_root=worktrees,
+    )
+    base = initial.repository.branch_tip()
+    root_id = Engine.ROOT_FRAME_ID
+    root_branch = initial.repository.frame_branch(root_id)
+    root_worktree = initial.repository.create_frame_worktree(
+        root_id, root_branch, base, resume=False
+    )
+    _push(
+        initial,
+        frame_id=root_id,
+        branch=root_branch,
+        base_commit=base,
+        worktree=root_worktree.path,
+    )
+
+    (root_worktree.path / "parent-self-commit.txt").write_text(
+        "parent\n", encoding="utf-8"
+    )
+    self_head = initial.repository.commit_all(root_worktree.path, "parent checkpoint")
+    request = DispatchRequest(tasks=["child job"], rig="observable")
+    initial.journal.append(DispatchCalled(
+        run_id=initial.run_id,
+        frame_id=root_id,
+        call_index=0,
+        call_hash=call_hash("dispatch", request),
+        request=request,
+        caller_head=self_head,
+    ))
+
+    child_id = "f0.c0.t0"
+    child_branch = initial.repository.frame_branch(child_id)
+    child_worktree = initial.repository.create_frame_worktree(
+        child_id, child_branch, self_head, resume=False
+    )
+    _push(
+        initial,
+        frame_id=child_id,
+        branch=child_branch,
+        base_commit=self_head,
+        worktree=child_worktree.path,
+        parent_frame_id=root_id,
+        parent_call_index=0,
+        task_index=0,
+        depth=1,
+        prompt="child job",
+    )
+    (child_worktree.path / "child-after-self-commit.txt").write_text(
+        "child\n", encoding="utf-8"
+    )
+    child_head = initial.repository.commit_all(child_worktree.path, "child completed")
+    initial.journal.append(FrameExited(
+        run_id=initial.run_id,
+        frame_id=child_id,
+        attempt=0,
+        outcome="ok",
+        text="child completed",
+        exit_code=0,
+        head=child_head,
+    ))
+    receipt = initial.repository.receipt(self_head, child_head)
+    initial.journal.append(FrameIntegrating(
+        run_id=initial.run_id,
+        frame_id=child_id,
+        target_frame_id=root_id,
+        integration_base=self_head,
+        candidate_head=child_head,
+        source_commits=receipt.commits,
+        landed_commits=receipt.commits,
+    ))
+    initial.repository.advance(
+        root_branch,
+        self_head,
+        child_head,
+        target_worktree=root_worktree.path,
+    )
+    initial.journal.append(FrameIntegrated(
+        run_id=initial.run_id,
+        frame_id=child_id,
+        target_frame_id=root_id,
+        integration_base=self_head,
+        candidate_head=child_head,
+        source_commits=receipt.commits,
+        landed_commits=receipt.commits,
+    ))
+    initial.repository.remove_worktree(child_worktree)
+
+    resumed = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"observable": rig}),
+        run_id="self-commit-child",
+        root_rig="observable",
+        root_prompt="root job",
+    )
+    assert resumed.run().outcome == "ok"
+    assert rig.frame_ids == [root_id]
+    assert (repo / "parent-self-commit.txt").read_text(encoding="utf-8") == "parent\n"
+    assert (repo / "child-after-self-commit.txt").read_text(encoding="utf-8") == "child\n"
+    assert not any(
+        isinstance(event, FrameRelaunchBlocked)
+        for event in resumed.journal.events()
+    )
+
+
+def test_resume_relaunches_self_committed_frame_at_pending_dispatch(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A dispatch call journals a self-commit even when no child integration follows."""
+    run_dir = tmp_path / "self-commit-pending-run"
+    worktrees = tmp_path / "self-commit-pending-worktrees"
+    rig = ObservableRig()
+    initial = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"observable": rig}),
+        run_id="self-commit-pending",
+        root_rig="observable",
+        root_prompt="root job",
+        worktrees_root=worktrees,
+    )
+    base = initial.repository.branch_tip()
+    root_id = Engine.ROOT_FRAME_ID
+    root_branch = initial.repository.frame_branch(root_id)
+    root_worktree = initial.repository.create_frame_worktree(
+        root_id, root_branch, base, resume=False
+    )
+    _push(
+        initial,
+        frame_id=root_id,
+        branch=root_branch,
+        base_commit=base,
+        worktree=root_worktree.path,
+    )
+    (root_worktree.path / "parent-before-pending-dispatch.txt").write_text(
+        "checkpoint\n", encoding="utf-8"
+    )
+    self_head = initial.repository.commit_all(root_worktree.path, "parent checkpoint")
+    request = DispatchRequest(tasks=["never launched"], rig="observable")
+    initial.journal.append(DispatchCalled(
+        run_id=initial.run_id,
+        frame_id=root_id,
+        call_index=0,
+        call_hash=call_hash("dispatch", request),
+        request=request,
+        caller_head=self_head,
+    ))
+
+    resumed = Engine(
+        run_dir,
+        repo,
+        RigRegistry({"observable": rig}),
+        run_id="self-commit-pending",
+        root_rig="observable",
+        root_prompt="root job",
+    )
+    assert resumed.run().outcome == "ok"
+    assert rig.frame_ids == [root_id]
+    assert (repo / "parent-before-pending-dispatch.txt").read_text(
+        encoding="utf-8"
+    ) == "checkpoint\n"
     assert not any(
         isinstance(event, FrameRelaunchBlocked)
         for event in resumed.journal.events()
