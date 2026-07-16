@@ -35,6 +35,7 @@ from wildflows.frame import (
     ToolFailure,
     ToolName,
 )
+from wildflows.mcp import FrameCallJoin, ValidatedToolCall
 from wildflows.projection import FrameProjection
 from wildflows.rig import RigRegistry
 from wildflows.run import Run
@@ -377,10 +378,10 @@ def test_terminal_attempt_cannot_journal_a_typed_worker_refusal_after_frame_exit
     _assert_joined_teardown(trace, "dispatch_returned", committed=True)
 
 
-def test_join_timeout_retains_cross_process_lifecycle_ownership(
+def test_run_does_not_retain_lifecycle_for_an_escaped_join_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A live unjoined worker must not release the run to another process."""
+    """The obsolete fatal-timeout special case cannot strand lifecycle ownership."""
     run = object.__new__(Run)
     descriptor = os.open(tmp_path / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -390,12 +391,56 @@ def test_join_timeout_retains_cross_process_lifecycle_ownership(
         raise FrameCallJoinTimeoutError("worker did not confirm stop")
 
     monkeypatch.setattr(run, "_drive", fail_join)
-    try:
-        with pytest.raises(FrameCallJoinTimeoutError, match="confirm stop"):
-            run.run()
-        assert run._lifecycle_descriptor == descriptor  # noqa: SLF001
-    finally:
-        run.close()
+    with pytest.raises(FrameCallJoinTimeoutError, match="confirm stop"):
+        run.run()
+    assert run._lifecycle_descriptor is None  # noqa: SLF001
+
+
+def test_join_timeout_retries_then_fails_only_call_and_frame(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exhausting the bookkeeping join is a durable frame failure, not a run crash."""
+    rig = _DetachedToolRig("gate", {"cmd": "printf never"})
+    engine = _engine(repo, tmp_path, rig, "timeout-isolated")
+    request = GateRequest(cmd="printf never")
+    active = ValidatedToolCall("f0", 0, "gate", request, 0)
+    waits: list[float] = []
+
+    def never_joins(frame_id: str, timeout: float) -> FrameCallJoin:
+        assert frame_id == "f0"
+        waits.append(timeout)
+        return FrameCallJoin(completed=(), active=(active,))
+
+    def issue_without_worker(
+        prompt: str, workdir: Path, runtime: FrameRuntime
+    ) -> FrameResult:
+        del prompt, workdir, runtime
+        return FrameResult(outcome="ok", text="adapter exited")
+
+    monkeypatch.setattr(rig, "run", issue_without_worker)
+    monkeypatch.setattr(engine.server, "join_frame", never_joins)
+    monkeypatch.setattr("wildflows.engine.FRAME_CALL_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        "wildflows.engine.FRAME_CALL_JOIN_RETRY_BACKOFF_S", (0.01, 0.02)
+    )
+
+    result = engine.run()
+
+    assert result.outcome == "failed"
+    assert len(waits) == 4  # natural grace, cancellation grace, two retries
+    assert waits[-2:] == [0.01, 0.02]
+    failures = [
+        event for event in engine.journal.events() if isinstance(event, CallFailed)
+    ]
+    exited = [
+        event for event in engine.journal.events() if isinstance(event, FrameExited)
+    ]
+    assert len(failures) == len(exited) == 1
+    assert failures[0].result.error_code == "frame_call_join_timeout"
+    assert failures[0].seq < exited[0].seq
+    assert exited[0].outcome == "failed"
+    assert engine.projection.finished is not None
+    assert engine.projection.finished.outcome == "failed"
 
 
 def test_cancellation_record_without_confirmed_stop_does_not_close_call_join(
