@@ -228,13 +228,17 @@ def test_pending_retry_replay_does_not_relaunch_an_already_failed_attempt(
         worktree=str(first_worktree.path),
         subtree_deadline=4_102_444_800.0,
     ))
+    (first_worktree.path / "prior.txt").write_text("prior commit\n")
+    first_head = engine.repository.commit_all(
+        first_worktree.path, "failed child checkpoint"
+    )
     engine.journal.append(FrameExited(
         run_id=engine.run_id,
         frame_id=child_id,
         attempt=0,
         outcome="failed",
         text="first failure",
-        head=base,
+        head=first_head,
     ))
     engine.journal.append(FramePopped(
         run_id=engine.run_id,
@@ -272,13 +276,18 @@ def test_pending_retry_replay_does_not_relaunch_an_already_failed_attempt(
         worktree=str(retry_worktree.path),
         subtree_deadline=4_102_444_800.0,
     ))
+    # A retry interrupted after push must accept the prior attempt's journalled
+    # exit head as branch evidence and warm-relaunch from it on resume.
+    engine._guard_frame_relaunch(  # noqa: SLF001 - retry crash-replay seam
+        engine.projection, engine.projection.frame(child_id)
+    )
     engine.journal.append(FrameExited(
         run_id=engine.run_id,
         frame_id=child_id,
         attempt=1,
         outcome="failed",
         text="retry also failed",
-        head=base,
+        head=first_head,
     ))
     engine.repository.remove_worktree(retry_worktree)
 

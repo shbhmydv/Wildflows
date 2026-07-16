@@ -1657,6 +1657,12 @@ class Engine:
                 if caller_head is not None and pending is None:
                     advance_observed_tip(caller_head, require_on_branch=False)
             elif (
+                isinstance(event, FrameExited)
+                and event.frame_id == frame_id
+                and pending is None
+            ):
+                advance_observed_tip(event.head, require_on_branch=True)
+            elif (
                 isinstance(event, FrameIntegrating)
                 and event.target_frame_id == frame_id
                 and pending is None
