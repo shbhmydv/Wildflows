@@ -537,7 +537,9 @@ function renderCall(frame, call, relativeDepth) {
   const block = el("section", "call-block");
   const heading = el("div", "call-heading");
   heading.append(el("span", "call-chip", `call ${call.call_index} · dispatch`));
-  const taskLabel = call.parallel ? `parallel fan-out × ${call.requested}` : `serial dispatch × ${call.requested}`;
+  const shapeLabel = call.parallel ? `parallel fan-out × ${call.requested}` : `serial dispatch × ${call.requested}`;
+  const kinds = [...new Set(call.kinds || [])];
+  const taskLabel = kinds.length ? `${shapeLabel} · ${kinds.join(" / ")}` : shapeLabel;
   heading.append(el("span", "call-command", taskLabel), el("span", "call-counts", callSummary(call)));
   block.append(heading);
   if (call.result?.outcome === "refused") {
@@ -575,13 +577,14 @@ function renderCall(frame, call, relativeDepth) {
 function dispatchSlots(call) {
   const byIndex = new Map(call.children.map(frameId => [state.run.frames[frameId].task_index, frameId]));
   const tasks = call.request?.tasks || [];
-  return Array.from({ length: call.requested }, (_, index) => ({ index, frameId: byIndex.get(index) || null, task: tasks[index] || `task ${index}` }));
+  const kinds = call.kinds || [];
+  return Array.from({ length: call.requested }, (_, index) => ({ index, frameId: byIndex.get(index) || null, task: tasks[index] || `task ${index}`, kind: kinds[index] || null }));
 }
 
 function renderQueued(slot) {
   const card = el("article", "frame-node frame-card queued");
   const top = el("div", "frame-top");
-  top.append(dot("queued"), el("span", "frame-path", `task ${slot.index}`), el("span", "state-chip", "queued"));
+  top.append(dot("queued"), el("span", "frame-path", `task ${slot.index}${slot.kind ? ` · ${slot.kind}` : ""}`), el("span", "state-chip", "queued"));
   card.append(top, el("p", "frame-prompt", slot.task));
   return card;
 }
@@ -710,6 +713,9 @@ function eventInfo(event) {
   if (event.kind === "run_opened") return { kind: "run open", tone: "owner", detail: firstLine(event.root_prompt), ref: event.run_branch, expandable: String(event.root_prompt).length > 120 };
   if (event.kind === "run_finished") return { kind: "run result", tone: event.outcome === "ok" ? "result" : "failure", detail: event.text || event.outcome, ref: `result / ${short(event.root_head)}`, expandable: String(event.text).length > 120 };
   if (event.kind === "frame_pushed") return { kind: "frame push", tone: "frame", detail: `${event.rig} started · ${firstLine(event.prompt)}`, ref: `attempt ${event.attempt}`, expandable: String(event.prompt).length > 120 };
+  if (event.kind === "frame_slot_queued") return { kind: "slot queue", tone: "owner", detail: `${event.rig} waiting for an active slot`, ref: `attempt ${event.attempt}` };
+  if (event.kind === "frame_slot_acquired") return { kind: "slot acquired", tone: "frame", detail: `${event.rig}${event.slot == null ? " active" : ` lane ${event.slot}`}`, ref: `attempt ${event.attempt}` };
+  if (event.kind === "frame_slot_released") return { kind: "slot released", tone: "", detail: `${event.reason} · ${formatDuration(event.active_s)} self-time`, ref: `attempt ${event.attempt}` };
   if (event.kind === "frame_exited") {
     const frame = state.run.frames[event.frame_id];
     return { kind: "frame result", tone: event.outcome === "ok" ? "result" : "failure", detail: event.text || `${event.outcome}: ${firstLine(event.stderr)}`, ref: `${event.outcome} / ${formatDuration(frame?.duration_s)}`, expandable: String(event.text || event.stderr).length > 100 };
@@ -717,7 +723,10 @@ function eventInfo(event) {
   if (event.kind === "frame_integrating") return { kind: "integrating", tone: "frame", detail: `${event.landed_commits?.length || 0} landed commit receipts`, ref: `candidate / ${short(event.candidate_head)}` };
   if (event.kind === "frame_integrated") return { kind: "integrated", tone: "result", detail: `${event.landed_commits?.length || 0} commits integrated`, ref: `result / ${short(event.candidate_head)}` };
   if (event.kind === "frame_popped") return { kind: "frame pop", tone: event.outcome === "ok" ? "result" : "failure", detail: `frame unwound · ${event.outcome}`, ref: `attempt ${event.attempt}` };
-  if (event.kind === "dispatch_called") return { kind: "dispatch", tone: "", detail: `${event.request.parallel ? "parallel" : "serial"} × ${event.request.tasks.length} · ${firstLine(event.request.tasks[0])}`, ref: `${ref} / request`, expandable: event.request.tasks.join(" ").length > 100 };
+  if (event.kind === "dispatch_called") {
+    const kinds = event.request.kinds?.length ? ` · ${event.request.kinds.join(" / ")}` : "";
+    return { kind: "dispatch", tone: "", detail: `${event.request.parallel ? "parallel" : "serial"} × ${event.request.tasks.length}${kinds} · ${firstLine(event.request.tasks[0])}`, ref: `${ref} / request`, expandable: event.request.tasks.join(" ").length > 100 };
+  }
   if (event.kind === "dispatch_returned") return { kind: "result", tone: event.result.outcome === "ok" ? "result" : "failure", detail: dispatchResultText(event.result), ref: `${ref} / result`, expandable: dispatchResultText(event.result).length > 100 };
   if (event.kind === "gate_called") return { kind: "gate", tone: "", detail: event.request.cmd, ref: `${ref} / request`, expandable: String(event.request.cmd).length > 100 };
   if (event.kind === "gate_returned") {

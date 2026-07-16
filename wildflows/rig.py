@@ -570,13 +570,15 @@ def run_shell(
 
 
 def _runtime_env(runtime: FrameRuntime) -> dict[str, str]:
-    return {
+    values = {
         "WILDFLOWS_MCP_URL": runtime.endpoint,
         "WILDFLOWS_RUN_TOKEN": runtime.token,
         "WILDFLOWS_FRAME_ID": runtime.frame_id,
         "WILDFLOWS_PI_EXTENSION": str(runtime.shim_path),
         "WILDFLOWS_NEXT_CALL_INDEX": str(runtime.next_call_index),
     }
+    values.update(runtime.environment or {})
+    return values
 
 
 @runtime_checkable
@@ -608,10 +610,11 @@ class ShellRig:
         self, prompt: str, workdir: Path, runtime: FrameRuntime
     ) -> FrameResult:
         command = self.template.replace("{prompt}", shlex.quote(prompt))
+        backstop = runtime.backstop_timeout_s or self.timeout_s
         result = run_shell(
             command,
             workdir,
-            self.timeout_s,
+            backstop,
             env={**os.environ, **_runtime_env(runtime)},
             cancellation=runtime.cancellation,
             worker=runtime.worker,
@@ -625,7 +628,7 @@ class ShellRig:
             )
         if result.timed_out:
             return FrameResult(
-                text=f"[timeout] command exceeded {self.timeout_s}s\n{result.stderr}",
+                text=f"[timeout] command exceeded {backstop}s\n{result.stderr}",
                 outcome="failed",
                 stdout=result.stdout,
                 stderr=result.stderr,
@@ -690,6 +693,7 @@ class ScriptRig:
             if runtime.worker is None
             else runtime.worker.handle_path
         )
+        backstop = runtime.backstop_timeout_s or self.timeout_s
         argv = [
             str(self.script),
             "--worktree",
@@ -701,12 +705,12 @@ class ScriptRig:
             "--handle-out",
             str(handle_out),
             "--timeout",
-            str(self.timeout_s),
+            str(backstop),
         ]
         result = _capture(
             argv,
             cwd=workdir,
-            timeout_s=self.timeout_s,
+            timeout_s=backstop,
             shell=False,
             env={**os.environ, **self.env, **_runtime_env(runtime)},
             cancellation=runtime.cancellation,
@@ -723,7 +727,7 @@ class ScriptRig:
             )
         if result.timed_out:
             return FrameResult(
-                text=f"[timeout] script exceeded {self.timeout_s}s\n{result.stderr}",
+                text=f"[timeout] script exceeded {backstop}s\n{result.stderr}",
                 outcome="failed",
                 stdout=result.stdout,
                 stderr=result.stderr,
@@ -745,6 +749,9 @@ class RigRegistry:
         self,
         rigs: dict[str, Rig],
         descriptions: dict[str, str] | None = None,
+        *,
+        slots: dict[str, int] | None = None,
+        kinds: dict[str, str] | None = None,
     ) -> None:
         self._rigs = dict(rigs)
         supplied = descriptions or {}
@@ -753,6 +760,25 @@ class RigRegistry:
             raise ValueError(
                 f"descriptions name unknown rigs: {', '.join(sorted(unknown))}"
             )
+        configured_slots = slots or {}
+        unknown_slots = configured_slots.keys() - self._rigs.keys()
+        if unknown_slots:
+            raise ValueError(
+                f"slots name unknown rigs: {', '.join(sorted(unknown_slots))}"
+            )
+        if any(type(value) is not int or value <= 0 for value in configured_slots.values()):
+            raise ValueError("rig slots must be positive integers")
+        configured_kinds = kinds or {}
+        unknown_kind_rigs = set(configured_kinds.values()) - self._rigs.keys()
+        if unknown_kind_rigs:
+            raise ValueError(
+                "kinds map to unknown rigs: "
+                f"{', '.join(sorted(unknown_kind_rigs))}"
+            )
+        if any(not kind.strip() or not rig.strip() for kind, rig in configured_kinds.items()):
+            raise ValueError("kind mappings must use non-blank names")
+        self._slots = dict(configured_slots)
+        self._kinds = dict(configured_kinds)
         self._descriptions: dict[str, str] = {}
         for name, description in supplied.items():
             normalized = description.strip()
@@ -772,6 +798,38 @@ class RigRegistry:
         if name not in self._rigs:
             raise KeyError(f"unknown rig: {name!r}")
         return self._descriptions.get(name)
+
+    def slots(self, name: str) -> int | None:
+        if name not in self._rigs:
+            raise KeyError(f"unknown rig: {name!r}")
+        return self._slots.get(name)
+
+    def default_rig(self, kind: str) -> str | None:
+        return self._kinds.get(kind)
+
+    def task_rigs(
+        self,
+        explicit: str | None,
+        kinds: list[str],
+        task_count: int,
+    ) -> tuple[str, ...]:
+        if explicit is not None:
+            return (explicit,) * task_count
+        if len(kinds) != task_count:
+            raise KeyError(
+                "dispatch without rig requires one mapped kind per task"
+            )
+        resolved: list[str] = []
+        for kind in kinds:
+            rig = self.default_rig(kind)
+            if rig is None:
+                raise KeyError(f"dispatch kind {kind!r} has no default rig")
+            resolved.append(rig)
+        return tuple(resolved)
+
+    @property
+    def slot_capacities(self) -> dict[str, int]:
+        return dict(self._slots)
 
     @property
     def ordered_names(self) -> tuple[str, ...]:

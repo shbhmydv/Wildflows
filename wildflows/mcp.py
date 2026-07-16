@@ -623,7 +623,9 @@ class MCPServer:
         name: str, arguments: dict[str, object]
     ) -> tuple[ToolName, ToolRequest]:
         if name == "dispatch":
-            MCPServer._only_keys(arguments, {"tasks", "rig", "parallel", "skills"})
+            MCPServer._only_keys(
+                arguments, {"tasks", "rig", "parallel", "skills", "kinds"}
+            )
             return "dispatch", DispatchRequest.model_validate(arguments)
         if name == "gate":
             MCPServer._only_keys(arguments, {"cmd"})
@@ -699,7 +701,14 @@ class MCPServer:
         return [
             {
                 "name": "dispatch",
-                "description": "Dispatch one or more child frame tasks.",
+                "description": (
+                    "Dispatch one or more child frame tasks; a task list runs serially "
+                    "by default, with each integrated result available before the next. "
+                    "Set parallel=true only to fan out independent tasks and join them. "
+                    "The call blocks until child results and commits are integrated. "
+                    "Make sequential dispatch calls to compose pipelines, loops, and "
+                    "parallel-then-review shapes."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": False,
@@ -715,6 +724,10 @@ class MCPServer:
                         },
                         "rig": {
                             "type": "string",
+                            "description": (
+                                "Explicit rig for every task; omit only when each kind "
+                                "has a rigs.yaml default."
+                            ),
                             "minLength": 1,
                             "pattern": r".*\S.*",
                         },
@@ -731,8 +744,20 @@ class MCPServer:
                                 },
                             },
                         },
+                        "kinds": {
+                            "type": "array",
+                            "description": (
+                                "Optional free-text kind per task; suggested: implement, "
+                                "review, research, artifact."
+                            ),
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "pattern": r".*\S.*",
+                            },
+                        },
                     },
-                    "required": ["tasks", "rig"],
+                    "required": ["tasks"],
                 },
             },
             {

@@ -4,6 +4,7 @@ rigs:
     script: ../../rigs/worker-local.sh
     log_dir: /tmp/wildflows-toy-run/local
     timeout_s: 900
+    slots: 2
   senior:
     kind: script
     script: ../../rigs/worker-picodex.sh

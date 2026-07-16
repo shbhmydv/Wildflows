@@ -30,9 +30,10 @@ class _ToolRequestBase(BaseModel):
 
 class DispatchRequest(_ToolRequestBase):
     tasks: list[str] = Field(min_length=1)
-    rig: str = Field(min_length=1)
+    rig: str | None = None
     parallel: bool = False
     skills: list[list[str]] = Field(default_factory=list)
+    kinds: list[str] = Field(default_factory=list)
 
     @field_validator("tasks")
     @classmethod
@@ -41,8 +42,15 @@ class DispatchRequest(_ToolRequestBase):
             raise ValueError("dispatch tasks must be non-blank")
         return values
 
+    @field_validator("rig")
+    @classmethod
+    def _nonblank_rig(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("dispatch rig must be non-blank")
+        return value
+
     @model_validator(mode="after")
-    def _per_task_skill_bundles(self) -> "DispatchRequest":
+    def _per_task_fields(self) -> "DispatchRequest":
         # Omission is canonicalized to one empty bundle per task. This keeps an
         # omitted bundle and explicit no-skill bundles at one memoization identity.
         if not self.skills:
@@ -51,6 +59,10 @@ class DispatchRequest(_ToolRequestBase):
             raise ValueError("dispatch skills must contain one list per task")
         if any(not name.strip() for bundle in self.skills for name in bundle):
             raise ValueError("dispatch skill names must be non-blank")
+        if self.kinds and len(self.kinds) != len(self.tasks):
+            raise ValueError("dispatch kinds must contain one string per task")
+        if any(not kind.strip() for kind in self.kinds):
+            raise ValueError("dispatch kinds must be non-blank")
         return self
 
     def skill_bundle(self, task_index: int) -> list[str]:
@@ -144,9 +156,17 @@ ToolResponse: TypeAlias = DispatchResult | GateResult | AskResult | ToolFailure
 
 def call_hash(tool: ToolName, request: ToolRequest) -> str:
     """Hash canonical engine-validated call content, never client-provided bytes."""
+    arguments = request.model_dump(mode="json")
+    if isinstance(request, DispatchRequest):
+        # Additive optional dispatch hints must not change old no-hint journal
+        # identities when those calls are loaded and replayed.
+        if not request.kinds:
+            arguments.pop("kinds", None)
+        if request.rig is None:
+            arguments.pop("rig", None)
     payload = {
         "tool": tool,
-        "arguments": request.model_dump(mode="json"),
+        "arguments": arguments,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -182,3 +202,5 @@ class FrameRuntime:
     next_call_index: int
     cancellation: threading.Event | None = None
     worker: WorkerLease | None = None
+    environment: dict[str, str] | None = None
+    backstop_timeout_s: float | None = None

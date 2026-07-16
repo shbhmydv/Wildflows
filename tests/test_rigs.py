@@ -343,6 +343,8 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
     config = tmp_path / "rigs.yaml"
     config.write_text(
         """notify: owner-notify --urgent
+kinds:
+  implement: local
 rigs:
   root:
     kind: script
@@ -352,6 +354,7 @@ rigs:
   local:
     kind: shell
     description: pooled dual-GPU Qwen lane for concretely-specced junior work
+    slots: 2
     template: "printf done"
     timeout_s: 5
 """,
@@ -367,8 +370,23 @@ rigs:
     assert registry.description("local") == (
         "pooled dual-GPU Qwen lane for concretely-specced junior work"
     )
+    assert registry.slots("root") is None
+    assert registry.slots("local") == 2
+    assert registry.default_rig("implement") == "local"
 
     old_style = RigsFile.model_validate({
         "rigs": {"echo": {"kind": "echo"}},
     })
     assert old_style.rigs["echo"].description is None
+    assert old_style.rigs["echo"].slots is None
+    assert old_style.kinds == {}
+
+    with pytest.raises(ValueError, match="unknown rigs"):
+        RigsFile.model_validate({
+            "kinds": {"review": "missing"},
+            "rigs": {"echo": {"kind": "echo"}},
+        })
+    with pytest.raises(ValueError, match="greater than 0"):
+        RigsFile.model_validate({
+            "rigs": {"echo": {"kind": "echo", "slots": 0}},
+        })

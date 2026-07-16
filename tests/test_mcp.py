@@ -405,6 +405,9 @@ def test_mcp_requires_token_and_exposes_fixed_loopback_tool_surface() -> None:
         skills_schema = json_object(properties["skills"])
         assert skills_schema["description"] == "One ordered skill-name list per task."
         assert json_object(json_object(skills_schema["items"])["items"])["type"] == "string"
+        assert dispatch_schema["required"] == ["tasks"]
+        assert "serially by default" in str(json_object(tools[0])["description"])
+        assert json_object(properties["kinds"])["type"] == "array"
 
 
 def test_frame_capability_cannot_spoof_another_active_frame() -> None:
@@ -467,12 +470,14 @@ def test_mcp_tool_calls_use_hidden_index_and_return_typed_results() -> None:
                     "rig": "echo",
                     "parallel": True,
                     "skills": [["long", "repo-conventions"]],
+                    "kinds": ["implement"],
                 },
                 DispatchRequest(
                     tasks=["child task"],
                     rig="echo",
                     parallel=True,
                     skills=[["long", "repo-conventions"]],
+                    kinds=["implement"],
                 ),
                 2,
                 DispatchResult(

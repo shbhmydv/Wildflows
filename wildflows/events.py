@@ -58,6 +58,37 @@ class FramePushed(_Header):
     subtree_deadline: float
 
 
+class FrameSlotQueued(_Header):
+    """A pushed frame is waiting for one configured active rig slot."""
+
+    kind: Literal["frame_slot_queued"] = "frame_slot_queued"
+    frame_id: str
+    attempt: int
+    rig: str
+
+
+class FrameSlotAcquired(_Header):
+    """A frame's self-time clock started with an active rig lease."""
+
+    kind: Literal["frame_slot_acquired"] = "frame_slot_acquired"
+    frame_id: str
+    attempt: int
+    rig: str
+    slot: int | None = None
+
+
+class FrameSlotReleased(_Header):
+    """A frame parked or exited and stopped consuming self-time and capacity."""
+
+    kind: Literal["frame_slot_released"] = "frame_slot_released"
+    frame_id: str
+    attempt: int
+    rig: str
+    slot: int | None = None
+    active_s: float = Field(ge=0)
+    reason: str
+
+
 class DispatchCalled(_Header):
     kind: Literal["dispatch_called"] = "dispatch_called"
     frame_id: str
@@ -195,6 +226,9 @@ class RunFinished(_Header):
 Event: TypeAlias = Annotated[
     RunOpened
     | FramePushed
+    | FrameSlotQueued
+    | FrameSlotAcquired
+    | FrameSlotReleased
     | DispatchCalled
     | DispatchReturned
     | GateCalled

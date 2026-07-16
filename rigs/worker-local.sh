@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# ScriptRig adapter for a flock-pinned local pi worker in its disposable worktree.
+# ScriptRig adapter for an engine-scheduled local pi worker in its worktree.
 set -euo pipefail
-
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=_pin_backend.sh
-source "$script_dir/_pin_backend.sh"
 
 worktree=""; prompt=""; log_dir=""; handle_out=""; timeout=""
 while [[ $# -gt 0 ]]; do
@@ -32,7 +28,7 @@ if [[ ! -s "$handle_out" ]]; then
 fi
 export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
 
-provider="${GRINDSTONE_SENIOR_PROVIDER:-}"
+provider="${GRINDSTONE_SENIOR_PROVIDER:-${WILDFLOWS_PROVIDER_OVERRIDE:-local-reviewer-8081}}"
 model="${GRINDSTONE_SENIOR_MODEL:-qwen-3-6-27b-dense}"
 thinking="${GRINDSTONE_SENIOR_EFFORT:-medium}"
 extension="${WILDFLOWS_PI_EXTENSION:-}"
@@ -40,7 +36,6 @@ extension="${WILDFLOWS_PI_EXTENSION:-}"
   echo "worker-local: WILDFLOWS_PI_EXTENSION is missing or unreadable" >&2
   exit 2
 }
-pin_local_backend provider "$provider"
 system_prompt='You are a WILDFLOWS frame. Work only inside this worktree (your CWD), use relative paths, commit useful changes before engine tool calls or exit, and return a concise final report.'
 out="$log_dir/pi.stdout.log"; err="$log_dir/pi.stderr.log"
 limit=()
@@ -56,12 +51,7 @@ pi_args=(
 
 cd "$worktree"
 set +e
-if [[ -n "${_WILDFLOWS_PIN_FD:-}" ]]; then
-  # The wrapper retains its lock while foreground pi runs; pi does not inherit it.
-  "${limit[@]}" pi "${pi_args[@]}" < "$prompt" > "$out" 2> "$err" {_WILDFLOWS_PIN_FD}>&-
-else
-  "${limit[@]}" pi "${pi_args[@]}" < "$prompt" > "$out" 2> "$err"
-fi
+"${limit[@]}" pi "${pi_args[@]}" < "$prompt" > "$out" 2> "$err"
 rc=$?
 set -e
 tail -c 65536 "$err" >&2 || true

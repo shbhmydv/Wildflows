@@ -291,6 +291,8 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
         subtree_deadline=9_999_999_999.0,
     ))
     digest = call_hash("dispatch", request)
+    child_rig = request.rig
+    assert child_rig is not None
     first.journal.append(DispatchCalled(
         run_id=first.run_id,
         frame_id=Engine.ROOT_FRAME_ID,
@@ -320,7 +322,7 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
         task_index=0,
         attempt=0,
         depth=1,
-        rig=request.rig,
+        rig=child_rig,
         prompt=request.tasks[0],
         skills=request.skill_bundle(0),
         branch=completed_branch,
@@ -349,7 +351,7 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
         task_index=1,
         attempt=0,
         depth=1,
-        rig=request.rig,
+        rig=child_rig,
         prompt=request.tasks[1],
         skills=request.skill_bundle(1),
         branch=unfinished_branch,

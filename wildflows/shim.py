@@ -280,16 +280,19 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "wildflows_dispatch",
     label: "Wildflows dispatch",
-    description: "Dispatch child frame tasks through the wildflows engine.",
+    description: "Dispatch tasks serially by default and block until their results and commits are integrated. Set parallel only for independent fan-out; use sequential calls to compose pipelines, loops, and parallel-then-review shapes.",
     parameters: Type.Object({{
       tasks: Type.Array(Type.String({{ description: "Self-contained child task" }})),
-      rig: Type.String({{ description: "Allowed wildflows rig name" }}),
+      rig: Type.Optional(Type.String({{ description: "Explicit rig for all tasks; omit when kinds map to defaults" }})),
       parallel: Type.Optional(Type.Boolean({{ description: "Run siblings in parallel" }})),
       skills: Type.Optional(Type.Array(Type.Array(Type.String({{
         description: "Bundled skill name for this task",
       }}), {{ description: "Ordered skill bundle for one task" }}), {{
         description: "One ordered skill-name list per task",
       }})),
+      kinds: Type.Optional(Type.Array(Type.String({{
+        description: "Free-text task kind (suggested: implement, review, research, artifact)",
+      }}), {{ description: "One optional kind hint per task" }})),
     }}),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {{
       return piResult(await callTool("dispatch", {{
@@ -297,6 +300,7 @@ export default function (pi: ExtensionAPI) {{
         rig: params.rig,
         parallel: params.parallel ?? false,
         skills: params.skills ?? params.tasks.map(() => []),
+        kinds: params.kinds ?? [],
       }}, signal));
     }},
   }});

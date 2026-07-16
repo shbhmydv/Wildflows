@@ -491,6 +491,7 @@ def test_disconnect_mid_dispatch_refetches_the_engine_single_flight_once(
         "rig": "fake",
         "parallel": False,
         "skills": [[]],
+        "kinds": [],
     }
     assert returned[0].result.model_dump(mode="json") == returned_payload
 

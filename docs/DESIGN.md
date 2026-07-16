@@ -2088,3 +2088,48 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      `EARLIER ATTEMPT` prompt block has a 64 KiB fail-safe cap and explicit truncation
      markers. This is ephemeral engine-side prompt materialization: no journal or rig
      contract changes, no durable call-identity changes, and no block on a first launch.
+
+
+### Hand-44 calls — dispatch economy and active-period scheduling
+
+161. **Economy and orchestration shapes are default root doctrine, not engine policy.**
+     Fresh roots receive `dispatch-economy` and `orchestration-shapes`; repository files
+     with those stems shadow the bundled text, and `skill-selection` routes the pair to
+     any child expected to dispatch. Determinate work goes to a cheap worker, open design
+     to one senior, and each component gets at most one commissioned cheap review.
+     Multi-task dispatch remains serial by default; independent fan-out is explicit, and
+     sequential blocking calls compose loops and parallel-then-review shapes.
+
+162. **Dispatch kind is an additive per-task hint with optional repository defaults.**
+     `kinds` is an optional free-text string array parallel to `tasks`, suggested but not
+     restricted to implement/review/research/artifact. It is journalled inside the typed
+     dispatch request, replayed, and shown by the dashboard. A top-level `rigs.yaml`
+     `kinds:` map supplies each task's rig only when the call omits explicit `rig`; an
+     explicit rig wins for all tasks, and Wildflows ships no mapping. Empty/absent hints
+     are excluded from the canonical call hash so pre-field journals retain their exact
+     memoization identity.
+
+163. **Rig slots lease active periods, never resident frame lifetimes.** A positive
+     per-rig `slots` value creates one FIFO engine queue; absence remains unlimited.
+     Every frame acquires before adapter launch and before a blocking dispatch/ask result
+     returns, and releases on dispatch/ask park or adapter exit. Gate keeps the lease and
+     charges its caller. Queue, acquire, and release are durable events; release records
+     monotonic active duration, so projection and resumed attempts accumulate self-time
+     without charging queued or parked wall time. Parked ancestors therefore hold no
+     capacity and nested dispatch cannot reproduce the former two-lane depth-three
+     deadlock.
+
+164. **Per-rig timeout is engine-owned accumulated self-time.** `timeout_s` now budgets
+     the sum of a frame's active lease intervals across park/resume cycles and attempts.
+     Exhaustion synchronously stops the adapter through `WorkerSupervisor` with
+     `frame_self_timeout`, producing the existing `worker_reaped` fact and a failed frame
+     result. Shell and script adapter timeouts, including script `--timeout`, are retained
+     at three times the budget solely as a crash backstop. Admission's subtree timeout
+     remains a separate wall-clock owner-waiting cap.
+
+165. **Engine lanes replace local adapter flocks.** Finite slots have stable numeric
+     lanes: first choice is a stable frame-id hash, reacquisition prefers the prior lane
+     when free, and otherwise takes a free lane. The adapter environment receives the
+     lane plus the bundled local provider override (`local-reviewer-8081`/`8082`);
+     `worker-local.sh` honors it while preserving an explicit operator provider as higher
+     priority. `_pin_backend.sh`, including its blocking third-worker branch, is deleted.

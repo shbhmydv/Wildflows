@@ -5,13 +5,14 @@ from pathlib import Path
 from typing import Annotated, Literal, Union
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from wildflows.rig import EchoRig, Rig, RigRegistry, ScriptRig, ShellRig
 
 
 class _RigConfigBase(BaseModel):
     description: str | None = None
+    slots: int | None = Field(default=None, strict=True, gt=0)
 
     @field_validator("description")
     @classmethod
@@ -65,10 +66,39 @@ RigConfig = Annotated[
 
 
 class RigsFile(BaseModel):
-    """The parsed rigs.yaml: rigs plus optional run-level owner notification."""
+    """The parsed rigs.yaml: rigs plus optional notification and kind defaults."""
 
     rigs: dict[str, RigConfig]
     notify: str | None = None
+    kinds: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("kinds")
+    @classmethod
+    def _valid_kind_mappings(cls, value: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for kind, rig in value.items():
+            clean_kind = kind.strip()
+            clean_rig = rig.strip()
+            if (
+                not clean_kind
+                or not clean_rig
+                or "\n" in clean_kind
+                or "\r" in clean_kind
+                or "\n" in clean_rig
+                or "\r" in clean_rig
+            ):
+                raise ValueError("kind mappings must use non-blank single lines")
+            normalized[clean_kind] = clean_rig
+        return normalized
+
+    @model_validator(mode="after")
+    def _known_kind_rigs(self) -> "RigsFile":
+        unknown = set(self.kinds.values()) - set(self.rigs)
+        if unknown:
+            raise ValueError(
+                f"kinds map to unknown rigs: {', '.join(sorted(unknown))}"
+            )
+        return self
 
     @field_validator("notify")
     @classmethod
@@ -88,9 +118,12 @@ def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
     parsed = RigsFile.model_validate(data)
     built: dict[str, Rig] = {}
     descriptions: dict[str, str] = {}
+    slots: dict[str, int] = {}
     for name, config in parsed.rigs.items():
         if config.description is not None:
             descriptions[name] = config.description
+        if config.slots is not None:
+            slots[name] = config.slots
         if isinstance(config, ScriptRigConfig):
             base = config_path.parent
             config = config.model_copy(update={
@@ -98,7 +131,9 @@ def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
                 "log_dir": (base / config.log_dir).resolve(),
             })
         built[name] = config.build()
-    return RigRegistry(built, descriptions), parsed.notify
+    return RigRegistry(
+        built, descriptions, slots=slots, kinds=parsed.kinds
+    ), parsed.notify
 
 
 def load_rigs(path: Path) -> RigRegistry:

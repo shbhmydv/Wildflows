@@ -8,7 +8,10 @@ card, then that frame's dispatch rows in call order, with parallel siblings acro
 row. A nested frame collapses as soon as it is done and its own calls are complete;
 failed frames collapse when their enclosing dispatch returns, and a finished root
 collapses when the run completes. An in-flight caller is **banked**, and only a running
-leaf breathes. Frame state follows the frame's own exit: an ok frame with failed direct
+leaf breathes. A pushed frame waiting for configured rig capacity is **queued**; its
+`frame_slot_queued` event, later lane acquisition, release reason, and accumulated
+self-time are visible in the journal/detail projection. Dispatch headings and journal
+rows show any per-task kind hints. Frame state follows the frame's own exit: an ok frame with failed direct
 children remains **done** and shows an `N failed children` chip.
 
 The call stack keeps its natural intrinsic width on an unbounded surface. Parallel

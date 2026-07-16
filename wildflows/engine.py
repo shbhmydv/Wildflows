@@ -28,6 +28,9 @@ from wildflows.events import (
     FramePopped,
     FramePushed,
     FrameRelaunchBlocked,
+    FrameSlotAcquired,
+    FrameSlotQueued,
+    FrameSlotReleased,
     GateCalled,
     GateReturned,
     RunFinished,
@@ -56,6 +59,7 @@ from wildflows.journal import Journal
 from wildflows.mcp import MCPServer, ToolProtocolError, ValidatedToolCall
 from wildflows.projection import FrameProjection, RunProjection
 from wildflows.result import CommitReceipt
+from wildflows.scheduler import RigSlotScheduler, SlotSchedulerStopped
 from wildflows.rig import (
     RigRegistry,
     ScriptRig,
@@ -139,6 +143,22 @@ class _LiveCall:
     cancellation: threading.Event
 
 
+@dataclass
+class _FrameExecution:
+    frame_id: str
+    attempt: int
+    rig: str
+    budget_s: float
+    used_s: float
+    worker: WorkerLease
+    lane: int | None = None
+    active_started: float | None = None
+    timer: threading.Timer | None = None
+    generation: int = 0
+    timed_out: bool = False
+    closed: bool = False
+
+
 @dataclass(frozen=True)
 class _AdmissionHeadroom:
     remaining_depth: int
@@ -151,6 +171,7 @@ class Engine:
     """One run's append owner, MCP service, frame stack, and serialized integrator."""
 
     ROOT_FRAME_ID = "f0"
+    ROOT_SKILLS = ("dispatch-economy", "orchestration-shapes")
 
     def __init__(
         self,
@@ -174,6 +195,9 @@ class Engine:
             raise ValueError("notify command must not be empty")
         self._active: dict[str, FrameWorktree] = {}
         self._active_lock = threading.RLock()
+        self._execution_lock = threading.RLock()
+        self._executions: dict[str, _FrameExecution] = {}
+        self._slot_scheduler = RigSlotScheduler(registry.slot_capacities)
         self._integration_lock = threading.RLock()
         self._workspace_lock = threading.RLock()
         self._admission_lock = threading.RLock()
@@ -252,6 +276,7 @@ class Engine:
         self._restore_dispatch_reservations()
         self._workers = WorkerSupervisor(self._record_worker_reap)
         self._sweep_outstanding_worker_handles()
+        self._close_orphaned_slot_intervals()
         self.server = MCPServer(self)
 
     @property
@@ -291,6 +316,232 @@ class Engine:
                     handle_path,
                     "engine_resume_sweep",
                 )
+
+    def _close_orphaned_slot_intervals(self) -> None:
+        """Stop an interrupted active interval before a frame is relaunched."""
+        with self.journal.projection_transaction() as projection:
+            active = [
+                frame for frame in projection.frames.values() if frame.slot_active
+            ]
+            events = list(projection.effective_events)
+        observed = time.time()
+        for frame in active:
+            acquired = next(
+                event
+                for event in reversed(events)
+                if isinstance(event, FrameSlotAcquired)
+                and event.frame_id == frame.frame_id
+            )
+            self.journal.append(FrameSlotReleased(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                attempt=acquired.attempt,
+                rig=acquired.rig,
+                slot=acquired.slot,
+                active_s=max(0.0, observed - acquired.ts),
+                reason="engine_resume_sweep",
+            ))
+
+    def _register_execution(
+        self,
+        frame_id: str,
+        attempt: int,
+        rig: str,
+        worker: WorkerLease,
+    ) -> _FrameExecution:
+        with self.journal.projection_transaction() as projection:
+            used_s = projection.frame(frame_id).self_time_s
+        execution = _FrameExecution(
+            frame_id=frame_id,
+            attempt=attempt,
+            rig=rig,
+            budget_s=self.registry.resolve(rig).timeout_s,
+            used_s=used_s,
+            worker=worker,
+        )
+        with self._execution_lock:
+            if frame_id in self._executions:
+                raise RuntimeError(f"frame execution already registered for {frame_id!r}")
+            self._executions[frame_id] = execution
+        return execution
+
+    def _acquire_frame_slot(
+        self,
+        execution: _FrameExecution,
+        cancellation: threading.Event | None,
+    ) -> bool:
+        with self._execution_lock:
+            if execution.closed or execution.timed_out:
+                return False
+            remaining = execution.budget_s - execution.used_s
+        if remaining <= 0:
+            with self._execution_lock:
+                execution.timed_out = True
+            execution.worker.stop("frame_self_timeout")
+            return False
+        with self.journal.projection_transaction() as projection:
+            previous = projection.frame(execution.frame_id).last_slot
+
+        def queued() -> None:
+            self.journal.append(FrameSlotQueued(
+                run_id=self.run_id,
+                frame_id=execution.frame_id,
+                attempt=execution.attempt,
+                rig=execution.rig,
+            ))
+
+        try:
+            lane = self._slot_scheduler.acquire(
+                execution.rig,
+                execution.frame_id,
+                previous=previous,
+                cancellation=cancellation,
+                on_queued=queued,
+            )
+        except SlotSchedulerStopped:
+            return False
+        try:
+            self.journal.append(FrameSlotAcquired(
+                run_id=self.run_id,
+                frame_id=execution.frame_id,
+                attempt=execution.attempt,
+                rig=execution.rig,
+                slot=lane,
+            ))
+        except BaseException:
+            self._slot_scheduler.release(
+                execution.rig, execution.frame_id, lane
+            )
+            raise
+        with self._execution_lock:
+            stopped = execution.closed or execution.timed_out
+            if not stopped:
+                execution.lane = lane
+                execution.active_started = time.monotonic()
+                execution.generation += 1
+                generation = execution.generation
+                timer = threading.Timer(
+                    remaining,
+                    self._expire_frame_self_time,
+                    args=(execution, generation),
+                )
+                timer.daemon = True
+                execution.timer = timer
+                timer.start()
+        if stopped:
+            self.journal.append(FrameSlotReleased(
+                run_id=self.run_id,
+                frame_id=execution.frame_id,
+                attempt=execution.attempt,
+                rig=execution.rig,
+                slot=lane,
+                active_s=0.0,
+                reason="cancelled_before_start",
+            ))
+            self._slot_scheduler.release(
+                execution.rig, execution.frame_id, lane
+            )
+            return False
+        return True
+
+    def _expire_frame_self_time(
+        self, execution: _FrameExecution, generation: int
+    ) -> None:
+        with self._execution_lock:
+            if (
+                execution.closed
+                or execution.timed_out
+                or execution.active_started is None
+                or execution.generation != generation
+            ):
+                return
+            active_s = max(0.0, time.monotonic() - execution.active_started)
+            execution.used_s += active_s
+            lane = execution.lane
+            execution.lane = None
+            execution.active_started = None
+            execution.timer = None
+            execution.timed_out = True
+            execution.generation += 1
+        execution.worker.stop("frame_self_timeout")
+        try:
+            self.journal.append(FrameSlotReleased(
+                run_id=self.run_id,
+                frame_id=execution.frame_id,
+                attempt=execution.attempt,
+                rig=execution.rig,
+                slot=lane,
+                active_s=active_s,
+                reason="self_time_timeout",
+            ))
+        finally:
+            self._slot_scheduler.release(
+                execution.rig, execution.frame_id, lane
+            )
+
+    def _release_frame_slot(
+        self, execution: _FrameExecution, reason: str, *, close: bool = False
+    ) -> None:
+        with self._execution_lock:
+            if close:
+                execution.closed = True
+            if execution.active_started is None:
+                if close:
+                    self._executions.pop(execution.frame_id, None)
+                return
+            timer = execution.timer
+            if timer is not None:
+                timer.cancel()
+            active_s = max(0.0, time.monotonic() - execution.active_started)
+            execution.used_s += active_s
+            lane = execution.lane
+            execution.lane = None
+            execution.active_started = None
+            execution.timer = None
+            execution.generation += 1
+            if close:
+                self._executions.pop(execution.frame_id, None)
+        try:
+            self.journal.append(FrameSlotReleased(
+                run_id=self.run_id,
+                frame_id=execution.frame_id,
+                attempt=execution.attempt,
+                rig=execution.rig,
+                slot=lane,
+                active_s=active_s,
+                reason=reason,
+            ))
+        finally:
+            self._slot_scheduler.release(execution.rig, execution.frame_id, lane)
+
+    def _park_frame(self, frame_id: str, reason: str) -> None:
+        with self._execution_lock:
+            execution = self._executions.get(frame_id)
+        if execution is not None:
+            self._release_frame_slot(execution, reason)
+
+    def _resume_frame(
+        self, frame_id: str, cancellation: threading.Event
+    ) -> None:
+        with self._execution_lock:
+            execution = self._executions.get(frame_id)
+        if execution is not None and not cancellation.is_set():
+            self._acquire_frame_slot(execution, cancellation)
+
+    def _close_frame_execution(self, frame_id: str, reason: str) -> None:
+        with self._execution_lock:
+            execution = self._executions.get(frame_id)
+        if execution is not None:
+            self._release_frame_slot(execution, reason, close=True)
+
+    @staticmethod
+    def _slot_environment(lane: int | None) -> dict[str, str]:
+        if lane is None:
+            return {}
+        return {
+            "WILDFLOWS_SLOT": str(lane),
+            "WILDFLOWS_PROVIDER_OVERRIDE": f"local-reviewer-{8081 + lane}",
+        }
 
     def _sweep_integration_refs(self) -> None:
         with self.journal.projection_transaction() as projection:
@@ -354,7 +605,12 @@ class Engine:
             frame_ids.update(owner for owner, _ in self._inflight_calls)
         for frame_id in frame_ids:
             self._cancel_frame_calls(frame_id)
+        self._slot_scheduler.shutdown()
         self._workers.shutdown(reason)
+        with self._execution_lock:
+            execution_ids = list(self._executions)
+        for frame_id in execution_ids:
+            self._close_frame_execution(frame_id, reason)
 
     def _shutdown_preserving(self, reason: str, original: BaseException) -> None:
         try:
@@ -396,6 +652,9 @@ class Engine:
         with self.server:
             root = self.journal.projection.frames.get(self.ROOT_FRAME_ID)
             if root is None or root.outcome is None:
+                root_skills = (
+                    list(self.ROOT_SKILLS) if root is None else list(root.skills)
+                )
                 root = self._launch_frame(
                     frame_id=self.ROOT_FRAME_ID,
                     parent_frame_id=None,
@@ -404,7 +663,7 @@ class Engine:
                     depth=0,
                     rig=opened.root_rig,
                     prompt=opened.root_prompt,
-                    skills=[],
+                    skills=root_skills,
                     base_commit=opened.base_commit,
                     subtree_deadline=opened.started_at + self.policy.subtree_timeout_s,
                 )
@@ -447,13 +706,12 @@ class Engine:
                 wait_for_leader = False
                 with self.journal.projection_transaction() as projection:
                     existing = projection.call(frame_id, call_index)
-                    if existing is not None:
-                        if existing.tool != tool or existing.call_hash != digest:
-                            raise CallConflictError(
-                                f"call {frame_id}:{call_index} content differs from its durable call"
-                            )
-                        if existing.response is not None:
-                            return existing.response
+                    if existing is not None and (
+                        existing.tool != tool or existing.call_hash != digest
+                    ):
+                        raise CallConflictError(
+                            f"call {frame_id}:{call_index} content differs from its durable call"
+                        )
                     leader = self._inflight_calls.get(key)
                     if leader is not None:
                         if leader.tool != tool or leader.digest != digest:
@@ -461,6 +719,8 @@ class Engine:
                                 f"call {frame_id}:{call_index} conflicts with its live call"
                             )
                         wait_for_leader = True
+                    elif existing is not None and existing.response is not None:
+                        return existing.response
                     elif any(
                         owner == frame_id and index < call_index
                         for owner, index in self._inflight_calls
@@ -503,6 +763,9 @@ class Engine:
                 if wait_for_leader:
                     self._call_condition.wait()
         self._call_context.cancellation = live_call.cancellation
+        parked = tool in ("dispatch", "ask")
+        if parked:
+            self._park_frame(frame_id, tool)
         try:
             if tool == "dispatch":
                 if not isinstance(request, DispatchRequest):
@@ -522,6 +785,8 @@ class Engine:
                 frame, worktree, call_index, digest, request, replaying
             )
         finally:
+            if parked:
+                self._resume_frame(frame_id, live_call.cancellation)
             del self._call_context.cancellation
             with self._call_condition:
                 self._inflight_calls.pop(key, None)
@@ -798,12 +1063,22 @@ class Engine:
                     and child.parent_call_index == call.call_index
                     and child.task_index is not None
                 }
-                remaining = len(request.tasks) - len(launched)
+                remaining_indexes = [
+                    index for index in range(len(request.tasks))
+                    if index not in launched
+                ]
+                remaining = len(remaining_indexes)
                 if remaining <= 0:
                     continue
+                task_rigs = self.registry.task_rigs(
+                    request.rig, request.kinds, len(request.tasks)
+                )
                 frame = projection.frame(call.frame_id)
                 ancestors = self._ancestor_ids(frame)
-                spend = remaining * self.policy.rig_cost(request.rig)
+                spend = sum(
+                    self.policy.rig_cost(task_rigs[index])
+                    for index in remaining_indexes
+                )
                 for ancestor_id in ancestors:
                     self._reservation_frames[ancestor_id] = (
                         self._reservation_frames.get(ancestor_id, 0) + remaining
@@ -823,10 +1098,11 @@ class Engine:
     ) -> None:
         with self.journal.projection_transaction() as projection:
             ancestors = self._ancestor_ids(frame)
+            task_rigs: tuple[str, ...] = ()
             for ancestor_id in ancestors:
                 ancestor = projection.frame(ancestor_id)
                 frames, spend = self._subtree_admission_usage(ancestor_id)
-                admit_dispatch(
+                task_rigs = admit_dispatch(
                     request,
                     caller_depth=frame.depth,
                     subtree_frames=frames,
@@ -836,7 +1112,7 @@ class Engine:
                     registry=self.registry,
                 )
             frames = len(request.tasks)
-            spend = frames * self.policy.rig_cost(request.rig)
+            spend = sum(self.policy.rig_cost(rig) for rig in task_rigs)
             for ancestor_id in ancestors:
                 self._reservation_frames[ancestor_id] = (
                     self._reservation_frames.get(ancestor_id, 0) + frames
@@ -893,6 +1169,9 @@ class Engine:
     ) -> list[ChildResult]:
         results: list[ChildResult] = []
         cancellation = self._current_call_cancellation()
+        task_rigs = self.registry.task_rigs(
+            request.rig, request.kinds, len(request.tasks)
+        )
         for task_index, task in enumerate(request.tasks):
             try:
                 child = self._execute_child(
@@ -900,7 +1179,7 @@ class Engine:
                     call_index,
                     task_index,
                     task,
-                    request.rig,
+                    task_rigs[task_index],
                     request.skill_bundle(task_index),
                     base_commit=self.repository.branch_tip(parent.branch),
                     cancellation=cancellation,
@@ -942,6 +1221,9 @@ class Engine:
     ) -> list[ChildResult]:
         base = self.repository.branch_tip(parent.branch)
         cancellation = self._current_call_cancellation()
+        task_rigs = self.registry.task_rigs(
+            request.rig, request.kinds, len(request.tasks)
+        )
         by_index: dict[int, ChildResult] = {}
         with self.journal.projection_transaction() as projection:
             owned = self._parallel_owned_paths(parent.frame_id, call_index)
@@ -966,7 +1248,7 @@ class Engine:
                     call_index,
                     task_index,
                     task,
-                    request.rig,
+                    task_rigs[task_index],
                     request.skill_bundle(task_index),
                     base_commit=base,
                     start_barrier=start_barrier,
@@ -1586,6 +1868,7 @@ class Engine:
         capability = self.server.register_frame(frame_id)
         terminalized = False
         worker: WorkerLease | None = None
+        execution: _FrameExecution | None = None
         try:
             try:
                 if start_barrier is not None:
@@ -1616,31 +1899,39 @@ class Engine:
                     next_call_index,
                     replay_calls,
                 )
+                rendered_prompt = self._frame_prompt(
+                    frame_id,
+                    prompt,
+                    skills,
+                    worktree.path,
+                    earlier_attempt=earlier_attempt,
+                )
                 worker = self._workers.prepare(
                     frame_id, attempt, runtime_dir / "worker.handle"
                 )
-                runtime = FrameRuntime(
-                    endpoint=self.server.endpoint,
-                    token=capability,
-                    frame_id=frame_id,
-                    shim_path=shim,
-                    runtime_dir=runtime_dir,
-                    next_call_index=next_call_index,
-                    cancellation=cancellation,
-                    worker=worker,
+                execution = self._register_execution(
+                    frame_id, attempt, rig, worker
                 )
-                result = self.registry.resolve(rig).run(
-                    self._frame_prompt(
-                        frame_id,
-                        prompt,
-                        skills,
-                        worktree.path,
-                        earlier_attempt=earlier_attempt,
-                    ),
-                    worktree.path,
-                    runtime,
-                )
-                worker.finished()
+                if self._acquire_frame_slot(execution, cancellation):
+                    adapter = self.registry.resolve(rig)
+                    runtime = FrameRuntime(
+                        endpoint=self.server.endpoint,
+                        token=capability,
+                        frame_id=frame_id,
+                        shim_path=shim,
+                        runtime_dir=runtime_dir,
+                        next_call_index=next_call_index,
+                        cancellation=cancellation,
+                        worker=worker,
+                        environment=self._slot_environment(execution.lane),
+                        backstop_timeout_s=adapter.timeout_s * 3,
+                    )
+                    result = adapter.run(rendered_prompt, worktree.path, runtime)
+                else:
+                    result = FrameResult(
+                        outcome="failed",
+                        text="frame execution stopped before acquiring a rig slot",
+                    )
             except Exception as exc:
                 if worker is not None:
                     worker.stop("rig_exception")
@@ -1648,6 +1939,22 @@ class Engine:
                     outcome="failed",
                     text=f"frame rig failed: {exc}",
                     stderr=str(exc),
+                )
+            finally:
+                if execution is not None:
+                    self._close_frame_execution(frame_id, "exit")
+            if worker is not None:
+                worker.finished()
+            if execution is not None and execution.timed_out:
+                result = FrameResult(
+                    outcome="failed",
+                    text=(
+                        "[timeout] frame self-time budget "
+                        f"of {execution.budget_s:g}s exhausted"
+                    ),
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
                 )
 
             # MCP validation transfers lifetime ownership to the engine. No frame
@@ -1751,7 +2058,9 @@ class Engine:
             "The only engine tools are wildflows_dispatch, wildflows_gate, and "
             "wildflows_ask. Tool calls block; child commits are present in your branch "
             "when dispatch returns. Dispatch skills is optional and contains one "
-            "ordered skill-name list per task. Shapes are your control flow: a sequence "
+            "ordered skill-name list per task. Dispatch kinds is an optional parallel "
+            "list of free-text hints; when every kind has a configured default, rig may "
+            "be omitted. Shapes are your control flow: a sequence "
             "is consecutive dispatch calls, a loop is redispatching until your own "
             "criterion is met, a fan-out is one dispatch with many tasks (parallel: "
             "true); combine these freely and choose per task. Prefer sequential "

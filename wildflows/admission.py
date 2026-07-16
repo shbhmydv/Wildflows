@@ -65,8 +65,8 @@ def admit_dispatch(
     policy: AdmissionPolicy,
     registry: RigRegistry,
     now: float | None = None,
-) -> None:
-    """Refuse a dispatch before worktree, process, or spend effects occur."""
+) -> tuple[str, ...]:
+    """Refuse a dispatch before effects and return each task's resolved rig."""
     observed = time.time() if now is None else now
     child_depth = caller_depth + 1
     if child_depth > policy.max_depth:
@@ -93,16 +93,26 @@ def admit_dispatch(
             "caller subtree deadline has elapsed",
             registry,
         )
-    if request.rig not in registry:
+    try:
+        task_rigs = registry.task_rigs(
+            request.rig, request.kinds, len(request.tasks)
+        )
+    except KeyError as exc:
+        raise _refusal("rig_not_allowed", exc.args[0], registry) from exc
+    unknown = [rig for rig in task_rigs if rig not in registry]
+    if unknown:
         raise _refusal(
             "rig_not_allowed",
-            f"rig {request.rig!r} is not in this run's allowlist",
+            f"rig {unknown[0]!r} is not in this run's allowlist",
             registry,
         )
-    projected = subtree_spend + len(request.tasks) * policy.rig_cost(request.rig)
+    projected = subtree_spend + sum(
+        policy.rig_cost(rig) for rig in task_rigs
+    )
     if projected > policy.max_subtree_spend:
         raise _refusal(
             "subtree_spend_cap",
             f"subtree spend {projected:g} would exceed cap {policy.max_subtree_spend:g}",
             registry,
         )
+    return task_rigs

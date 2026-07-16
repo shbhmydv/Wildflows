@@ -66,17 +66,46 @@ def _push_root(engine: Engine, worktree: Path) -> str:
 def test_bundled_skills_are_discovered_with_heading_descriptions(repo: Path) -> None:
     library = SkillLibrary(repo)
 
-    assert library.names == ("long", "plan-compress-execute", "skill-selection")
+    assert library.names == (
+        "dispatch-economy",
+        "long",
+        "orchestration-shapes",
+        "plan-compress-execute",
+        "skill-selection",
+    )
     skills = library.resolve(library.names)
     assert [skill.description for skill in skills] == [
         skill.text.splitlines()[0].removeprefix("# ") for skill in skills
     ]
     assert library.manifest() == "\n".join([
         "SKILL MANIFEST:",
+        "- dispatch-economy: Dispatch economy — Route bounded work by determinacy and spend review once",
         "- long: Long — Run a disciplined, multi-hour senior implementation frame",
+        "- orchestration-shapes: Orchestration shapes — Compose serial work, independent fan-out, bounded loops, and reviews",
         "- plan-compress-execute: Plan, compress, execute — Turn a bounded junior task into verified delivery",
         "- skill-selection: Skill selection — Route a small, role-appropriate bundle to each frame",
     ])
+
+
+def test_root_gets_default_dispatch_skills_with_repository_overrides(
+    repo: Path, tmp_path: Path
+) -> None:
+    skills_dir = repo / ".wildflows" / "skills"
+    skills_dir.mkdir(parents=True)
+    local = skills_dir / "dispatch-economy.md"
+    local.write_text(
+        "# Local economy — Repository dispatch policy\n\nUse this local policy.\n",
+        encoding="utf-8",
+    )
+    rig = CapturingRig()
+    engine = _engine(repo, tmp_path, rig)
+
+    assert engine.run().outcome == "ok"
+    assert rig.prompts[0].startswith(local.read_text(encoding="utf-8"))
+    pushed = [
+        event for event in engine.journal.events() if isinstance(event, FramePushed)
+    ]
+    assert pushed[0].skills == ["dispatch-economy", "orchestration-shapes"]
 
 
 def test_repository_skills_shadow_bundled_stems_and_add_custom_skills(repo: Path) -> None:
@@ -90,7 +119,9 @@ def test_repository_skills_shadow_bundled_stems_and_add_custom_skills(repo: Path
     library = SkillLibrary(repo)
 
     assert library.names == (
+        "dispatch-economy",
         "long",
+        "orchestration-shapes",
         "plan-compress-execute",
         "review",
         "skill-selection",
@@ -189,7 +220,11 @@ def test_frame_prompt_orders_assigned_skill_texts_before_job_and_resources(
         "- Remaining descendant frame capacity: 64.\n"
         "- Remaining subtree spend capacity: 64 admission units.\n\n"
         "SKILL MANIFEST:\n"
+        "- dispatch-economy: Dispatch economy — Route bounded work by determinacy "
+        "and spend review once\n"
         "- long: Long — Run a disciplined, multi-hour senior implementation frame\n"
+        "- orchestration-shapes: Orchestration shapes — Compose serial work, "
+        "independent fan-out, bounded loops, and reviews\n"
         "- plan-compress-execute: Plan, compress, execute — Turn a bounded junior "
         "task into verified delivery\n"
         "- skill-selection: Skill selection — Route a small, role-appropriate bundle "
@@ -198,7 +233,9 @@ def test_frame_prompt_orders_assigned_skill_texts_before_job_and_resources(
         "The only engine tools are wildflows_dispatch, wildflows_gate, and "
         "wildflows_ask. Tool calls block; child commits are present in your branch "
         "when dispatch returns. Dispatch skills is optional and contains one "
-        "ordered skill-name list per task. Shapes are your control flow: a sequence "
+        "ordered skill-name list per task. Dispatch kinds is an optional parallel "
+        "list of free-text hints; when every kind has a configured default, rig may "
+        "be omitted. Shapes are your control flow: a sequence "
         "is consecutive dispatch calls, a loop is redispatching until your own "
         "criterion is met, a fan-out is one dispatch with many tasks (parallel: "
         "true); combine these freely and choose per task. Prefer sequential "

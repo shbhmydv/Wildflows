@@ -13,8 +13,9 @@ bank*—the caller stays alive while the engine does the durable work below it. 
 tool surface has only three tools, exposed by the reference Pi shim with
 `wildflows_`-prefixed names:
 
-- **`wildflows_dispatch(tasks, rig, parallel?, skills?)`** (`dispatch` over MCP) pushes
-  child frames, then returns their reports and integrated commits;
+- **`wildflows_dispatch(tasks, rig?, parallel?, skills?, kinds?)`** (`dispatch` over
+  MCP) pushes child frames, then returns their reports and integrated commits. `kinds`
+  is an optional free-text hint per task; configured kind defaults can supply omitted rigs;
 - **`wildflows_gate(cmd)`** (`gate`) runs a deterministic check in the caller's
   worktree and returns the exit code plus complete stdout and stderr;
 - **`wildflows_ask(question)`** (`ask`) parks the frame until the owner answers.
@@ -64,10 +65,14 @@ rigs:
   worker:
     kind: script
     description: bounded implementation lane
-    # For pooled dual-GPU workers, set script: rigs/worker-local.sh.
-    script: rigs/worker-picodex.sh
+    script: rigs/worker-local.sh
     log_dir: /tmp/wildflows/worker
     timeout_s: 900
+    slots: 2
+# Optional defaults used only when a dispatch omits its explicit rig:
+kinds:
+  implement: worker
+  review: worker
 EOF
 
 python3 -m wildflows run job.md \
@@ -95,10 +100,11 @@ For a small two-leaf example, see [`examples/toy-run`](examples/toy-run/).
 
 The durable frame/call history is an append-only stream of fsynced v2 records at
 `<target>/.wildflows/runs/<run-id>/events.ndjson`. The current event kinds are
-`run_opened`, `frame_pushed`, `dispatch_called`, `dispatch_returned`, `gate_called`,
-`gate_returned`, `asked`, `answered`, `call_failed`, `frame_relaunch_blocked`,
-`frame_exited`, `frame_integrating`, `frame_integrated`, `frame_popped`, and
-`run_finished`. `frame_relaunch_blocked` parks replay when a live frame branch has
+`run_opened`, `frame_pushed`, `frame_slot_queued`, `frame_slot_acquired`,
+`frame_slot_released`, `dispatch_called`, `dispatch_returned`, `gate_called`,
+`gate_returned`, `asked`, `answered`, `call_failed`, `worker_reaped`,
+`frame_relaunch_blocked`, `frame_exited`, `frame_integrating`, `frame_integrated`,
+`frame_popped`, and `run_finished`. `frame_relaunch_blocked` parks replay when a live frame branch has
 advanced beyond the journal-explained tip. Frame ids are structural breadcrumbs. This
 is the opening of the committed dashboard fixture, rendered in the same breadcrumb
 style as the console:
@@ -121,10 +127,11 @@ hash returns its journalled result instead of launching or gating twice.
 
 ## Skills are layered data
 
-A dispatch can assign one ordered skill-name list to each task. WILDFLOWS ships three
+A dispatch can assign one ordered skill-name list to each task. WILDFLOWS ships five
 Markdown bundles; target-local `.wildflows/skills/*.md` files add skills or shadow a
-bundled file with the same stem. Skills steer prompts—they do not grant capability or
-change admission.
+bundled file with the same stem. The root receives `dispatch-economy` and
+`orchestration-shapes` by default; parents route that pair to children expected to
+further dispatch. Skills steer prompts—they do not grant capability or change admission.
 
 Every frame receives its assigned skill texts in order, then its job, then one engine
 `RESOURCES` preamble. That block gives the currently dispatchable rig registry keys and

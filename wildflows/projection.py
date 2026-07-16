@@ -16,6 +16,9 @@ from wildflows.events import (
     FramePopped,
     FramePushed,
     FrameRelaunchBlocked,
+    FrameSlotAcquired,
+    FrameSlotQueued,
+    FrameSlotReleased,
     GateCalled,
     GateReturned,
     RunFinished,
@@ -56,6 +59,11 @@ class FrameProjection:
     integrating: FrameIntegrating | None = None
     integrated: FrameIntegrated | None = None
     popped: bool = False
+    self_time_s: float = 0.0
+    slot_active: bool = False
+    waiting_for_slot: bool = False
+    slot: int | None = None
+    last_slot: int | None = None
 
 
 @dataclass
@@ -110,6 +118,22 @@ class RunProjection:
             current.worktree = event.worktree
             current.popped = False
             current.relaunch_blocked = None
+        elif isinstance(event, FrameSlotQueued):
+            frame = self.frames[event.frame_id]
+            frame.waiting_for_slot = True
+        elif isinstance(event, FrameSlotAcquired):
+            frame = self.frames[event.frame_id]
+            frame.waiting_for_slot = False
+            frame.slot_active = True
+            frame.slot = event.slot
+            if event.slot is not None:
+                frame.last_slot = event.slot
+        elif isinstance(event, FrameSlotReleased):
+            frame = self.frames[event.frame_id]
+            frame.self_time_s += event.active_s
+            frame.slot_active = False
+            frame.slot = None
+            frame.waiting_for_slot = False
         elif isinstance(event, (DispatchCalled, GateCalled, Asked)):
             if isinstance(event, DispatchCalled):
                 tool: ToolName = "dispatch"
@@ -237,5 +261,6 @@ class RunProjection:
             }
             if isinstance(call.request, DispatchRequest):
                 item["skills"] = [list(bundle) for bundle in call.request.skills]
+                item["kinds"] = list(call.request.kinds)
             digest.append(item)
         return digest

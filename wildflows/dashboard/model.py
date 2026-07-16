@@ -218,6 +218,8 @@ class DashboardModel:
             return "done" if own_outcome == "ok" else "failed"
         if frame.relaunch_blocked is not None:
             return "parked"
+        if frame.waiting_for_slot:
+            return "queued"
         if self._pending_ask(frame.frame_id, projection) is not None:
             return "parked"
         if self._pending_dispatch(frame.frame_id, projection) is not None:
@@ -274,6 +276,10 @@ class DashboardModel:
             "queued": max(0, requested - len(children)),
             "parallel": (
                 call.request.parallel if isinstance(call.request, DispatchRequest) else False
+            ),
+            "kinds": (
+                list(call.request.kinds)
+                if isinstance(call.request, DispatchRequest) else []
             ),
             "counts": dict(counts),
         }
@@ -332,6 +338,8 @@ class DashboardModel:
                 if frame_started is not None and frame_ended is not None
                 else None
             ),
+            "self_time_s": frame.self_time_s,
+            "slot": frame.slot,
             "branch": frame.branch,
             "base_commit": frame.base_commit,
             "head": frame.head,
