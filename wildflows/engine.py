@@ -36,6 +36,7 @@ from wildflows.events import (
     RunFinished,
     RunOpened,
     WorkerReaped,
+    WorktreeProvisioned,
 )
 from wildflows.frame import (
     AskRequest,
@@ -135,6 +136,11 @@ _EARLIER_ATTEMPT_DIFF_BYTES = 24 * 1024
 _EARLIER_ATTEMPT_SUMMARY_BYTES = 8 * 1024
 _EARLIER_ATTEMPT_BLOCK_BYTES = 64 * 1024
 _EARLIER_ATTEMPT_REASON_BYTES = 512
+_PROVISION_OUTPUT_BYTES = 16 * 1024
+
+
+class WorktreeProvisioningError(RuntimeError):
+    """A configured setup or link mechanism could not prepare a checkout."""
 
 
 @dataclass(frozen=True)
@@ -195,6 +201,8 @@ class Engine:
         self.run_dir = Path(run_dir).resolve()
         self.registry = registry
         self.run_id = run_id
+        self._worktree_setup = registry.worktree_setup
+        self._worktree_links = registry.worktree_links
         self._notify_command = tuple(notify_command or ())
         if notify_command is not None and not self._notify_command:
             raise ValueError("notify command must not be empty")
@@ -234,6 +242,10 @@ class Engine:
             if opened.root_rig != root_rig:
                 raise ValueError("resumed root rig differs from durable run")
             durable_worktrees = Path(opened.worktrees_root)
+            if opened.worktree_setup != self._worktree_setup:
+                raise ValueError("resumed worktree setup differs from durable run")
+            if tuple(opened.worktree_links) != self._worktree_links:
+                raise ValueError("resumed worktree links differ from durable run")
             if worktrees_root is not None and Path(worktrees_root).resolve() != durable_worktrees:
                 raise ValueError("resumed worktrees root differs from durable run")
             self.policy = opened.policy
@@ -271,6 +283,8 @@ class Engine:
                 root_rig=root_rig,
                 root_prompt=root_prompt,
                 worktrees_root=str(self.repository.worktrees_root),
+                worktree_setup=self._worktree_setup,
+                worktree_links=list(self._worktree_links),
                 started_at=started,
                 policy=self.policy,
             ))
@@ -1875,6 +1889,134 @@ class Engine:
             "[... EARLIER ATTEMPT BLOCK TRUNCATED ...]",
         )
 
+    @staticmethod
+    def _provision_output_tail(stdout: str, stderr: str) -> str:
+        combined = f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        encoded = combined.encode("utf-8")
+        if len(encoded) <= _PROVISION_OUTPUT_BYTES:
+            return combined
+        marker = b"[... PROVISIONING OUTPUT TRUNCATED ...]\n"
+        tail = encoded[-(_PROVISION_OUTPUT_BYTES - len(marker)):]
+        return (marker + tail).decode("utf-8", errors="replace")
+
+    def _provisioning_recorded(
+        self, worktree: FrameWorktree, mechanism: str
+    ) -> bool:
+        with self.journal.projection_transaction() as projection:
+            return any(
+                isinstance(event, WorktreeProvisioned)
+                and event.worktree == str(worktree.path)
+                and event.mechanism == mechanism
+                and event.outcome in ("ok", "skipped")
+                for event in projection.effective_events
+            )
+
+    def _provision_setup(
+        self, worktree: FrameWorktree, attempt: int, command: str
+    ) -> None:
+        if self._provisioning_recorded(worktree, "setup"):
+            return
+        started = time.monotonic()
+        try:
+            result = run_shell(command, worktree.path, None)
+        except (OSError, _subprocess.SubprocessError) as exc:
+            duration_s = max(0.0, time.monotonic() - started)
+            detail = f"worktree setup could not launch: {exc}"
+            self.journal.append(WorktreeProvisioned(
+                run_id=self.run_id,
+                frame_id=worktree.frame_id,
+                attempt=attempt,
+                worktree=str(worktree.path),
+                mechanism="setup",
+                duration_s=duration_s,
+                outcome="failed",
+                output_tail=detail,
+            ))
+            raise WorktreeProvisioningError(detail) from exc
+        duration_s = max(0.0, time.monotonic() - started)
+        assert result.returncode is not None
+        output_tail = self._provision_output_tail(result.stdout, result.stderr)
+        self.journal.append(WorktreeProvisioned(
+            run_id=self.run_id,
+            frame_id=worktree.frame_id,
+            attempt=attempt,
+            worktree=str(worktree.path),
+            mechanism="setup",
+            duration_s=duration_s,
+            outcome="ok" if result.returncode == 0 else "failed",
+            output_tail=output_tail,
+        ))
+        if result.returncode != 0:
+            raise WorktreeProvisioningError(
+                f"worktree setup failed with exit {result.returncode}\n{output_tail}"
+            )
+
+    def _provision_links(
+        self, worktree: FrameWorktree, attempt: int, links: tuple[str, ...]
+    ) -> None:
+        if self._provisioning_recorded(worktree, "link"):
+            return
+        started = time.monotonic()
+        linked: list[str] = []
+        warnings: list[str] = []
+        try:
+            for relative in links:
+                source = self.repository.root / relative
+                if not source.exists():
+                    warnings.append(
+                        "worktree link source does not exist; skipped: " + relative
+                    )
+                    continue
+                destination = worktree.path / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                parent = destination.parent.resolve()
+                if not parent.is_relative_to(worktree.path.resolve()):
+                    raise WorktreeProvisioningError(
+                        f"worktree link destination escapes checkout: {relative}"
+                    )
+                if destination.exists() or destination.is_symlink():
+                    raise WorktreeProvisioningError(
+                        f"worktree link destination already exists: {relative}"
+                    )
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+                linked.append(relative)
+        except (OSError, WorktreeProvisioningError) as exc:
+            duration_s = max(0.0, time.monotonic() - started)
+            detail = f"worktree link provisioning failed: {exc}"
+            self.journal.append(WorktreeProvisioned(
+                run_id=self.run_id,
+                frame_id=worktree.frame_id,
+                attempt=attempt,
+                worktree=str(worktree.path),
+                mechanism="link",
+                duration_s=duration_s,
+                outcome="failed",
+                output_tail=detail,
+                linked=linked,
+                warnings=warnings,
+            ))
+            raise WorktreeProvisioningError(detail) from exc
+        duration_s = max(0.0, time.monotonic() - started)
+        self.journal.append(WorktreeProvisioned(
+            run_id=self.run_id,
+            frame_id=worktree.frame_id,
+            attempt=attempt,
+            worktree=str(worktree.path),
+            mechanism="link",
+            duration_s=duration_s,
+            outcome="ok" if linked else "skipped",
+            linked=linked,
+            warnings=warnings,
+        ))
+
+    def _provision_worktree(
+        self, worktree: FrameWorktree, attempt: int
+    ) -> None:
+        if self._worktree_setup is not None:
+            self._provision_setup(worktree, attempt, self._worktree_setup)
+        if self._worktree_links:
+            self._provision_links(worktree, attempt, self._worktree_links)
+
     def _launch_frame(
         self,
         *,
@@ -1959,6 +2101,23 @@ class Engine:
                 )
         else:
             self.journal.append(pushed)
+        try:
+            self._provision_worktree(worktree, attempt)
+        except WorktreeProvisioningError as exc:
+            try:
+                self.journal.append(FrameExited(
+                    run_id=self.run_id,
+                    frame_id=frame_id,
+                    attempt=attempt,
+                    outcome="failed",
+                    text=str(exc),
+                    stderr=str(exc),
+                    head=self.repository.head(worktree.path),
+                ))
+                return self.journal.projection.frame(frame_id)
+            finally:
+                with self._workspace_lock:
+                    self.repository.remove_worktree(worktree)
         with self._active_lock:
             self._active[frame_id] = worktree
         capability = self.server.register_frame(frame_id)

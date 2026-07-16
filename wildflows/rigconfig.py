@@ -66,12 +66,51 @@ RigConfig = Annotated[
 ]
 
 
+class WorktreeConfig(BaseModel):
+    """Repository-wide provisioning applied to each fresh frame checkout."""
+
+    setup: str | None = None
+    link: list[str] = Field(default_factory=list)
+
+    @field_validator("setup")
+    @classmethod
+    def _nonblank_setup(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("worktree setup command must be non-blank")
+        return value
+
+    @field_validator("link")
+    @classmethod
+    def _relative_links(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            candidate = Path(value)
+            if (
+                not value.strip()
+                or candidate.is_absolute()
+                or candidate in (Path("."), Path(".."))
+                or ".." in candidate.parts
+                or ".git" in candidate.parts
+            ):
+                raise ValueError(
+                    "worktree links must be repository-relative paths outside .git"
+                )
+            clean = candidate.as_posix()
+            if clean in normalized:
+                raise ValueError("worktree links must not contain duplicates")
+            normalized.append(clean)
+        return normalized
+
+
 class RigsFile(BaseModel):
     """The parsed rigs.yaml: rigs plus optional notification and kind defaults."""
 
     rigs: dict[str, RigConfig]
     notify: str | None = None
     kinds: dict[str, str] = Field(default_factory=dict)
+    worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
 
     @field_validator("kinds")
     @classmethod
@@ -141,6 +180,8 @@ def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
         slots=slots,
         kinds=parsed.kinds,
         gate_timeouts=gate_timeouts,
+        worktree_setup=parsed.worktree.setup,
+        worktree_links=parsed.worktree.link,
     ), parsed.notify
 
 

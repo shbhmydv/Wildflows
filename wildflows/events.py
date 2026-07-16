@@ -37,6 +37,8 @@ class RunOpened(_Header):
     root_rig: str
     root_prompt: str
     worktrees_root: str
+    worktree_setup: str | None = None
+    worktree_links: list[str] = Field(default_factory=list)
     started_at: float
     policy: AdmissionPolicy
 
@@ -56,6 +58,21 @@ class FramePushed(_Header):
     base_commit: str
     worktree: str
     subtree_deadline: float
+
+
+class WorktreeProvisioned(_Header):
+    """One configured provisioning mechanism completed for a frame checkout."""
+
+    kind: Literal["worktree_provisioned"] = "worktree_provisioned"
+    frame_id: str
+    attempt: int
+    worktree: str
+    mechanism: Literal["setup", "link"]
+    duration_s: float = Field(ge=0)
+    outcome: Literal["ok", "failed", "skipped"]
+    output_tail: str = ""
+    linked: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class FrameSlotQueued(_Header):
@@ -226,6 +243,7 @@ class RunFinished(_Header):
 Event: TypeAlias = Annotated[
     RunOpened
     | FramePushed
+    | WorktreeProvisioned
     | FrameSlotQueued
     | FrameSlotAcquired
     | FrameSlotReleased

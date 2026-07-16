@@ -756,6 +756,8 @@ class RigRegistry:
         slots: dict[str, int] | None = None,
         kinds: dict[str, str] | None = None,
         gate_timeouts: dict[str, float] | None = None,
+        worktree_setup: str | None = None,
+        worktree_links: list[str] | None = None,
     ) -> None:
         self._rigs = dict(rigs)
         supplied = descriptions or {}
@@ -790,9 +792,31 @@ class RigRegistry:
             )
         if any(not kind.strip() or not rig.strip() for kind, rig in configured_kinds.items()):
             raise ValueError("kind mappings must use non-blank names")
+        configured_links = worktree_links or []
+        normalized_links: list[str] = []
+        for value in configured_links:
+            candidate = Path(value)
+            if (
+                not value.strip()
+                or candidate.is_absolute()
+                or candidate in (Path("."), Path(".."))
+                or ".." in candidate.parts
+                or ".git" in candidate.parts
+            ):
+                raise ValueError(
+                    "worktree links must be repository-relative paths outside .git"
+                )
+            clean = candidate.as_posix()
+            if clean in normalized_links:
+                raise ValueError("worktree links must not contain duplicates")
+            normalized_links.append(clean)
+        if worktree_setup is not None and not worktree_setup.strip():
+            raise ValueError("worktree setup command must be non-blank")
         self._slots = dict(configured_slots)
         self._kinds = dict(configured_kinds)
         self._gate_timeouts = dict(configured_gate_timeouts)
+        self._worktree_setup = worktree_setup
+        self._worktree_links = tuple(normalized_links)
         self._descriptions: dict[str, str] = {}
         for name, description in supplied.items():
             normalized = description.strip()
@@ -845,6 +869,14 @@ class RigRegistry:
                 raise KeyError(f"dispatch kind {kind!r} has no default rig")
             resolved.append(rig)
         return tuple(resolved)
+
+    @property
+    def worktree_setup(self) -> str | None:
+        return self._worktree_setup
+
+    @property
+    def worktree_links(self) -> tuple[str, ...]:
+        return self._worktree_links
 
     @property
     def slot_capacities(self) -> dict[str, int]:

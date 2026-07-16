@@ -345,6 +345,10 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
         """notify: owner-notify --urgent
 kinds:
   implement: local
+worktree:
+  setup: python3 -m ensure_dependencies
+  link:
+    - .cache/dependencies
 rigs:
   root:
     kind: script
@@ -376,6 +380,8 @@ rigs:
     assert registry.gate_timeout("root") is None
     assert registry.gate_timeout("local") == 3600
     assert registry.default_rig("implement") == "local"
+    assert registry.worktree_setup == "python3 -m ensure_dependencies"
+    assert registry.worktree_links == (".cache/dependencies",)
 
     old_style = RigsFile.model_validate({
         "rigs": {"echo": {"kind": "echo"}},
@@ -384,6 +390,8 @@ rigs:
     assert old_style.rigs["echo"].slots is None
     assert old_style.rigs["echo"].gate_timeout_s is None
     assert old_style.kinds == {}
+    assert old_style.worktree.setup is None
+    assert old_style.worktree.link == []
 
     with pytest.raises(ValueError, match="unknown rigs"):
         RigsFile.model_validate({
