@@ -34,11 +34,14 @@ class _ToolRequestBase(BaseModel):
 
 
 class DispatchRequest(_ToolRequestBase):
-    tasks: list[str] = Field(min_length=1)
+    tasks: list[str] = Field(default_factory=list)
     rig: str | None = None
     parallel: bool = False
     skills: list[list[str]] = Field(default_factory=list)
     kinds: list[str] = Field(default_factory=list)
+    retry_frame: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("tasks")
     @classmethod
@@ -54,8 +57,23 @@ class DispatchRequest(_ToolRequestBase):
             raise ValueError("dispatch rig must be non-blank")
         return value
 
+    @field_validator("retry_frame")
+    @classmethod
+    def _nonblank_retry_frame(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("dispatch retry_frame must be non-blank")
+        return value
+
     @model_validator(mode="after")
     def _per_task_fields(self) -> "DispatchRequest":
+        if self.retry_frame is not None:
+            if self.tasks or self.rig is not None or self.parallel or self.skills or self.kinds:
+                raise ValueError(
+                    "dispatch retry_frame is exclusive with new-task fields"
+                )
+            return self
+        if not self.tasks:
+            raise ValueError("dispatch tasks must contain at least one task")
         # Omission is canonicalized to one empty bundle per task. This keeps an
         # omitted bundle and explicit no-skill bundles at one memoization identity.
         if not self.skills:
@@ -105,6 +123,9 @@ class ChildResult(BaseModel):
     text: str = ""
     exit_code: int | None = None
     commits: list[CommitReceipt] = Field(default_factory=list)
+    branch: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    head: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    diffstat: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class DispatchResult(BaseModel):
@@ -118,10 +139,19 @@ class DispatchResult(BaseModel):
             return f"dispatch refused [{self.error_code}]: {self.message}"
         if not self.children and self.message:
             return self.message
-        blocks = [
-            f"[{child.frame_id}] {child.outcome} (exit={child.exit_code})\n{child.text}"
-            for child in self.children
-        ]
+        blocks: list[str] = []
+        for child in self.children:
+            block = (
+                f"[{child.frame_id}] {child.outcome} (exit={child.exit_code})\n"
+                f"{child.text}"
+            )
+            if child.branch is not None and child.head is not None:
+                block += (
+                    f"\n\nsalvage branch: {child.branch}"
+                    f"\nsalvage head: {child.head}"
+                    f"\nsalvage diffstat:\n{child.diffstat or '(no committed changes)'}"
+                )
+            blocks.append(block)
         return "\n\n".join(blocks)
 
 
@@ -169,6 +199,8 @@ def call_hash(tool: ToolName, request: ToolRequest) -> str:
             arguments.pop("kinds", None)
         if request.rig is None:
             arguments.pop("rig", None)
+        if request.retry_frame is None:
+            arguments.pop("retry_frame", None)
     payload = {
         "tool": tool,
         "arguments": arguments,

@@ -1034,6 +1034,10 @@ class Engine:
         request: DispatchRequest,
         replaying: bool,
     ) -> DispatchResult:
+        if request.retry_frame is not None:
+            return self._dispatch_retry(
+                frame, worktree, call_index, digest, request, replaying
+            )
         if replaying:
             self.repository.ensure_clean(worktree.path, frame.branch)
         else:
@@ -1099,6 +1103,107 @@ class Engine:
             "ok" if all(result.outcome == "ok" for result in results) else "failed"
         )
         returned = DispatchResult(outcome=outcome, children=results)
+        self._append_tool_return(DispatchReturned(
+            run_id=self.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            result=returned,
+        ))
+        return returned
+
+    def _retry_refused(
+        self,
+        frame: FrameProjection,
+        call_index: int,
+        digest: str,
+        code: str,
+        message: str,
+    ) -> DispatchResult:
+        refused = DispatchResult(
+            outcome="refused", error_code=code, message=message
+        )
+        self._append_tool_return(DispatchReturned(
+            run_id=self.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            result=refused,
+        ))
+        return refused
+
+    def _dispatch_retry(
+        self,
+        frame: FrameProjection,
+        worktree: FrameWorktree,
+        call_index: int,
+        digest: str,
+        request: DispatchRequest,
+        replaying: bool,
+    ) -> DispatchResult:
+        retry_frame = request.retry_frame
+        assert retry_frame is not None
+        caller_head = self.repository.ensure_clean(worktree.path, frame.branch)
+        if not replaying:
+            self.journal.append(DispatchCalled(
+                run_id=self.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                request=request,
+                caller_head=caller_head,
+            ))
+        with self.journal.projection_transaction() as projection:
+            child = projection.frames.get(retry_frame)
+            direct_child = (
+                child is not None and child.parent_frame_id == frame.frame_id
+            )
+            retryable = (
+                child is not None
+                and (
+                    child.outcome == "failed"
+                    or (replaying and child.outcome in (None, "ok"))
+                )
+            )
+        if not direct_child or child is None:
+            return self._retry_refused(
+                frame,
+                call_index,
+                digest,
+                "retry_not_direct_child",
+                f"frame {retry_frame!r} is not a direct child of {frame.frame_id!r}",
+            )
+        if not retryable:
+            return self._retry_refused(
+                frame,
+                call_index,
+                digest,
+                "retry_child_not_failed",
+                f"frame {retry_frame!r} is not a failed direct child",
+            )
+        cancellation = self._current_call_cancellation()
+        if child.outcome == "failed":
+            temporary_ref = self.repository.integration_ref(child.frame_id)
+            if child.integrating is not None and self.repository.ref_exists(temporary_ref):
+                self.repository.delete_integration_ref(temporary_ref)
+            child = self._launch_frame(
+                frame_id=child.frame_id,
+                parent_frame_id=child.parent_frame_id,
+                parent_call_index=child.parent_call_index,
+                task_index=child.task_index,
+                depth=child.depth,
+                rig=child.rig,
+                prompt=child.prompt,
+                skills=list(child.skills),
+                base_commit=child.base_commit,
+                subtree_deadline=child.subtree_deadline,
+                cancellation=cancellation,
+            )
+        result = self._finish_child(child, frame, worktree, owned=set())
+        returned = DispatchResult(
+            outcome="ok" if result.outcome == "ok" else "failed",
+            children=[result],
+        )
         self._append_tool_return(DispatchReturned(
             run_id=self.run_id,
             frame_id=frame.frame_id,
@@ -1483,22 +1588,30 @@ class Engine:
             return self._child_result(child, integrated.landed_commits)
         except RepositoryError as exc:
             self._pop_once(child, "failed")
-            return ChildResult(
-                frame_id=child.frame_id,
-                outcome="failed",
-                text=f"integration failed: {exc}",
-                exit_code=child.exit_code,
-            )
+            failed = self._child_result(child, [])
+            return failed.model_copy(update={"text": f"integration failed: {exc}"})
 
     def _child_result(
         self, child: FrameProjection, commits: list[CommitReceipt]
     ) -> ChildResult:
+        outcome = child.outcome or "failed"
+        head = child.head
+        failed = outcome != "ok" and head is not None
         return ChildResult(
             frame_id=child.frame_id,
-            outcome=child.outcome or "failed",
+            outcome=outcome,
             text=child.text,
             exit_code=child.exit_code,
             commits=commits,
+            branch=(
+                child.branch.removeprefix("refs/heads/") if failed else None
+            ),
+            head=head if failed else None,
+            diffstat=(
+                self.repository.diffstat(child.base_commit, head)
+                if failed and head is not None
+                else None
+            ),
         )
 
     def _explained_frame_tips(
@@ -1839,6 +1952,40 @@ class Engine:
             return self._diff_summary(worktree)
         return decoded
 
+    def _attempt_dirty_diff(self, frame: FrameProjection) -> str:
+        worktree = Path(frame.worktree)
+        if worktree.is_dir():
+            return self._uncommitted_diff(worktree)
+        snapshot = (
+            self.run_dir
+            / "runtime"
+            / frame.frame_id
+            / f"attempt-{frame.attempt}"
+            / "uncommitted.diff"
+        )
+        try:
+            return snapshot.read_text(encoding="utf-8")
+        except OSError:
+            return "(prior attempt worktree is unavailable)"
+
+    def _snapshot_failed_worktree(
+        self, frame_id: str, attempt: int, worktree: Path
+    ) -> None:
+        evidence = self._uncommitted_diff(worktree)
+        path = (
+            self.run_dir
+            / "runtime"
+            / frame_id
+            / f"attempt-{attempt}"
+            / "uncommitted.diff"
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.write_text(evidence, encoding="utf-8")
+        except OSError:
+            # Relaunch evidence is best effort and cannot change frame disposition.
+            return
+
     def _attempt_death_reason(self, frame: FrameProjection) -> str:
         with self.journal.projection_transaction() as projection:
             reaped = [
@@ -1848,6 +1995,18 @@ class Engine:
                 and event.frame_id == frame.frame_id
                 and event.attempt == frame.attempt
             ]
+        if frame.outcome is not None:
+            exit_detail = (
+                f"exit={frame.exit_code}" if frame.exit_code is not None
+                else f"outcome={frame.outcome}"
+            )
+            text = self._truncate_utf8(
+                frame.text.replace("\r", " ").replace("\n", " "),
+                _EARLIER_ATTEMPT_REASON_BYTES,
+                "[... REASON TRUNCATED ...]",
+            )
+            suffix = "" if not text else f": {text}"
+            return f"{frame.outcome} ({exit_detail}){suffix}"
         if not reaped:
             return "crash (no worker_reaped cause was recorded)"
         raw_reason = self._truncate_utf8(
@@ -1869,7 +2028,7 @@ class Engine:
     def _earlier_attempt_block(self, frame: FrameProjection) -> str:
         stdout_name, stdout_tail = self._attempt_log_tail(frame, "stdout")
         stderr_name, stderr_tail = self._attempt_log_tail(frame, "stderr")
-        dirty_diff = self._uncommitted_diff(Path(frame.worktree))
+        dirty_diff = self._attempt_dirty_diff(frame)
         block = (
             "--- EARLIER ATTEMPT ---\n"
             f"This is relaunch attempt {frame.push_count + 1} for frame "
@@ -2247,6 +2406,8 @@ class Engine:
                     head = self.repository.head(worktree.path)
             else:
                 head = self.repository.head(worktree.path)
+            if result.outcome != "ok":
+                self._snapshot_failed_worktree(frame_id, attempt, worktree.path)
             self.journal.append(FrameExited(
                 run_id=self.run_id,
                 frame_id=frame_id,

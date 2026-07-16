@@ -116,6 +116,15 @@ class RunProjection:
             current.attempt = event.attempt
             current.push_count += 1
             current.worktree = event.worktree
+            current.outcome = None
+            current.text = ""
+            current.exit_code = None
+            current.stdout = ""
+            current.stderr = ""
+            current.head = None
+            current.exited_seq = -1
+            current.integrating = None
+            current.integrated = None
             current.popped = False
             current.relaunch_blocked = None
         elif isinstance(event, FrameSlotQueued):

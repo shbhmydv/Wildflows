@@ -624,7 +624,8 @@ class MCPServer:
     ) -> tuple[ToolName, ToolRequest]:
         if name == "dispatch":
             MCPServer._only_keys(
-                arguments, {"tasks", "rig", "parallel", "skills", "kinds"}
+                arguments,
+                {"tasks", "rig", "parallel", "skills", "kinds", "retry_frame"},
             )
             return "dispatch", DispatchRequest.model_validate(arguments)
         if name == "gate":

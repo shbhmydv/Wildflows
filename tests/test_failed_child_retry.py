@@ -84,6 +84,7 @@ elif mode == "retry":
         (cwd / "prior-commit.txt").write_text("preserved\n")
         subprocess.run(["git", "add", "prior-commit.txt"], check=True)
         subprocess.run(["git", "commit", "-m", "preserve failed child work"], check=True)
+        (cwd / "dirty-note.txt").write_text("uncommitted evidence\n")
         print("prior stdout evidence")
         print("prior stderr evidence", file=sys.stderr)
         raise SystemExit(7)
@@ -92,6 +93,8 @@ elif mode == "retry":
     assert "This is relaunch attempt 2 for frame f0.c0.t0." in prompt
     assert "prior stdout evidence" in prompt
     assert "prior stderr evidence" in prompt
+    assert "dirty-note.txt" in prompt
+    assert "+uncommitted evidence" in prompt
     (artifacts / "retry-prompt.txt").write_text(prompt)
     (cwd / "retry-finished.txt").write_text("finished\n")
     print("retry complete")
@@ -160,6 +163,8 @@ def test_failed_result_surfaces_salvage_and_retry_reuses_branch_and_evidence(
     assert engine.repository.is_ancestor(salvage["head"], child.head or "")
     prompt = (artifacts / "retry-prompt.txt").read_text(encoding="utf-8")
     assert "Earlier attempt 1 died: failed" in prompt
+    assert "dirty-note.txt" in prompt
+    assert "+uncommitted evidence" in prompt
     retry_calls = [
         event
         for event in engine.journal.events()

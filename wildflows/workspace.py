@@ -263,6 +263,26 @@ class Repository:
         except UnicodeDecodeError as exc:
             raise RepositoryError("non-UTF-8 repository paths are unsupported") from exc
 
+    def diffstat(self, base: str, candidate: str, *, limit: int = 8192) -> str:
+        """Return a bounded committed diffstat for a frame salvage range."""
+        if limit <= 0:
+            raise ValueError("diffstat limit must be positive")
+        output = self.git([
+            "diff",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+            base,
+            candidate,
+            "--",
+        ]).stdout.rstrip()
+        encoded = output.encode("utf-8")
+        if len(encoded) <= limit:
+            return output
+        marker = b"\n[... DIFFSTAT TRUNCATED ...]"
+        prefix = encoded[:max(0, limit - len(marker))]
+        return (prefix + marker).decode("utf-8", errors="ignore")
+
     def receipt(self, base: str, candidate: str) -> IntegrationReceipt:
         if base == candidate:
             return IntegrationReceipt()
