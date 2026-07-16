@@ -148,6 +148,11 @@ while True:
         }
 
         process.send_signal(engine_signal)
+        # A repeated operator stop during the TERM grace must not interrupt the
+        # in-progress sweep before its SIGKILL/event boundary.
+        time.sleep(0.05)
+        if process.poll() is None:
+            process.send_signal(engine_signal)
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode is not None and process.returncode != 0, (stdout, stderr)
         _wait_stopped(parent)

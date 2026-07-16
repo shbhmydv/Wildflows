@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, TextIO, runtime_checkable
@@ -190,6 +192,22 @@ def _signal_process_tree(record: _WorkerProcess, sig: signal.Signals) -> bool:
     return sent
 
 
+@contextmanager
+def _defer_shutdown_signals() -> Iterator[None]:
+    if (
+        threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "pthread_sigmask")
+    ):
+        yield
+        return
+    watched = {signal.SIGINT, signal.SIGTERM}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 def _wait_for_session_exit(session_id: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while _session_members(session_id):
@@ -359,29 +377,31 @@ class WorkerSupervisor:
         return lease.record or _read_worker_handle(lease.handle_path)
 
     def _stop(self, lease: _SupervisorLease, reason: str) -> None:
-        key = (lease.frame_id, lease.attempt)
-        with self._lock:
-            if key not in self._leases:
-                return
-            lease.stop_reason = reason
-            record = self._record(lease)
-            if record is None:
-                return
-            self._leases.pop(key, None)
-            self._reaping += 1
-        self._reap(lease, record, reason)
+        with _defer_shutdown_signals():
+            key = (lease.frame_id, lease.attempt)
+            with self._lock:
+                if key not in self._leases:
+                    return
+                lease.stop_reason = reason
+                record = self._record(lease)
+                if record is None:
+                    return
+                self._leases.pop(key, None)
+                self._reaping += 1
+            self._reap(lease, record, reason)
 
     def _finished(self, lease: _SupervisorLease) -> None:
-        key = (lease.frame_id, lease.attempt)
-        with self._lock:
-            if key not in self._leases:
-                return
-            record = self._record(lease)
-            self._leases.pop(key, None)
+        with _defer_shutdown_signals():
+            key = (lease.frame_id, lease.attempt)
+            with self._lock:
+                if key not in self._leases:
+                    return
+                record = self._record(lease)
+                self._leases.pop(key, None)
+                if record is not None:
+                    self._reaping += 1
             if record is not None:
-                self._reaping += 1
-        if record is not None:
-            self._reap(lease, record, "worker_exit_cleanup")
+                self._reap(lease, record, "worker_exit_cleanup")
 
     def _reap(
         self, lease: _SupervisorLease, record: _WorkerProcess, reason: str
@@ -418,24 +438,26 @@ class WorkerSupervisor:
             raise RuntimeError("one or more worker sessions could not be reaped") from first_error
 
     def reap_frames(self, frame_ids: set[str], reason: str) -> None:
-        with self._lock:
-            leases = [
-                lease for lease in self._leases.values()
-                if lease.frame_id in frame_ids
-            ]
-        self._stop_all(leases, reason)
+        with _defer_shutdown_signals():
+            with self._lock:
+                leases = [
+                    lease for lease in self._leases.values()
+                    if lease.frame_id in frame_ids
+                ]
+            self._stop_all(leases, reason)
 
     def shutdown(self, reason: str) -> None:
-        with self._lock:
-            if self._shutdown_reason is None:
-                self._shutdown_reason = reason
-            leases = list(self._leases.values())
-        try:
-            self._stop_all(leases, reason)
-        finally:
-            with self._condition:
-                while self._reaping:
-                    self._condition.wait()
+        with _defer_shutdown_signals():
+            with self._lock:
+                if self._shutdown_reason is None:
+                    self._shutdown_reason = reason
+                leases = list(self._leases.values())
+            try:
+                self._stop_all(leases, reason)
+            finally:
+                with self._condition:
+                    while self._reaping:
+                        self._condition.wait()
 
 
 def _kill_unmanaged_process(process: subprocess.Popen[str]) -> None:
