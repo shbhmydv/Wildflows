@@ -204,6 +204,16 @@ class FrameRelaunchBlocked(_Header):
     message: str
 
 
+class FrameCommitWarning(_Header):
+    """Frame auto-commit skipped unsafe environment-owned symlink additions."""
+
+    kind: Literal["frame_commit_warning"] = "frame_commit_warning"
+    frame_id: str
+    attempt: int
+    skipped_paths: list[str]
+    message: str
+
+
 class FrameExited(_Header):
     kind: Literal["frame_exited"] = "frame_exited"
     frame_id: str
@@ -245,6 +255,13 @@ class FramePopped(_Header):
     outcome: FrameOutcome
 
 
+class RunInterrupted(_Header):
+    """An abnormal engine lifecycle ended after synchronous worker shutdown."""
+
+    kind: Literal["run_interrupted"] = "run_interrupted"
+    reason: str
+
+
 class RunFinished(_Header):
     kind: Literal["run_finished"] = "run_finished"
     outcome: FrameOutcome
@@ -269,10 +286,12 @@ Event: TypeAlias = Annotated[
     | CallFailed
     | WorkerReaped
     | FrameRelaunchBlocked
+    | FrameCommitWarning
     | FrameExited
     | FrameIntegrating
     | FrameIntegrated
     | FramePopped
+    | RunInterrupted
     | RunFinished,
     Field(discriminator="kind"),
 ]

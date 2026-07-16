@@ -141,7 +141,7 @@ h1 span { color: var(--muted); font-weight: 400; }
 }
 .state-pill { --pill-pad-x: 9px; gap: 7px; border: 1px solid var(--hairline); border-radius: 999px; background: var(--surface); font-family: var(--mono); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .state-pill.failed { border-color: var(--failure); color: var(--failure); }
-.state-pill.parked { border-color: var(--amber); color: var(--amber); }
+.state-pill.parked, .state-pill.interrupted { border-color: var(--amber); color: var(--amber); }
 .state-line { min-width: 0; gap: 10px; padding: 0 10px; border: 1px solid var(--violet); border-radius: 3px; background: var(--surface); }
 .state-line .micro-label { --pill-pad-x: 6px; flex: 0 0 auto; border-radius: 999px; background: var(--violet-chip); color: var(--violet); }
 .state-line strong { min-width: 0; overflow: hidden; font: 650 11px var(--mono); white-space: nowrap; text-overflow: ellipsis; }
@@ -259,7 +259,7 @@ h1 span { color: var(--muted); font-weight: 400; }
 .status-dot.success, .status-dot.done { background: var(--success); }
 .status-dot.running, .status-dot.banked { background: var(--violet); }
 .status-dot.failed { background: var(--failure); }
-.status-dot.parked { background: var(--amber); }
+.status-dot.parked, .status-dot.interrupted { background: var(--amber); }
 .status-dot.queued, .status-dot.muted { opacity: .5; }
 dialog { width: min(430px, 90vw); padding: 22px; border: 1px solid var(--hairline); border-radius: 6px; background: var(--surface); color: var(--ink); box-shadow: 0 24px 80px var(--shadow); }
 dialog::backdrop { background: var(--shadow); }

@@ -39,7 +39,7 @@ from wildflows.mcp import FrameCallJoin, ValidatedToolCall
 from wildflows.projection import FrameProjection
 from wildflows.rig import RigRegistry
 from wildflows.run import Run
-from wildflows.workspace import FrameWorktree
+from wildflows.workspace import AutoCommitResult, FrameWorktree
 
 
 @dataclass
@@ -136,7 +136,7 @@ def _trace_teardown(
 ) -> _TeardownTrace:
     trace = _TeardownTrace()
     original_append = engine.journal.append
-    original_commit = engine.repository.commit_all
+    original_commit = engine.repository.auto_commit
     original_revoke = engine.server.revoke_frame
     original_remove = engine.repository.remove_worktree
 
@@ -152,7 +152,7 @@ def _trace_teardown(
             trace.record("frame_exited")
         return sequence
 
-    def commit_all(worktree: Path, message: str) -> str:
+    def auto_commit(worktree: Path, message: str) -> AutoCommitResult:
         trace.record("commit")
         return original_commit(worktree, message)
 
@@ -165,7 +165,7 @@ def _trace_teardown(
         original_remove(worktree)
 
     monkeypatch.setattr(engine.journal, "append", append)
-    monkeypatch.setattr(engine.repository, "commit_all", commit_all)
+    monkeypatch.setattr(engine.repository, "auto_commit", auto_commit)
     monkeypatch.setattr(engine.server, "revoke_frame", revoke)
     monkeypatch.setattr(engine.repository, "remove_worktree", remove)
     return trace

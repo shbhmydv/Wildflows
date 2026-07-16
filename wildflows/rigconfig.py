@@ -1,6 +1,7 @@
 """Owner-facing YAML configuration for root, resident, and one-shot frame rigs."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Literal, Union
 
@@ -105,40 +106,20 @@ class WorktreeConfig(BaseModel):
 
 
 class RigsFile(BaseModel):
-    """The parsed rigs.yaml: rigs plus optional notification and kind defaults."""
+    """The parsed rigs.yaml: rigs plus optional run and worktree options."""
 
     rigs: dict[str, RigConfig]
     notify: str | None = None
-    kinds: dict[str, str] = Field(default_factory=dict)
     worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
 
-    @field_validator("kinds")
+    @model_validator(mode="before")
     @classmethod
-    def _valid_kind_mappings(cls, value: dict[str, str]) -> dict[str, str]:
-        normalized: dict[str, str] = {}
-        for kind, rig in value.items():
-            clean_kind = kind.strip()
-            clean_rig = rig.strip()
-            if (
-                not clean_kind
-                or not clean_rig
-                or "\n" in clean_kind
-                or "\r" in clean_kind
-                or "\n" in clean_rig
-                or "\r" in clean_rig
-            ):
-                raise ValueError("kind mappings must use non-blank single lines")
-            normalized[clean_kind] = clean_rig
-        return normalized
-
-    @model_validator(mode="after")
-    def _known_kind_rigs(self) -> "RigsFile":
-        unknown = set(self.kinds.values()) - set(self.rigs)
-        if unknown:
+    def _removed_kinds_routing(cls, value: object) -> object:
+        if isinstance(value, Mapping) and "kinds" in value:
             raise ValueError(
-                f"kinds map to unknown rigs: {', '.join(sorted(unknown))}"
+                "kinds routing was removed; pass rig per task in dispatch"
             )
-        return self
+        return value
 
     @field_validator("notify")
     @classmethod
@@ -178,7 +159,6 @@ def load_rigs_config(path: Path) -> tuple[RigRegistry, str | None]:
         built,
         descriptions,
         slots=slots,
-        kinds=parsed.kinds,
         gate_timeouts=gate_timeouts,
         worktree_setup=parsed.worktree.setup,
         worktree_links=parsed.worktree.link,

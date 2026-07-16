@@ -24,6 +24,7 @@ from wildflows.events import (
     CallRefused,
     DispatchCalled,
     DispatchReturned,
+    FrameCommitWarning,
     FrameExited,
     FrameIntegrated,
     FrameIntegrating,
@@ -36,6 +37,7 @@ from wildflows.events import (
     GateCalled,
     GateReturned,
     RunFinished,
+    RunInterrupted,
     RunOpened,
     WorkerReaped,
     WorktreeProvisioned,
@@ -398,7 +400,9 @@ class Engine:
         worker: WorkerLease,
     ) -> _FrameExecution:
         with self.journal.projection_transaction() as projection:
-            used_s = projection.frame(frame_id).self_time_s
+            used_s = projection.frame(frame_id).attempt_self_time_s.get(
+                attempt, 0.0
+            )
         execution = _FrameExecution(
             frame_id=frame_id,
             attempt=attempt,
@@ -650,6 +654,12 @@ class Engine:
             execution = self._executions.get(frame_id)
         if execution is not None:
             self._release_frame_slot(execution, reason, close=True)
+            if execution.timed_out:
+                execution.timeout_complete.wait()
+                if execution.timeout_error is not None:
+                    raise RuntimeError(
+                        "frame self-time reap failed"
+                    ) from execution.timeout_error
 
     @staticmethod
     def _slot_environment(lane: int | None) -> dict[str, str]:
@@ -701,9 +711,14 @@ class Engine:
             return
         watched = (signal.SIGINT, signal.SIGTERM)
         previous = {item: signal.getsignal(item) for item in watched}
+        stopping = False
 
         def raise_signal(signum: int, frame: FrameType | None) -> None:
+            nonlocal stopping
             del frame
+            if stopping:
+                return
+            stopping = True
             raise _EngineSignal(signum)
 
         try:
@@ -724,16 +739,33 @@ class Engine:
             self._cancel_frame_calls(frame_id)
         self._slot_scheduler.shutdown()
         self._workers.shutdown(reason)
+        for frame_id in sorted(frame_ids):
+            self._join_frame_calls(frame_id)
         with self._execution_lock:
             execution_ids = list(self._executions)
         for frame_id in execution_ids:
             self._close_frame_execution(frame_id, reason)
+
+    @staticmethod
+    def _fatal_reason(error: BaseException) -> str:
+        detail = " ".join(str(error).split())
+        summary = type(error).__name__ if not detail else f"{type(error).__name__}: {detail}"
+        return f"fatal:{summary[:512]}"
 
     def _shutdown_preserving(self, reason: str, original: BaseException) -> None:
         try:
             self.shutdown(reason)
         except BaseException as cleanup_error:
             original.add_note(f"worker shutdown also failed: {cleanup_error!r}")
+        try:
+            self.journal.append(RunInterrupted(
+                run_id=self.run_id,
+                reason=reason,
+            ))
+        except BaseException as journal_error:
+            original.add_note(
+                f"run interruption journal append also failed: {journal_error!r}"
+            )
 
     def run(self) -> FrameResult:
         """Drive the root stack with fatal and signal-safe worker shutdown."""
@@ -751,7 +783,7 @@ class Engine:
                 stopped.__notes__ = list(getattr(exc, "__notes__", ()))
                 raise stopped from None
             except BaseException as exc:
-                self._shutdown_preserving(f"fatal:{type(exc).__name__}", exc)
+                self._shutdown_preserving(self._fatal_reason(exc), exc)
                 raise
 
     def _drive_root(self) -> FrameResult:
@@ -1122,6 +1154,8 @@ class Engine:
                         caller_head=caller_head,
                     ))
             except AdmissionError as exc:
+                if exc.code == "rig_not_allowed":
+                    raise
                 self.journal.append(DispatchCalled(
                     run_id=self.run_id,
                     frame_id=frame.frame_id,
@@ -1370,10 +1404,10 @@ class Engine:
                 remaining = len(remaining_indexes)
                 if remaining <= 0:
                     continue
-                task_rigs = self.registry.task_rigs(
-                    request.rig, request.kinds, len(request.tasks)
-                )
                 frame = projection.frame(call.frame_id)
+                task_rigs = self.registry.task_rigs(
+                    request.rig, frame.rig, len(request.tasks)
+                )
                 ancestors = self._ancestor_ids(frame)
                 spend = sum(
                     self.policy.rig_cost(task_rigs[index])
@@ -1405,6 +1439,7 @@ class Engine:
                 task_rigs = admit_dispatch(
                     request,
                     caller_depth=frame.depth,
+                    caller_rig=frame.rig,
                     subtree_frames=frames,
                     subtree_spend=spend,
                     subtree_deadline=ancestor.subtree_deadline,
@@ -1470,7 +1505,7 @@ class Engine:
         results: list[ChildResult] = []
         cancellation = self._current_call_cancellation()
         task_rigs = self.registry.task_rigs(
-            request.rig, request.kinds, len(request.tasks)
+            request.rig, parent.rig, len(request.tasks)
         )
         for task_index, task in enumerate(request.tasks):
             try:
@@ -1522,7 +1557,7 @@ class Engine:
         base = self.repository.branch_tip(parent.branch)
         cancellation = self._current_call_cancellation()
         task_rigs = self.registry.task_rigs(
-            request.rig, request.kinds, len(request.tasks)
+            request.rig, parent.rig, len(request.tasks)
         )
         by_index: dict[int, ChildResult] = {}
         with self.journal.projection_transaction() as projection:
@@ -2465,11 +2500,6 @@ class Engine:
             if worker is not None:
                 worker.finished()
             if execution is not None and execution.timed_out:
-                execution.timeout_complete.wait()
-                if execution.timeout_error is not None:
-                    raise RuntimeError(
-                        "frame self-time reap failed"
-                    ) from execution.timeout_error
                 result = FrameResult(
                     outcome="failed",
                     text=(
@@ -2497,9 +2527,22 @@ class Engine:
             self._raise_active_relaunch_block()
             if result.outcome == "ok":
                 try:
-                    head = self.repository.commit_all(
+                    committed = self.repository.auto_commit(
                         worktree.path, f"wildflows frame {frame_id}"
                     )
+                    head = committed.head
+                    if committed.skipped_symlinks:
+                        paths = list(committed.skipped_symlinks)
+                        self.journal.append(FrameCommitWarning(
+                            run_id=self.run_id,
+                            frame_id=frame_id,
+                            attempt=attempt,
+                            skipped_paths=paths,
+                            message=(
+                                "frame auto-commit skipped new out-of-tree "
+                                f"symlinks: {', '.join(paths)}"
+                            ),
+                        ))
                 except RepositoryError as exc:
                     result = FrameResult(
                         outcome="failed",
@@ -2586,9 +2629,11 @@ class Engine:
             "your branch when dispatch returns. A failed child result includes its "
             "salvage branch, head, and diffstat; pass retry_frame alone to relaunch a "
             "failed direct child on that branch. Dispatch skills is optional and contains one "
-            "ordered skill-name list per task. Dispatch kinds is an optional parallel "
-            "list of free-text hints; when every kind has a configured default, rig may "
-            "be omitted. Shapes are your control flow: a sequence "
+            "ordered skill-name list per task. Dispatch rig accepts one registry key for "
+            "every task or a parallel list; omission and null list entries inherit this "
+            "frame's rig. Dispatch kinds is an optional parallel list describing the "
+            "nature of each task; kinds are journalled hints with no routing power. "
+            "Shapes are your control flow: a sequence "
             "is consecutive dispatch calls, a loop is redispatching until your own "
             "criterion is met, a fan-out is one dispatch with many tasks (parallel: "
             "true); combine these freely and choose per task. Prefer sequential "
@@ -2658,6 +2703,14 @@ class Engine:
                 target_worktree = owner
             elif target_worktree is None:
                 target_worktree = self.repository.checked_out_owner(target_ref)
+            unsafe_symlinks = self.repository.new_out_of_tree_commit_symlinks(
+                frame.base_commit, frame.head
+            )
+            if unsafe_symlinks:
+                raise IntegrationError(
+                    "refusing integration of new out-of-tree symlinks: "
+                    f"{', '.join(unsafe_symlinks)}"
+                )
             temporary_ref = self.repository.integration_ref(frame_id)
             intent = frame.integrating
             if intent is None:

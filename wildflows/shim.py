@@ -280,10 +280,16 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "wildflows_dispatch",
     label: "Wildflows dispatch",
-    description: "Dispatch tasks serially by default and block until their results and commits are integrated. Set retry_frame alone to relaunch a failed direct child on its existing branch. Set parallel only for independent fan-out; use sequential calls to compose pipelines, loops, and parallel-then-review shapes.",
+    description: "Dispatch tasks serially by default and block until their results and commits are integrated. Rig chooses who does each task; kinds only describe the work. Set retry_frame alone to relaunch a failed direct child on its existing branch. Set parallel only for independent fan-out; use sequential calls to compose pipelines, loops, and parallel-then-review shapes.",
     parameters: Type.Object({{
       tasks: Type.Optional(Type.Array(Type.String({{ description: "Self-contained child task" }}))),
-      rig: Type.Optional(Type.String({{ description: "Explicit rig for all tasks; omit when kinds map to defaults" }})),
+      rig: Type.Optional(Type.Union([
+        Type.String({{ description: "Rig for every task" }}),
+        Type.Array(Type.Union([
+          Type.String({{ description: "Rig for this task" }}),
+          Type.Null({{ description: "A null entry inherits the caller's rig" }}),
+        ]), {{ description: "One rig or null entry per task" }}),
+      ], {{ description: "One rig for all tasks or a per-task rig array; omission inherits the caller's rig" }})),
       parallel: Type.Optional(Type.Boolean({{ description: "Run siblings in parallel" }})),
       skills: Type.Optional(Type.Array(Type.Array(Type.String({{
         description: "Bundled skill name for this task",
@@ -291,8 +297,8 @@ export default function (pi: ExtensionAPI) {{
         description: "One ordered skill-name list per task",
       }})),
       kinds: Type.Optional(Type.Array(Type.String({{
-        description: "Free-text task kind (suggested: implement, review, research, artifact)",
-      }}), {{ description: "One optional kind hint per task" }})),
+        description: "Free-text description of the task's nature; it has no routing power",
+      }}), {{ description: "One optional semantic kind label per task" }})),
       retry_frame: Type.Optional(Type.String({{
         description: "Failed direct child frame id to relaunch on its existing branch",
       }})),

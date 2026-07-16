@@ -16,6 +16,8 @@ from wildflows.events import (
     FrameIntegrated,
     FrameIntegrating,
     FramePushed,
+    RunFinished,
+    RunInterrupted,
 )
 from wildflows.frame import DispatchRequest, FrameResult, FrameRuntime, call_hash
 from wildflows.rig import RigRegistry
@@ -94,6 +96,63 @@ class ReplayRig:
             raise SimulatedKill()
         (workdir / "root.txt").write_text("resumed\n", encoding="utf-8")
         return FrameResult(text="root resumed", exit_code=0)
+
+
+@pytest.mark.parametrize("terminal_event", [False, True], ids=["legacy-stop", "interrupted"])
+def test_resume_accepts_stopped_and_run_interrupted_journals(
+    repo: Path, tmp_path: Path, terminal_event: bool
+) -> None:
+    run_id = "resume-interrupted" if terminal_event else "resume-legacy-stop"
+    run_dir = tmp_path / run_id
+    counter = tmp_path / f"{run_id}-executions"
+    registry = RigRegistry({"count": CountRig(counter)})
+    first = Engine(
+        run_dir,
+        repo,
+        registry,
+        run_id=run_id,
+        root_rig="count",
+        root_prompt="finish after lifecycle interruption",
+        worktrees_root=tmp_path / f"{run_id}-worktrees",
+    )
+    base = first.repository.branch_tip()
+    branch = first.repository.frame_branch("f0")
+    first.repository.git(["branch", branch.removeprefix("refs/heads/"), base])
+    first.journal.append(FramePushed(
+        run_id=run_id,
+        frame_id="f0",
+        attempt=0,
+        depth=0,
+        rig="count",
+        prompt="finish after lifecycle interruption",
+        branch=branch,
+        base_commit=base,
+        worktree=str(tmp_path / "lost-worktree"),
+        subtree_deadline=time.time() + 60,
+    ))
+    if terminal_event:
+        first.journal.append(RunInterrupted(
+            run_id=run_id,
+            reason="signal:SIGINT",
+        ))
+
+    resumed = Engine(
+        run_dir,
+        repo,
+        registry,
+        run_id=run_id,
+        root_rig="count",
+        root_prompt="finish after lifecycle interruption",
+    )
+    assert resumed.run().outcome == "ok"
+
+    assert counter.read_text(encoding="utf-8") == "1"
+    events = resumed.journal.events()
+    assert isinstance(events[-1], RunFinished)
+    assert len([
+        event for event in events if isinstance(event, RunInterrupted)
+    ]) == int(terminal_event)
+    assert resumed.projection.interrupted is None
 
 
 class PartialParallelReplayRig:
@@ -292,7 +351,7 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
     ))
     digest = call_hash("dispatch", request)
     child_rig = request.rig
-    assert child_rig is not None
+    assert isinstance(child_rig, str)
     first.journal.append(DispatchCalled(
         run_id=first.run_id,
         frame_id=Engine.ROOT_FRAME_ID,

@@ -407,7 +407,16 @@ def test_mcp_requires_token_and_exposes_fixed_loopback_tool_surface() -> None:
         assert json_object(json_object(skills_schema["items"])["items"])["type"] == "string"
         assert dispatch_schema["required"] == ["tasks"]
         assert "serially by default" in str(json_object(tools[0])["description"])
-        assert json_object(properties["kinds"])["type"] == "array"
+        rig_schema = json_object(properties["rig"])
+        rig_options = rig_schema["anyOf"]
+        assert isinstance(rig_options, list)
+        assert [json_object(option)["type"] for option in rig_options] == [
+            "string", "array",
+        ]
+        assert "inherit the caller's rig" in str(rig_schema["description"])
+        kinds_schema = json_object(properties["kinds"])
+        assert kinds_schema["type"] == "array"
+        assert "no routing power" in str(kinds_schema["description"])
 
 
 def test_frame_capability_cannot_spoof_another_active_frame() -> None:

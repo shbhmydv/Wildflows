@@ -708,7 +708,8 @@ class MCPServer:
                     "Set parallel=true only to fan out independent tasks and join them. "
                     "The call blocks until child results and commits are integrated. "
                     "Make sequential dispatch calls to compose pipelines, loops, and "
-                    "parallel-then-review shapes."
+                    "parallel-then-review shapes. Rig chooses each task's worker; "
+                    "kinds are semantic labels with no routing power."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -724,13 +725,30 @@ class MCPServer:
                             "minItems": 1,
                         },
                         "rig": {
-                            "type": "string",
                             "description": (
-                                "Explicit rig for every task; omit only when each kind "
-                                "has a rigs.yaml default."
+                                "One rig for every task, or one rig/null entry per task; "
+                                "omission and null entries inherit the caller's rig."
                             ),
-                            "minLength": 1,
-                            "pattern": r".*\S.*",
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "pattern": r".*\S.*",
+                                },
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "anyOf": [
+                                            {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "pattern": r".*\S.*",
+                                            },
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                },
+                            ],
                         },
                         "parallel": {"type": "boolean", "default": False},
                         "skills": {
@@ -748,8 +766,8 @@ class MCPServer:
                         "kinds": {
                             "type": "array",
                             "description": (
-                                "Optional free-text kind per task; suggested: implement, "
-                                "review, research, artifact."
+                                "Optional free-text description of each task's nature; "
+                                "journalled and displayed, with no routing power."
                             ),
                             "items": {
                                 "type": "string",

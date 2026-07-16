@@ -6,7 +6,6 @@ from pydantic import ValidationError
 
 from wildflows.frame import DispatchRequest, call_hash
 from wildflows.projection import RunProjection
-from wildflows.rig import EchoRig, RigRegistry
 
 
 def _dispatch_event(request: dict[str, object]) -> dict[str, object]:
@@ -68,22 +67,12 @@ def test_old_dispatch_event_without_kinds_still_loads() -> None:
     assert event.request.kinds == []
 
 
-def test_kind_mapping_supplies_per_task_rigs_and_explicit_rig_wins() -> None:
-    registry = RigRegistry(
-        {"worker": EchoRig(), "senior": EchoRig()},
-        kinds={"implement": "worker", "research": "senior"},
+def test_dispatch_rig_array_validates_parallel_length_and_entries() -> None:
+    request = DispatchRequest(
+        tasks=["build", "study"], rig=["worker", None]
     )
-    mapped = DispatchRequest(
-        tasks=["build", "study"], kinds=["implement", "research"]
-    )
-    assert registry.task_rigs(mapped.rig, mapped.kinds, len(mapped.tasks)) == (
-        "worker", "senior",
-    )
-    explicit = DispatchRequest(
-        tasks=["build", "study"],
-        rig="senior",
-        kinds=["implement", "research"],
-    )
-    assert registry.task_rigs(explicit.rig, explicit.kinds, len(explicit.tasks)) == (
-        "senior", "senior",
-    )
+    assert request.rig == ["worker", None]
+    with pytest.raises(ValidationError, match="one entry per task"):
+        DispatchRequest(tasks=["build", "study"], rig=["worker"])
+    with pytest.raises(ValidationError, match="must be non-blank"):
+        DispatchRequest(tasks=["build"], rig=["  "])

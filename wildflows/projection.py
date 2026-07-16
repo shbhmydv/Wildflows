@@ -23,6 +23,7 @@ from wildflows.events import (
     GateCalled,
     GateReturned,
     RunFinished,
+    RunInterrupted,
     RunOpened,
 )
 from wildflows.frame import (
@@ -33,6 +34,8 @@ from wildflows.frame import (
     ToolRequest,
     ToolResponse,
 )
+
+
 @dataclass
 class FrameProjection:
     frame_id: str
@@ -61,6 +64,7 @@ class FrameProjection:
     integrated: FrameIntegrated | None = None
     popped: bool = False
     self_time_s: float = 0.0
+    attempt_self_time_s: dict[int, float] = field(default_factory=dict)
     slot_active: bool = False
     waiting_for_slot: bool = False
     slot: int | None = None
@@ -88,6 +92,7 @@ class CallProjection:
 class RunProjection:
     opened: RunOpened | None = None
     finished: RunFinished | None = None
+    interrupted: RunInterrupted | None = None
     frames: dict[str, FrameProjection] = field(default_factory=dict)
     calls: dict[tuple[str, int], CallProjection] = field(default_factory=dict)
     refused_calls: dict[tuple[str, int], CallRefused] = field(default_factory=dict)
@@ -95,6 +100,8 @@ class RunProjection:
 
     def apply(self, event: Event) -> None:
         self.effective_events.append(event)
+        if self.interrupted is not None and not isinstance(event, RunInterrupted):
+            self.interrupted = None
         if isinstance(event, RunOpened):
             self.opened = event
         elif isinstance(event, FramePushed):
@@ -142,6 +149,10 @@ class RunProjection:
         elif isinstance(event, FrameSlotReleased):
             frame = self.frames[event.frame_id]
             frame.self_time_s += event.active_s
+            frame.attempt_self_time_s[event.attempt] = (
+                frame.attempt_self_time_s.get(event.attempt, 0.0)
+                + event.active_s
+            )
             frame.slot_active = False
             frame.slot = None
             frame.waiting_for_slot = False
@@ -217,6 +228,8 @@ class RunProjection:
             frame = self.frames[event.frame_id]
             frame.popped = True
             frame.outcome = event.outcome
+        elif isinstance(event, RunInterrupted):
+            self.interrupted = event
         elif isinstance(event, RunFinished):
             self.finished = event
 

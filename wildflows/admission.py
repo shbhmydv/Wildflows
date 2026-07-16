@@ -59,6 +59,7 @@ def admit_dispatch(
     request: DispatchRequest,
     *,
     caller_depth: int,
+    caller_rig: str | None = None,
     subtree_frames: int,
     subtree_spend: float,
     subtree_deadline: float,
@@ -94,8 +95,10 @@ def admit_dispatch(
             registry,
         )
     try:
+        if caller_rig is None and request.rig is None:
+            raise KeyError("dispatch without rig requires the caller's rig")
         task_rigs = registry.task_rigs(
-            request.rig, request.kinds, len(request.tasks)
+            request.rig, caller_rig or "", len(request.tasks)
         )
     except KeyError as exc:
         raise _refusal("rig_not_allowed", exc.args[0], registry) from exc

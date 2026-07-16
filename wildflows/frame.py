@@ -35,7 +35,7 @@ class _ToolRequestBase(BaseModel):
 
 class DispatchRequest(_ToolRequestBase):
     tasks: list[str] = Field(default_factory=list)
-    rig: str | None = None
+    rig: str | list[str | None] | None = None
     parallel: bool = False
     skills: list[list[str]] = Field(default_factory=list)
     kinds: list[str] = Field(default_factory=list)
@@ -52,9 +52,12 @@ class DispatchRequest(_ToolRequestBase):
 
     @field_validator("rig")
     @classmethod
-    def _nonblank_rig(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
-            raise ValueError("dispatch rig must be non-blank")
+    def _nonblank_rig(
+        cls, value: str | list[str | None] | None
+    ) -> str | list[str | None] | None:
+        names = [value] if isinstance(value, str) else (value or [])
+        if any(name is not None and not name.strip() for name in names):
+            raise ValueError("dispatch rig names must be non-blank")
         return value
 
     @field_validator("retry_frame")
@@ -78,6 +81,8 @@ class DispatchRequest(_ToolRequestBase):
         # omitted bundle and explicit no-skill bundles at one memoization identity.
         if not self.skills:
             self.skills = [[] for _ in self.tasks]
+        if isinstance(self.rig, list) and len(self.rig) != len(self.tasks):
+            raise ValueError("dispatch rig array must contain one entry per task")
         if len(self.skills) != len(self.tasks):
             raise ValueError("dispatch skills must contain one list per task")
         if any(not name.strip() for bundle in self.skills for name in bundle):

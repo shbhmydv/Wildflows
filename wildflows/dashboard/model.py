@@ -101,6 +101,8 @@ class DashboardModel:
     def _run_state(projection: RunProjection) -> str:
         if projection.finished is not None:
             return "completed" if projection.finished.outcome == "ok" else "failed"
+        if projection.interrupted is not None:
+            return "interrupted"
         if projection.pending_questions() or any(
             frame.relaunch_blocked is not None
             for frame in projection.frames.values()
@@ -355,6 +357,8 @@ class DashboardModel:
 
     def _state_line(self, projection: RunProjection, frames: list[dict[str, object]]) -> str:
         root_id = projection.opened.root_frame_id if projection.opened is not None else "f0"
+        if projection.interrupted is not None:
+            return f"{root_id} interrupted · {projection.interrupted.reason}"
         blocked = sorted(
             (
                 frame
@@ -450,14 +454,24 @@ class DashboardModel:
         frames = {str(frame["frame_id"]): frame for frame in frame_values}
         state = self._run_state(projection)
         last_ts = snapshot.events[-1].ts if snapshot.events else projection.opened.started_at
-        ended_at = projection.finished.ts if projection.finished is not None else None
+        ended_at = (
+            projection.finished.ts
+            if projection.finished is not None
+            else (
+                projection.interrupted.ts
+                if projection.interrupted is not None
+                else None
+            )
+        )
         return {
             "key": f"{repo.repo_id}:{run_id}",
             "repo": repo.public(),
             "run_id": run_id,
             "run_short": run_id[:8],
             "state": state,
-            "active": projection.finished is None,
+            "active": (
+                projection.finished is None and projection.interrupted is None
+            ),
             "started_at": projection.opened.started_at,
             "ended_at": ended_at,
             "journal_at": last_ts,

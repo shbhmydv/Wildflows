@@ -345,6 +345,38 @@ def test_unfinished_run_stays_live_after_a_child_failure(tmp_path: Path) -> None
     assert _object(_object(detail["frames"])["f0.c2.t1"])["state"] == "failed"
 
 
+def test_run_interrupted_projects_a_distinct_terminal_dashboard_state(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    run_dir = repo / ".wildflows" / "runs" / _RUN_ID
+    run_dir.mkdir(parents=True)
+    records = _FIXTURE_JOURNAL.read_bytes().splitlines(keepends=True)[:44]
+    interrupted = {
+        "version": 2,
+        "seq": len(records),
+        "ts": 1_720_000_999.0,
+        "run_id": _RUN_ID,
+        "kind": "run_interrupted",
+        "reason": "signal:SIGINT",
+    }
+    (run_dir / "events.ndjson").write_bytes(
+        b"".join(records)
+        + json.dumps(interrupted, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+    client = TestClient(create_app(repo))
+
+    listing = _objects(_json_object(client.get("/api/runs"))["runs"])
+    assert listing[0]["state"] == "interrupted"
+    detail = _json_object(client.get(_run_url(client)))
+    assert detail["state"] == "interrupted"
+    assert detail["active"] is False
+    assert detail["ended_at"] == interrupted["ts"]
+    assert "signal:SIGINT" in _text(detail["state_line"])
+    assert _objects(detail["events"])[-1] == interrupted
+
+
 def test_artifacts_are_listed_and_contained_inside_the_run(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     run_dir = _write_fixture_run(repo)
@@ -468,6 +500,8 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     assert 'const space = el("div", "canvas-space");' in javascript
     assert 'const surface = el("div", "canvas-surface");' in javascript
     assert "futureFrameId: futureFrameIds[index]" in javascript
+    assert 'value === "interrupted"' in javascript
+    assert 'event.kind === "run_interrupted"' in javascript
     assert "framePath(slot.futureFrameId)" in javascript
     assert 'const summary = el("div", "frame-summary");' in javascript
     assert "event.ctrlKey" in javascript

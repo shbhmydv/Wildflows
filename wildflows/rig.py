@@ -754,7 +754,6 @@ class RigRegistry:
         descriptions: dict[str, str] | None = None,
         *,
         slots: dict[str, int] | None = None,
-        kinds: dict[str, str] | None = None,
         gate_timeouts: dict[str, float] | None = None,
         worktree_setup: str | None = None,
         worktree_links: list[str] | None = None,
@@ -783,15 +782,6 @@ class RigRegistry:
             )
         if any(value <= 0 for value in configured_gate_timeouts.values()):
             raise ValueError("gate timeouts must be positive")
-        configured_kinds = kinds or {}
-        unknown_kind_rigs = set(configured_kinds.values()) - self._rigs.keys()
-        if unknown_kind_rigs:
-            raise ValueError(
-                "kinds map to unknown rigs: "
-                f"{', '.join(sorted(unknown_kind_rigs))}"
-            )
-        if any(not kind.strip() or not rig.strip() for kind, rig in configured_kinds.items()):
-            raise ValueError("kind mappings must use non-blank names")
         configured_links = worktree_links or []
         normalized_links: list[str] = []
         for value in configured_links:
@@ -813,7 +803,6 @@ class RigRegistry:
         if worktree_setup is not None and not worktree_setup.strip():
             raise ValueError("worktree setup command must be non-blank")
         self._slots = dict(configured_slots)
-        self._kinds = dict(configured_kinds)
         self._gate_timeouts = dict(configured_gate_timeouts)
         self._worktree_setup = worktree_setup
         self._worktree_links = tuple(normalized_links)
@@ -842,9 +831,6 @@ class RigRegistry:
             raise KeyError(f"unknown rig: {name!r}")
         return self._slots.get(name)
 
-    def default_rig(self, kind: str) -> str | None:
-        return self._kinds.get(kind)
-
     def gate_timeout(self, name: str) -> float | None:
         if name not in self._rigs:
             raise KeyError(f"unknown rig: {name!r}")
@@ -852,23 +838,17 @@ class RigRegistry:
 
     def task_rigs(
         self,
-        explicit: str | None,
-        kinds: list[str],
+        selection: str | list[str | None] | None,
+        caller_rig: str,
         task_count: int,
     ) -> tuple[str, ...]:
-        if explicit is not None:
-            return (explicit,) * task_count
-        if len(kinds) != task_count:
-            raise KeyError(
-                "dispatch without rig requires one mapped kind per task"
-            )
-        resolved: list[str] = []
-        for kind in kinds:
-            rig = self.default_rig(kind)
-            if rig is None:
-                raise KeyError(f"dispatch kind {kind!r} has no default rig")
-            resolved.append(rig)
-        return tuple(resolved)
+        if isinstance(selection, str):
+            return (selection,) * task_count
+        if selection is None:
+            return (caller_rig,) * task_count
+        if len(selection) != task_count:
+            raise KeyError("dispatch rig array must contain one entry per task")
+        return tuple(caller_rig if rig is None else rig for rig in selection)
 
     @property
     def worktree_setup(self) -> str | None:

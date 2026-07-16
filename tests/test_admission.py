@@ -102,17 +102,17 @@ def test_unknown_rig_refusal_lists_registry_keys_in_operator_order() -> None:
     )
 
 
-def test_kind_defaults_resolve_per_task_before_spend_admission() -> None:
-    registry = RigRegistry(
-        {"worker": EchoRig(), "senior": EchoRig()},
-        kinds={"implement": "worker", "research": "senior"},
-    )
+def test_per_task_rigs_and_inherited_entries_resolve_before_spend_admission() -> None:
+    registry = RigRegistry({"worker": EchoRig(), "senior": EchoRig()})
     request = DispatchRequest(
-        tasks=["build", "study"], kinds=["implement", "research"]
+        tasks=["build", "study"],
+        rig=["worker", None],
+        kinds=["review", "research"],
     )
     resolved = admit_dispatch(
         request,
         caller_depth=0,
+        caller_rig="senior",
         subtree_frames=0,
         subtree_spend=0.0,
         subtree_deadline=time.time() + 60,
@@ -125,17 +125,17 @@ def test_kind_defaults_resolve_per_task_before_spend_admission() -> None:
     )
     assert resolved == ("worker", "senior")
 
-    with pytest.raises(AdmissionError, match="no default rig") as raised:
-        admit_dispatch(
-            DispatchRequest(tasks=["critique"], kinds=["review"]),
-            caller_depth=0,
-            subtree_frames=0,
-            subtree_spend=0.0,
-            subtree_deadline=time.time() + 60,
-            policy=AdmissionPolicy(),
-            registry=registry,
-        )
-    assert raised.value.code == "rig_not_allowed"
+    inherited = admit_dispatch(
+        DispatchRequest(tasks=["critique"], kinds=["review"]),
+        caller_depth=0,
+        caller_rig="senior",
+        subtree_frames=0,
+        subtree_spend=0.0,
+        subtree_deadline=time.time() + 60,
+        policy=AdmissionPolicy(max_subtree_spend=4),
+        registry=registry,
+    )
+    assert inherited == ("senior",)
 
 
 def test_pending_dispatch_reservation_is_rebuilt_on_restart(

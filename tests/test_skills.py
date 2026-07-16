@@ -95,7 +95,10 @@ def test_failed_child_and_loop_exhaustion_doctrine_is_shipped() -> None:
     assert "retry_frame" in economy
     assert "merge the salvage branch" in economy
     assert "wildflows_ask" in economy
-    assert "stronger kind" in economy
+    assert "same task" in economy
+    assert "stronger rig" in economy
+    assert "failure evidence" in economy
+    assert "cheapest rig" in economy
     assert "Never silently extend the loop" in shapes
     assert "fail honestly upward with the concrete evidence" in shapes
 
@@ -248,9 +251,11 @@ def test_frame_prompt_orders_assigned_skill_texts_before_job_and_resources(
         "your branch when dispatch returns. A failed child result includes its "
         "salvage branch, head, and diffstat; pass retry_frame alone to relaunch a "
         "failed direct child on that branch. Dispatch skills is optional and contains one "
-        "ordered skill-name list per task. Dispatch kinds is an optional parallel "
-        "list of free-text hints; when every kind has a configured default, rig may "
-        "be omitted. Shapes are your control flow: a sequence "
+        "ordered skill-name list per task. Dispatch rig accepts one registry key for "
+        "every task or a parallel list; omission and null list entries inherit this "
+        "frame's rig. Dispatch kinds is an optional parallel list describing the "
+        "nature of each task; kinds are journalled hints with no routing power. "
+        "Shapes are your control flow: a sequence "
         "is consecutive dispatch calls, a loop is redispatching until your own "
         "criterion is met, a fan-out is one dispatch with many tasks (parallel: "
         "true); combine these freely and choose per task. Prefer sequential "

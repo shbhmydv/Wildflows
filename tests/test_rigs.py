@@ -30,6 +30,8 @@ def test_pi_shim_is_private_and_outside_worktree(tmp_path: Path) -> None:
     assert "wildflows_dispatch" in source
     assert "retry_frame" in source
     assert "tasks: Type.Optional" in source
+    assert "Type.Union" in source
+    assert "null entry inherits the caller's rig" in source
     assert "wildflows_gate" in source
     assert "wildflows_ask" in source
 
@@ -78,6 +80,8 @@ def test_pi_shim_retries_transport_failures_with_one_request_identity(
   Array: (value) => value,
   String: (value) => value,
   Optional: (value) => value,
+  Union: (value) => value,
+  Null: () => null,
   Boolean: () => ({}),
 };
 """,
@@ -345,8 +349,6 @@ def test_rig_yaml_builds_frame_rigs_relative_to_config(tmp_path: Path) -> None:
     config = tmp_path / "rigs.yaml"
     config.write_text(
         """notify: owner-notify --urgent
-kinds:
-  implement: local
 worktree:
   setup: python3 -m ensure_dependencies
   link:
@@ -381,7 +383,6 @@ rigs:
     assert registry.slots("local") == 2
     assert registry.gate_timeout("root") is None
     assert registry.gate_timeout("local") == 3600
-    assert registry.default_rig("implement") == "local"
     assert registry.worktree_setup == "python3 -m ensure_dependencies"
     assert registry.worktree_links == (".cache/dependencies",)
 
@@ -391,13 +392,15 @@ rigs:
     assert old_style.rigs["echo"].description is None
     assert old_style.rigs["echo"].slots is None
     assert old_style.rigs["echo"].gate_timeout_s is None
-    assert old_style.kinds == {}
     assert old_style.worktree.setup is None
     assert old_style.worktree.link == []
 
-    with pytest.raises(ValueError, match="unknown rigs"):
+    with pytest.raises(
+        ValueError,
+        match="kinds routing was removed; pass rig per task in dispatch",
+    ):
         RigsFile.model_validate({
-            "kinds": {"review": "missing"},
+            "kinds": {"review": "echo"},
             "rigs": {"echo": {"kind": "echo"}},
         })
     with pytest.raises(ValueError, match="greater than 0"):

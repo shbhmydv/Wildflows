@@ -7,7 +7,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from wildflows.result import CommitReceipt, IntegrationReceipt
@@ -31,6 +31,12 @@ class FrameOwnershipError(RepositoryError):
 
 class RootIntegrationOwnershipError(IntegrationError):
     """The run branch is checked out by a worktree this run does not own."""
+
+
+@dataclass(frozen=True)
+class AutoCommitResult:
+    head: str
+    skipped_symlinks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -282,17 +288,159 @@ class Repository:
         ).returncode == 0
 
     def commit_all(self, worktree: Path, message: str) -> str:
+        """Commit every change; tests use this to craft arbitrary repository history."""
         self.git(["add", "-A", "--", "."], cwd=worktree)
         staged = self.git(["diff", "--cached", "--quiet"], cwd=worktree, check=False)
         if staged.returncode not in (0, 1):
             raise IntegrationError(staged.stderr.strip() or "could not inspect staged changes")
         if staged.returncode == 1:
             self.git(["commit", "-m", message], cwd=worktree)
-        if self.git(
-            ["status", "--porcelain", "--untracked-files=all"], cwd=worktree
-        ).stdout:
+        if self.status_porcelain(worktree):
             raise IntegrationError("frame worktree remained dirty after core commit")
         return self.head(worktree)
+
+    def _tree_modes(self, commit: str) -> dict[str, str]:
+        process = subprocess.run(
+            ["git", "ls-tree", "-r", "-z", commit],
+            cwd=self.root,
+            capture_output=True,
+            text=False,
+        )
+        if process.returncode != 0:
+            detail = process.stderr.decode("utf-8", "replace").strip()
+            raise RepositoryError(f"could not inspect commit tree {commit!r}: {detail}")
+        modes: dict[str, str] = {}
+        try:
+            for record in process.stdout.split(b"\0"):
+                if not record:
+                    continue
+                metadata, separator, raw_path = record.partition(b"\t")
+                if not separator:
+                    raise RepositoryError("malformed git ls-tree record")
+                mode = metadata.split(b" ", 1)[0].decode("ascii")
+                modes[raw_path.decode("utf-8")] = mode
+        except UnicodeDecodeError as exc:
+            raise RepositoryError(
+                "non-UTF-8 repository paths are unsupported"
+            ) from exc
+        return modes
+
+    def _new_worktree_symlinks(self, worktree: Path) -> list[str]:
+        candidates = set(self._paths(
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=worktree,
+        ))
+        candidates.update(self._paths(
+            ["diff", "--name-only", "--no-renames", "-z"],
+            cwd=worktree,
+        ))
+        candidates.update(self._paths(
+            ["diff", "--cached", "--name-only", "--no-renames", "-z"],
+            cwd=worktree,
+        ))
+        tracked_symlinks = {
+            path for path, mode in self._tree_modes(self.head(worktree)).items()
+            if mode == "120000"
+        }
+        return sorted(
+            path for path in candidates
+            if path not in tracked_symlinks and (worktree / path).is_symlink()
+        )
+
+    def new_out_of_tree_worktree_symlinks(self, worktree: Path) -> list[str]:
+        """Find changed symlinks not already tracked whose live target escapes."""
+        root = worktree.resolve()
+        unsafe: list[str] = []
+        for path in self._new_worktree_symlinks(worktree):
+            try:
+                target = (worktree / path).resolve(strict=False)
+            except (OSError, RuntimeError):
+                unsafe.append(path)
+                continue
+            if not target.is_relative_to(root):
+                unsafe.append(path)
+        return unsafe
+
+    def auto_commit(self, worktree: Path, message: str) -> AutoCommitResult:
+        """Commit frame work while leaving new out-of-tree symlinks untracked."""
+        skipped = self.new_out_of_tree_worktree_symlinks(worktree)
+        self.git(["add", "-A", "--", "."], cwd=worktree)
+        if skipped:
+            self.git(["reset", "--quiet", "HEAD", "--", *skipped], cwd=worktree)
+        staged = self.git(["diff", "--cached", "--quiet"], cwd=worktree, check=False)
+        if staged.returncode not in (0, 1):
+            raise IntegrationError(staged.stderr.strip() or "could not inspect staged changes")
+        if staged.returncode == 1:
+            self.git(["commit", "-m", message], cwd=worktree)
+        status = self.status_porcelain(worktree)
+        if status:
+            allowed = self.git(
+                ["status", "--porcelain", "--untracked-files=all", "--", *skipped],
+                cwd=worktree,
+            ).stdout if skipped else ""
+            if status != allowed:
+                raise IntegrationError("frame worktree remained dirty after core commit")
+        return AutoCommitResult(
+            head=self.head(worktree), skipped_symlinks=tuple(skipped)
+        )
+
+    @staticmethod
+    def _symlink_target_escapes(
+        path: str, target: str, links: dict[str, str]
+    ) -> bool:
+        raw_target = PurePosixPath(target)
+        if raw_target.is_absolute() or not target:
+            return True
+        pending = [*PurePosixPath(path).parent.parts, *raw_target.parts]
+        resolved: list[str] = []
+        expansions = 0
+        while pending:
+            part = pending.pop(0)
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not resolved:
+                    return True
+                resolved.pop()
+                continue
+            resolved.append(part)
+            nested_path = "/".join(resolved)
+            nested_target = links.get(nested_path)
+            if nested_target is None:
+                continue
+            expansions += 1
+            if expansions > len(links) + 40:
+                return True
+            nested = PurePosixPath(nested_target)
+            if nested.is_absolute() or not nested_target:
+                return True
+            resolved.pop()
+            pending = [*nested.parts, *pending]
+        return False
+
+    def new_out_of_tree_commit_symlinks(
+        self, base: str, candidate: str
+    ) -> list[str]:
+        """Find candidate symlinks absent as symlinks from the base tree."""
+        base_modes = self._tree_modes(base)
+        candidate_modes = self._tree_modes(candidate)
+        links: dict[str, str] = {}
+        for path, mode in candidate_modes.items():
+            if mode != "120000":
+                continue
+            try:
+                links[path] = self.git(
+                    ["cat-file", "blob", f"{candidate}:{path}"]
+                ).stdout
+            except RepositoryError as exc:
+                raise IntegrationError(
+                    f"could not inspect symlink target for {path!r}"
+                ) from exc
+        return sorted(
+            path for path, target in links.items()
+            if base_modes.get(path) != "120000"
+            and self._symlink_target_escapes(path, target, links)
+        )
 
     def _paths(self, args: list[str], *, cwd: Path) -> list[str]:
         process = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=False)

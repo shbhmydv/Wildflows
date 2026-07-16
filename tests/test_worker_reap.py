@@ -14,7 +14,7 @@ import pytest
 
 from tests.conftest import executable
 from wildflows.engine import Engine
-from wildflows.events import WorkerReaped
+from wildflows.events import RunInterrupted, WorkerReaped
 from wildflows.frame import FrameResult, FrameRuntime
 from wildflows.rig import RigRegistry, WorkerReap, WorkerSupervisor
 
@@ -168,6 +168,14 @@ while True:
         assert reaped[0]["attempt"] == 0
         assert reaped[0]["session_id"] == parent
         assert reaped[0]["escalated"] is True
+        records = _journal_records(repo, run_id)
+        assert records[-1]["kind"] == "run_interrupted"
+        assert engine_signal.name in str(records[-1]["reason"])
+        reaped_seq = reaped[0]["seq"]
+        interrupted_seq = records[-1]["seq"]
+        assert isinstance(reaped_seq, int)
+        assert isinstance(interrupted_seq, int)
+        assert reaped_seq < interrupted_seq
     finally:
         if process.poll() is None:
             process.kill()
@@ -307,3 +315,8 @@ def test_fatal_engine_exception_reaps_and_journals_before_propagating(
     assert reaped[0].attempt == 0
     assert reaped[0].session_id == process.pid
     assert reaped[0].escalated
+    events = engine.journal.events()
+    assert isinstance(events[-1], RunInterrupted)
+    assert "_FatalEngineError" in events[-1].reason
+    assert "fatal engine seam" in events[-1].reason
+    assert reaped[0].seq < events[-1].seq

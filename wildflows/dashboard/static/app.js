@@ -110,6 +110,7 @@ function runTone(value) {
   if (value === "completed" || value === "done") return "success";
   if (value === "failed" || value === "invalid") return "failed";
   if (value === "parked") return "parked";
+  if (value === "interrupted") return "interrupted";
   if (value === "running" || value === "banked") return value;
   return "muted";
 }
@@ -171,7 +172,7 @@ function renderLiveRuns() {
   const target = $("#live-list");
   target.replaceChildren();
   const ordered = [...state.runs].sort((left, right) => {
-    const rank = value => value === "running" ? 3 : value === "parked" ? 2 : value === "completed" ? 1 : 0;
+    const rank = value => value === "running" ? 4 : value === "parked" ? 3 : value === "interrupted" ? 2 : value === "completed" ? 1 : 0;
     return rank(right.state) - rank(left.state) || Number(right.started_at || 0) - Number(left.started_at || 0);
   });
   if (!ordered.length) target.append(el("p", "empty-copy", "No runs in watched repositories."));
@@ -728,10 +729,12 @@ function eventInfo(event) {
   const ref = event.frame_id != null && event.call_index != null ? `${eventFrame(event)} / call ${event.call_index}` : `seq / ${event.seq}`;
   if (event.kind === "run_opened") return { kind: "run open", tone: "owner", detail: firstLine(event.root_prompt), ref: event.run_branch, expandable: String(event.root_prompt).length > 120 };
   if (event.kind === "run_finished") return { kind: "run result", tone: event.outcome === "ok" ? "result" : "failure", detail: event.text || event.outcome, ref: `result / ${short(event.root_head)}`, expandable: String(event.text).length > 120 };
+  if (event.kind === "run_interrupted") return { kind: "interrupted", tone: "owner", detail: event.reason, ref: `seq / ${event.seq}`, expandable: String(event.reason).length > 120 };
   if (event.kind === "frame_pushed") return { kind: "frame push", tone: "frame", detail: `${event.rig} started · ${firstLine(event.prompt)}`, ref: `attempt ${event.attempt}`, expandable: String(event.prompt).length > 120 };
   if (event.kind === "frame_slot_queued") return { kind: "slot queue", tone: "owner", detail: `${event.rig} waiting for an active slot`, ref: `attempt ${event.attempt}` };
   if (event.kind === "frame_slot_acquired") return { kind: "slot acquired", tone: "frame", detail: `${event.rig}${event.slot == null ? " active" : ` lane ${event.slot}`}`, ref: `attempt ${event.attempt}` };
   if (event.kind === "frame_slot_released") return { kind: "slot released", tone: "", detail: `${event.reason} · ${formatDuration(event.active_s)} self-time`, ref: `attempt ${event.attempt}` };
+  if (event.kind === "frame_commit_warning") return { kind: "commit warning", tone: "owner", detail: event.message, ref: `attempt ${event.attempt}`, expandable: String(event.message).length > 100 };
   if (event.kind === "frame_exited") {
     const frame = state.run.frames[event.frame_id];
     return { kind: "frame result", tone: event.outcome === "ok" ? "result" : "failure", detail: event.text || `${event.outcome}: ${firstLine(event.stderr)}`, ref: `${event.outcome} / ${formatDuration(frame?.duration_s)}`, expandable: String(event.text || event.stderr).length > 100 };
