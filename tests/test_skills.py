@@ -87,6 +87,19 @@ def test_bundled_skills_are_discovered_with_heading_descriptions(repo: Path) -> 
     ])
 
 
+def test_failed_child_and_loop_exhaustion_doctrine_is_shipped() -> None:
+    library = SkillLibrary(Path("wildflows/skills").parent.parent)
+    economy = library.resolve(["dispatch-economy"])[0].text
+    shapes = library.resolve(["orchestration-shapes"])[0].text
+
+    assert "retry_frame" in economy
+    assert "merge the salvage branch" in economy
+    assert "wildflows_ask" in economy
+    assert "stronger kind" in economy
+    assert "Never silently extend the loop" in shapes
+    assert "fail honestly upward with the concrete evidence" in shapes
+
+
 def test_root_gets_default_dispatch_skills_with_repository_overrides(
     repo: Path, tmp_path: Path
 ) -> None:
