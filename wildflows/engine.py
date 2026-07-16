@@ -2138,6 +2138,8 @@ class Engine:
         linked: list[str] = []
         warnings: list[str] = []
         try:
+            with self._workspace_lock:
+                self.repository.append_excludes(worktree.path, list(links))
             for relative in links:
                 source = self.repository.root / relative
                 if not source.exists():
@@ -2153,12 +2155,21 @@ class Engine:
                         f"worktree link destination escapes checkout: {relative}"
                     )
                 if destination.exists() or destination.is_symlink():
-                    raise WorktreeProvisioningError(
-                        f"worktree link destination already exists: {relative}"
-                    )
+                    if (
+                        destination.is_file()
+                        and not destination.is_symlink()
+                        and self.repository.is_tracked(worktree.path, relative)
+                    ):
+                        # Let the checkout-wide cleanliness assertion diagnose a
+                        # configured link that shadows a tracked file.
+                        destination.unlink()
+                    else:
+                        raise WorktreeProvisioningError(
+                            f"worktree link destination already exists: {relative}"
+                        )
                 destination.symlink_to(source, target_is_directory=source.is_dir())
                 linked.append(relative)
-        except (OSError, WorktreeProvisioningError) as exc:
+        except (OSError, RepositoryError, WorktreeProvisioningError) as exc:
             duration_s = max(0.0, time.monotonic() - started)
             detail = f"worktree link provisioning failed: {exc}"
             self.journal.append(WorktreeProvisioned(
@@ -2194,6 +2205,13 @@ class Engine:
             self._provision_setup(worktree, attempt, self._worktree_setup)
         if self._worktree_links:
             self._provision_links(worktree, attempt, self._worktree_links)
+        status = self.repository.status_porcelain(worktree.path)
+        if status:
+            raise WorktreeProvisioningError(
+                "worktree provisioning left checkout dirty; refusing to launch "
+                "the frame.\n"
+                f"git status --porcelain:\n{status.rstrip()}"
+            )
 
     def _launch_frame(
         self,

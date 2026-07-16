@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 import tempfile
@@ -227,18 +228,58 @@ class Repository:
         self.git(["worktree", "remove", "--force", str(worktree.path)], check=False)
         self.git(["worktree", "prune", "--expire", "now"], check=False)
 
+    def status_porcelain(self, worktree: Path) -> str:
+        return self.git(
+            ["status", "--porcelain", "--untracked-files=all"], cwd=worktree
+        ).stdout
+
     def ensure_clean(self, worktree: Path, branch: str) -> str:
         head = self.head(worktree)
         if self.branch_tip(branch) != head:
             raise BranchDivergedError(f"worktree HEAD differs from frame branch {branch!r}")
-        status = self.git(
-            ["status", "--porcelain", "--untracked-files=all"], cwd=worktree
-        ).stdout
+        status = self.status_porcelain(worktree)
         if status:
             raise IntegrationError(
-                "caller frame must commit or discard worktree changes before an engine tool call"
+                "caller frame worktree is dirty; commit or clean the changes below, "
+                "then retry the engine tool.\n"
+                f"git status --porcelain:\n{status.rstrip()}"
             )
         return head
+
+    def append_excludes(self, worktree: Path, paths: list[str]) -> None:
+        """Append anchored link patterns to the repository exclude file once."""
+        raw_path = self.git(
+            ["rev-parse", "--git-path", "info/exclude"], cwd=worktree
+        ).stdout.strip()
+        exclude = Path(raw_path)
+        if not exclude.is_absolute():
+            exclude = worktree / exclude
+        try:
+            current = exclude.read_bytes() if exclude.exists() else b""
+            existing = set(current.splitlines())
+            additions = [
+                f"/{path}".encode("utf-8")
+                for path in paths
+                if f"/{path}".encode("utf-8") not in existing
+            ]
+            if not additions:
+                return
+            separator = b"" if not current or current.endswith(b"\n") else b"\n"
+            with exclude.open("ab") as stream:
+                stream.write(separator + b"\n".join(additions) + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            raise RepositoryError(
+                f"could not update repository exclude file {exclude}: {exc}"
+            ) from exc
+
+    def is_tracked(self, worktree: Path, path: str) -> bool:
+        return self.git(
+            ["ls-files", "--error-unmatch", "--", path],
+            cwd=worktree,
+            check=False,
+        ).returncode == 0
 
     def commit_all(self, worktree: Path, message: str) -> str:
         self.git(["add", "-A", "--", "."], cwd=worktree)

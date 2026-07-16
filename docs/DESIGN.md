@@ -2179,3 +2179,16 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      budget: finish inline, re-tier deliberately, or fail honestly upward with the gate
      evidence. The engine performs no automatic salvage merge, escalation, or fake
      success conversion.
+
+### Hand-47 calls — git-invisible worktree links and pre-journal refusals
+
+171. **Provisioned links are repository-excluded and every prepared checkout must be
+     clean before adapter launch.** For each configured `worktree.link`, provisioning
+     idempotently appends the anchored, no-trailing-slash `/<path>` pattern to the common
+     Git `info/exclude`; this matches the symlink itself even when a target's existing
+     `<path>/` rule matches directories only. The exclude update is serialized across
+     parallel frame launches and fsynced. After setup and links, an empty
+     `git status --porcelain` is a launch invariant. A visible provisioning artifact
+     terminalizes the frame with the exact status evidence and removes its worktree via
+     the same path as setup failure, before an adapter or later engine call can observe
+     the poisoned checkout.

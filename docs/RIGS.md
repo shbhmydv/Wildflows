@@ -86,13 +86,20 @@ The optional top-level `worktree` section belongs to the target repository, not 
   bounded stdout/stderr in the failure, and removes the worktree cleanly.
 - `link` is a list of repository-relative paths. Each existing source in the primary
   checkout is symlinked at the same path in every new frame worktree; a missing source is
-  skipped with a journalled warning. Links share mutable state, which suits caches and
-  dependency directories but not frame-owned source or build outputs.
+  skipped with a journalled warning. Every configured link path is also added once as an
+  anchored, no-trailing-slash `/<path>` pattern in Git's repository exclude file. Unlike
+  a directory-only `<path>/` pattern, this hides both a symlink and a directory, and the
+  shared exclude entry is idempotent across concurrent provisioning and resume. Links
+  share mutable state, which suits caches and dependency directories but not frame-owned
+  source or build outputs.
 
 Each configured mechanism records `worktree_provisioned` with its worktree, duration,
 outcome, linked paths/warnings, and bounded setup output. Provisioning is once per fresh
-worktree path. Replay returns completed calls without provisioning again; a resumed
-attempt that must create a replacement worktree provisions that new checkout once.
+worktree path. After all mechanisms complete, the engine requires an empty
+`git status --porcelain`; any artifact still visible to Git terminalizes the launch with
+that status and removes the worktree before an adapter can start. Replay returns
+completed calls without provisioning again; a resumed attempt that must create a
+replacement worktree provisions that new checkout once.
 `setup` runs with no Wildflows hard timeout, so owners should make it deterministic and
 supply any repository-appropriate bound inside the command when needed. Link paths may
 not be absolute, escape with `..`, name `.git`, or repeat.

@@ -8,7 +8,8 @@ import pytest
 
 from tests.conftest import executable, git
 from wildflows.engine import Engine
-from wildflows.events import FrameExited, WorktreeProvisioned
+from wildflows.events import DispatchCalled, FrameExited, WorktreeProvisioned
+from wildflows.frame import FrameResult, FrameRuntime
 from wildflows.rig import RigRegistry, ShellRig
 
 
@@ -62,10 +63,48 @@ elif mode == "link":
     })
     assert gate["exit_code"] == 0
     print("links visible")
+elif mode == "link-dispatch":
+    assert pathlib.Path("node_modules").is_symlink()
+    assert not os.popen("git status --porcelain").read()
+    if frame == "f0":
+        dispatched = call(0, "dispatch", {
+            "tasks": ["verify linked child"],
+            "rig": "worker", "parallel": False,
+        })
+        assert dispatched["outcome"] == "ok"
+    print("link dispatch visible")
 else:
     pathlib.Path(os.environ["AGENT_STARTED"]).write_text("started\n")
     raise SystemExit("failed setup unexpectedly launched the frame adapter")
 '''
+
+
+class _ProvisionInterrupted(BaseException):
+    pass
+
+
+class _ResumeLinkRig:
+    timeout_s = 2.0
+
+    def __init__(self, *, interrupt: bool) -> None:
+        self.interrupt = interrupt
+
+    def run(
+        self, prompt: str, workdir: Path, runtime: FrameRuntime
+    ) -> FrameResult:
+        del prompt, runtime
+        assert (workdir / "node_modules").is_symlink()
+        if self.interrupt:
+            raise _ProvisionInterrupted()
+        return FrameResult(text="resumed with clean link", exit_code=0)
+
+
+def _exclude_lines(repo: Path) -> list[str]:
+    raw = git(repo, "rev-parse", "--git-path", "info/exclude")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = repo / path
+    return path.read_text(encoding="utf-8").splitlines()
 
 
 def _registry(
@@ -176,6 +215,106 @@ def test_setup_failure_terminalizes_launch_and_removes_worktree(
     assert not list((tmp_path / "worktrees-setup-failure").glob("*"))
     worktree_listing = git(repo, "worktree", "list", "--porcelain")
     assert worktree_listing.count("worktree ") == 1
+
+
+def test_trailing_slash_gitignore_link_is_excluded_and_dispatch_starts_clean(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore dependency directory only")
+    dependencies = repo / "node_modules"
+    dependencies.mkdir()
+    (dependencies / "package.txt").write_text("shared\n", encoding="utf-8")
+    registry = _registry(
+        tmp_path,
+        monkeypatch,
+        mode="link-dispatch",
+        links=["node_modules"],
+    )
+    engine = _engine(repo, tmp_path, registry, run_id="trailing-slash-link")
+
+    assert engine.run().outcome == "ok"
+    calls = [
+        event
+        for event in engine.journal.events()
+        if isinstance(event, DispatchCalled)
+    ]
+    assert len(calls) == 1
+    assert calls[0].frame_id == "f0"
+    assert _exclude_lines(repo).count("/node_modules") == 1
+
+
+def test_link_exclude_is_idempotent_across_interrupted_relaunch(
+    repo: Path, tmp_path: Path
+) -> None:
+    (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore dependency directory only")
+    (repo / "node_modules").mkdir()
+    run_dir = tmp_path / "run-link-resume"
+    worktrees = tmp_path / "worktrees-link-resume"
+    first_registry = RigRegistry(
+        {"worker": _ResumeLinkRig(interrupt=True)},
+        worktree_links=["node_modules"],
+    )
+    first = Engine(
+        run_dir,
+        repo,
+        first_registry,
+        run_id="link-resume",
+        root_rig="worker",
+        root_prompt="interrupt after provisioning",
+        worktrees_root=worktrees,
+    )
+
+    with pytest.raises(_ProvisionInterrupted):
+        first.run()
+    assert _exclude_lines(repo).count("/node_modules") == 1
+
+    resumed_registry = RigRegistry(
+        {"worker": _ResumeLinkRig(interrupt=False)},
+        worktree_links=["node_modules"],
+    )
+    resumed = Engine(
+        run_dir,
+        repo,
+        resumed_registry,
+        run_id="link-resume",
+        root_rig="worker",
+        root_prompt="interrupt after provisioning",
+    )
+    assert resumed.run().outcome == "ok"
+    assert _exclude_lines(repo).count("/node_modules") == 1
+    provisioned = [
+        event
+        for event in resumed.journal.events()
+        if isinstance(event, WorktreeProvisioned)
+        and event.mechanism == "link"
+    ]
+    assert len(provisioned) == 2
+
+
+def test_tracked_file_link_fails_launch_with_dirty_status_and_removes_worktree(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _registry(
+        tmp_path,
+        monkeypatch,
+        mode="failure",
+        links=["base.txt"],
+    )
+    engine = _engine(repo, tmp_path, registry, run_id="tracked-link")
+
+    result = engine.run()
+
+    assert result.outcome == "failed"
+    assert "worktree provisioning left checkout dirty" in result.text
+    assert "git status --porcelain" in result.text
+    assert "base.txt" in result.text
+    assert not (tmp_path / "agent-started").exists()
+    assert any(isinstance(event, FrameExited) for event in engine.journal.events())
+    assert not list((tmp_path / "worktrees-tracked-link").glob("*"))
 
 
 def test_links_share_existing_sources_and_warn_for_missing_sources(
