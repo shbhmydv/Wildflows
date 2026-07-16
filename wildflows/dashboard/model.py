@@ -12,7 +12,7 @@ from typing import cast
 from fastapi import HTTPException, status
 
 from wildflows.events import Event, FrameExited, FramePushed, parse_event
-from wildflows.frame import DispatchRequest, FrameOutcome, GateResult
+from wildflows.frame import DispatchRequest, FrameOutcome, GateResult, child_frame_id
 from wildflows.projection import CallProjection, FrameProjection, RunProjection
 
 
@@ -272,6 +272,10 @@ class DashboardModel:
                 else None
             ),
             "children": [child.frame_id for child in children],
+            "future_frame_ids": [
+                child_frame_id(call.frame_id, call.call_index, task_index)
+                for task_index in range(requested)
+            ],
             "requested": requested,
             "queued": max(0, requested - len(children)),
             "parallel": (

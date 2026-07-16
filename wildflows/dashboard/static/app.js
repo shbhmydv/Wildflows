@@ -63,6 +63,10 @@ function firstLine(value, fallback = "—") {
   return line ? line.trim() : fallback;
 }
 
+function framePath(frameId) {
+  return String(frameId).split(".").join(" › ");
+}
+
 function expandableCopy(className, value, title = "Expand text") {
   const control = el("button", className);
   control.type = "button";
@@ -578,14 +582,26 @@ function dispatchSlots(call) {
   const byIndex = new Map(call.children.map(frameId => [state.run.frames[frameId].task_index, frameId]));
   const tasks = call.request?.tasks || [];
   const kinds = call.kinds || [];
-  return Array.from({ length: call.requested }, (_, index) => ({ index, frameId: byIndex.get(index) || null, task: tasks[index] || `task ${index}`, kind: kinds[index] || null }));
+  const futureFrameIds = call.future_frame_ids || [];
+  return Array.from({ length: call.requested }, (_, index) => ({
+    index,
+    frameId: byIndex.get(index) || null,
+    futureFrameId: futureFrameIds[index],
+    task: tasks[index] || `task ${index}`,
+    kind: kinds[index] || null,
+  }));
 }
 
 function renderQueued(slot) {
   const card = el("article", "frame-node frame-card queued");
+  card.dataset.frame = slot.futureFrameId;
+  const summary = el("div", "frame-summary");
   const top = el("div", "frame-top");
-  top.append(dot("queued"), el("span", "frame-path", `task ${slot.index}${slot.kind ? ` · ${slot.kind}` : ""}`), el("span", "state-chip", "queued"));
-  card.append(top, el("p", "frame-prompt", slot.task));
+  top.append(dot("queued"), el("span", "frame-path", framePath(slot.futureFrameId)));
+  if (slot.kind) top.append(el("span", "kind-badge", slot.kind));
+  top.append(el("span", "state-chip", "queued"));
+  summary.append(top, el("p", "frame-prompt", slot.task));
+  card.append(summary);
   return card;
 }
 

@@ -2133,3 +2133,14 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      lane plus the bundled local provider override (`local-reviewer-8081`/`8082`);
      `worker-local.sh` honors it while preserving an explicit operator provider as higher
      priority. `_pin_backend.sh`, including its blocking third-worker branch, is deleted.
+
+### Hand-45 calls — queued-frame dashboard containment
+
+166. **A queued dispatch slot previews its durable frame identity inside the canvas.**
+     Engine launch and dashboard projection share one child-id constructor, so task
+     position `n` in call `c` is labelled with the same breadcrumb path that its frame
+     will use after push, while muted queued styling remains the pending signal. Frame
+     prompts, including queued task specs, share a two-line anywhere-wrapping clamp.
+     The frame-stack panel is width-contained and owns horizontal overflow; page-level
+     overflow is suppressed, so future uncontained content stays scrollable inside the
+     canvas instead of widening the document.

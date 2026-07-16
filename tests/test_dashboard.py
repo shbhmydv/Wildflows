@@ -215,7 +215,7 @@ def test_app_lists_deduplicated_repositories_with_qualified_run_keys(
 def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
     tmp_path: Path,
 ) -> None:
-    run_dir = _write_fixture_run(tmp_path / "repo", tail=b'{"version":2,"seq":49')
+    run_dir = _write_fixture_run(tmp_path / "repo", tail=b'{"version":2,"seq":50')
     journal = run_dir / "events.ndjson"
     before = journal.read_bytes()
     client = TestClient(create_app(tmp_path / "repo"))
@@ -226,7 +226,7 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
     detail = _json_object(detail_response)
     events = _objects(detail["events"])
     assert detail["state"] == "parked"
-    assert len(events) == 49
+    assert len(events) == 50
     assert {event["version"] for event in events} == {2}
     gate_event = next(event for event in events if event["kind"] == "gate_returned")
     assert _object(gate_event["result"]) == {
@@ -248,11 +248,13 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
     root = _object(frames["f0"])
     failed = _object(frames["f0.c2.t1"])
     parked = _object(frames["f0.c2.t2"])
+    serial_parent = _object(frames["f0.c2.t3"])
     depth_four = _object(frames["f0.c0.t0.c0.t0.c0.t0.c0.t0"])
     assert root["state"] == "banked"
     assert failed["state"] == "failed"
     assert failed["reason"] == "migration boundary missing"
     assert parked["state"] == "parked"
+    assert serial_parent["state"] == "banked"
     assert depth_four["depth"] == 4
     assert depth_four["state"] == "done"
 
@@ -271,6 +273,9 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
     assert fanout["parallel"] is True
     assert fanout["requested"] == 20
     assert fanout["queued"] == 15
+    assert fanout["future_frame_ids"] == [
+        f"f0.c2.t{index}" for index in range(20)
+    ]
     children = fanout["children"]
     assert isinstance(children, list)
     assert {_text(value) for value in children} == {
@@ -281,11 +286,25 @@ def test_detail_projects_fixture_state_and_ignores_torn_tail_read_only(
         "f0.c2.t4",
     }
     assert _object(fanout["counts"]) == {
+        "banked": 1,
         "done": 2,
         "failed": 1,
         "parked": 1,
-        "running": 1,
     }
+
+    serial = _call(serial_parent, 0)
+    assert serial["parallel"] is False
+    assert serial["requested"] == 2
+    assert serial["queued"] == 2
+    assert serial["future_frame_ids"] == [
+        "f0.c2.t3.c0.t0",
+        "f0.c2.t3.c0.t1",
+    ]
+    serial_tasks = _object(serial["request"])["tasks"]
+    assert isinstance(serial_tasks, list)
+    long_task = _text(serial_tasks[0])
+    assert len(long_task) > 500
+    assert not any(character.isspace() for character in long_task)
 
 
 def test_frame_state_uses_own_exit_outcome_not_failed_child_pop(
@@ -424,7 +443,21 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     ) in javascript
     assert 'node.append(calls);' in javascript
     assert "if (collapsed) return node;" in javascript
-    assert ".canvas { position: relative; min-height: 0; overflow: auto;" in css
+    canvas_panel = _css_declarations(css, ".canvas-panel")
+    assert canvas_panel["max-width"] == "100%"
+    assert canvas_panel["overflow"] == "hidden"
+    canvas = _css_declarations(css, ".canvas")
+    assert canvas["width"] == "100%"
+    assert canvas["max-width"] == "100%"
+    assert canvas["min-width"] == "0"
+    assert canvas["overflow"] == "auto"
+    assert canvas["contain"] == "inline-size"
+    prompt = _css_declarations(css, ".frame-prompt")
+    assert prompt["display"] == "-webkit-box"
+    assert prompt["overflow-wrap"] == "anywhere"
+    assert prompt["white-space"] == "normal"
+    assert prompt["-webkit-box-orient"] == "vertical"
+    assert prompt["-webkit-line-clamp"] == "2"
     assert ".canvas-surface { position: absolute;" in css
     assert "transform: scale(var(--canvas-zoom, 1));" in css
     assert ".canvas-controls { position: absolute;" in css
@@ -434,6 +467,9 @@ def test_static_assets_are_local_and_keep_exact_theme_tokens(tmp_path: Path) -> 
     assert ".clamped.expanded { display: block; max-height: 150px;" in css
     assert 'const space = el("div", "canvas-space");' in javascript
     assert 'const surface = el("div", "canvas-surface");' in javascript
+    assert "futureFrameId: futureFrameIds[index]" in javascript
+    assert "framePath(slot.futureFrameId)" in javascript
+    assert 'const summary = el("div", "frame-summary");' in javascript
     assert "event.ctrlKey" in javascript
     assert "fitCanvasToWidth" in javascript
     assert 'id="canvas-controls"' in index

@@ -13,5 +13,7 @@ python3 -m wildflows dash --repo examples/dashboard-fixture
 
 The journal contains a completed dispatch beside an active 20-task parallel dispatch:
 five child slots are launched (terminal, parked, and running) and the other fifteen
-remain queued. It also includes a nonzero gate with both output streams and a
-completed depth-4 frame chain for drill-in.
+remain queued. One running child also has a serial dispatch whose first queued task
+is a deliberately long, unbroken single-line clamp fixture. The run includes a
+nonzero gate with both output streams and a completed depth-4 frame chain for
+drill-in.

@@ -54,6 +54,7 @@ from wildflows.frame import (
     ToolResponse,
     WorkerLease,
     call_hash,
+    child_frame_id,
 )
 from wildflows.journal import Journal
 from wildflows.mcp import MCPServer, ToolProtocolError, ValidatedToolCall
@@ -1243,7 +1244,7 @@ class Engine:
                 for task_index in range(len(request.tasks))
                 if (
                     (existing := projection.frames.get(
-                        self._child_id(parent.frame_id, call_index, task_index)
+                        child_frame_id(parent.frame_id, call_index, task_index)
                     ))
                     is None
                     or existing.outcome is None
@@ -1290,7 +1291,7 @@ class Engine:
         """Memoize only failures proven to precede a durable frame push."""
         if self.journal.poisoned:
             raise exc
-        frame_id = self._child_id(parent_frame_id, call_index, task_index)
+        frame_id = child_frame_id(parent_frame_id, call_index, task_index)
         with self.journal.projection_transaction() as projection:
             pushed = frame_id in projection.frames
         if pushed:
@@ -1316,7 +1317,7 @@ class Engine:
         start_barrier: threading.Barrier | None = None,
         cancellation: threading.Event | None = None,
     ) -> FrameProjection:
-        frame_id = self._child_id(parent.frame_id, call_index, task_index)
+        frame_id = child_frame_id(parent.frame_id, call_index, task_index)
         if cancellation is not None and cancellation.is_set():
             raise RuntimeError("dispatch cancelled before child frame push")
         with self.journal.projection_transaction() as projection:
@@ -1349,10 +1350,6 @@ class Engine:
             start_barrier=start_barrier,
             cancellation=cancellation,
         )
-
-    @staticmethod
-    def _child_id(parent: str, call_index: int, task_index: int) -> str:
-        return f"{parent}.c{call_index}.t{task_index}"
 
     def _finish_child(
         self,

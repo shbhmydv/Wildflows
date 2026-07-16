@@ -16,6 +16,11 @@ FrameOutcome: TypeAlias = Literal["ok", "failed", "busy", "refused"]
 ToolName: TypeAlias = Literal["dispatch", "gate", "ask"]
 
 
+def child_frame_id(parent: str, call_index: int, task_index: int) -> str:
+    """Return the durable identity of one task in a frame dispatch call."""
+    return f"{parent}.c{call_index}.t{task_index}"
+
+
 class FrameResult(BaseModel):
     outcome: FrameOutcome = "ok"
     text: str = ""
