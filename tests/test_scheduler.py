@@ -197,10 +197,17 @@ def test_self_time_exhaustion_reaps_worker_and_is_journalled(
         if isinstance(event, WorkerReaped)
     ]
     assert reaped and reaped[-1].reason == "frame_self_timeout"
+    releases = [
+        event for event in engine.journal.events()
+        if isinstance(event, FrameSlotReleased)
+        and event.reason == "self_time_timeout"
+    ]
+    assert releases and reaped[-1].seq < releases[-1].seq
     exits = [
         event for event in engine.journal.events()
         if isinstance(event, FrameExited)
     ]
+    assert releases[-1].seq < exits[-1].seq
     assert exits[-1].outcome == "failed"
     assert "self-time budget" in exits[-1].text
 

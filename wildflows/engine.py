@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from typing import cast
@@ -157,6 +157,8 @@ class _FrameExecution:
     generation: int = 0
     timed_out: bool = False
     closed: bool = False
+    timeout_complete: threading.Event = field(default_factory=threading.Event)
+    timeout_error: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -377,7 +379,10 @@ class Engine:
         if remaining <= 0:
             with self._execution_lock:
                 execution.timed_out = True
-            execution.worker.stop("frame_self_timeout")
+            try:
+                execution.worker.stop("frame_self_timeout")
+            finally:
+                execution.timeout_complete.set()
             return False
         with self.journal.projection_transaction() as projection:
             previous = projection.frame(execution.frame_id).last_slot
@@ -463,21 +468,27 @@ class Engine:
             execution.timer = None
             execution.timed_out = True
             execution.generation += 1
-        execution.worker.stop("frame_self_timeout")
         try:
-            self.journal.append(FrameSlotReleased(
-                run_id=self.run_id,
-                frame_id=execution.frame_id,
-                attempt=execution.attempt,
-                rig=execution.rig,
-                slot=lane,
-                active_s=active_s,
-                reason="self_time_timeout",
-            ))
+            execution.worker.stop("frame_self_timeout")
+            try:
+                self.journal.append(FrameSlotReleased(
+                    run_id=self.run_id,
+                    frame_id=execution.frame_id,
+                    attempt=execution.attempt,
+                    rig=execution.rig,
+                    slot=lane,
+                    active_s=active_s,
+                    reason="self_time_timeout",
+                ))
+            finally:
+                self._slot_scheduler.release(
+                    execution.rig, execution.frame_id, lane
+                )
+        except BaseException as exc:
+            with self._execution_lock:
+                execution.timeout_error = exc
         finally:
-            self._slot_scheduler.release(
-                execution.rig, execution.frame_id, lane
-            )
+            execution.timeout_complete.set()
 
     def _release_frame_slot(
         self, execution: _FrameExecution, reason: str, *, close: bool = False
@@ -1946,6 +1957,11 @@ class Engine:
             if worker is not None:
                 worker.finished()
             if execution is not None and execution.timed_out:
+                execution.timeout_complete.wait()
+                if execution.timeout_error is not None:
+                    raise RuntimeError(
+                        "frame self-time reap failed"
+                    ) from execution.timeout_error
                 result = FrameResult(
                     outcome="failed",
                     text=(
