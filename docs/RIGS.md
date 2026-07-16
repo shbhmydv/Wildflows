@@ -40,8 +40,9 @@ grace period, then SIGKILLs survivors.
   the model/effort overrides match `worker-picodex.sh`.
 
 Both scripts keep prompts out of argv and preserve the `--handle-out` contract. Handles
-are now JSON records containing the adapter PID, process-group ID, and session ID; the
-engine reader also accepts legacy one-integer PGID handles. The scripts set a Git ceiling,
+are now JSON records containing the adapter PID, process-group ID, session ID, and (when
+written by the Linux engine) process start-time generation; the engine reader also accepts
+legacy one-integer PGID handles. The scripts set a Git ceiling,
 return final text on stdout, diagnostics on stderr, and propagate the transport exit
 status.
 

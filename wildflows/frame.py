@@ -157,7 +157,13 @@ class WorkerLease(Protocol):
 
     handle_path: Path
 
-    def started(self, pid: int, process_group_id: int, session_id: int) -> None: ...
+    def started(
+        self,
+        pid: int,
+        process_group_id: int,
+        session_id: int,
+        start_time: int | None = None,
+    ) -> None: ...
 
     def stop(self, reason: str) -> None: ...
 

@@ -2066,3 +2066,12 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      completed call. `FrameCallJoinTimeoutError` remains only the typed internal
      escalation between join and frame terminalization; `Run` no longer special-cases
      it or retains the lifecycle lock.
+
+159. **Persisted worker identities are generation-checked before a restart sweep.**
+     Engine-written v2 handles include the Linux `/proc/<pid>/stat` start-time tick.
+     A stale handle whose numeric leader PID now names another generation is never
+     signalled, and the recorded process group is signalled only while a current member
+     of the recorded session still belongs to it; session members remain the exhaustive
+     kill target. Adapter-written v2 handles may omit the generation and v1 integer
+     handles remain readable for explicit compatibility, while live attempts always use
+     the engine's in-memory generation-bearing record.

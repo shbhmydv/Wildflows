@@ -138,6 +138,8 @@ while True:
         )
         _wait_for_path(handle)
         handle_record = json.loads(handle.read_text(encoding="utf-8"))
+        start_time = handle_record.pop("start_time")
+        assert isinstance(start_time, int) and start_time > 0
         assert handle_record == {
             "version": 2,
             "pid": parent,
@@ -210,9 +212,37 @@ def test_supervisor_reaps_all_handles_and_reads_legacy_pgid(
         process.wait(timeout=5)
 
 
+def test_stale_handle_generation_never_signals_reused_session(
+    tmp_path: Path,
+) -> None:
+    """A numeric SID match is insufficient when the persisted generation differs."""
+    reports: list[WorkerReap] = []
+    supervisor = WorkerSupervisor(reports.append, grace_s=0.01)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        text=True,
+    )
+    handle = tmp_path / "stale.handle"
+    handle.write_text(json.dumps({
+        "version": 2,
+        "pid": process.pid,
+        "process_group_id": process.pid,
+        "session_id": process.pid,
+        "start_time": 0,
+    }), encoding="utf-8")
+    supervisor.prepare("f0", 0, handle)
+    try:
+        supervisor.shutdown("resume_sweep")
+        assert process.poll() is None
+        assert not reports
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
 @dataclass
 class _FatalRig:
-    pid_file: Path
     processes: list[subprocess.Popen[str]]
     timeout_s: float = 30.0
 
@@ -238,7 +268,6 @@ class _FatalRig:
         runtime.worker.started(
             process.pid, os.getpgid(process.pid), os.getsid(process.pid)
         )
-        self.pid_file.write_text(str(process.pid), encoding="utf-8")
         raise _FatalEngineError("fatal engine seam")
 
 
@@ -247,7 +276,7 @@ def test_fatal_engine_exception_reaps_and_journals_before_propagating(
 ) -> None:
     """BaseException propagation is outside, and strictly after, engine shutdown."""
     processes: list[subprocess.Popen[str]] = []
-    rig = _FatalRig(tmp_path / "fatal.pid", processes)
+    rig = _FatalRig(processes)
     engine = Engine(
         tmp_path / "fatal-run",
         repo,

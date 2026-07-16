@@ -443,6 +443,71 @@ def test_join_timeout_retries_then_fails_only_call_and_frame(
     assert engine.projection.finished.outcome == "failed"
 
 
+def test_timed_out_live_call_cannot_append_return_after_failed_frame(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A daemon worker released later cannot overwrite its timeout failure."""
+    rig = _DetachedToolRig("gate", {"cmd": "printf late"})
+    engine = _engine(repo, tmp_path, rig, "timeout-late-return")
+    release = threading.Event()
+    stopped = threading.Event()
+
+    def ignore_cancellation(
+        frame: FrameProjection,
+        worktree: FrameWorktree,
+        call_index: int,
+        digest: str,
+        request: GateRequest,
+        replaying: bool,
+    ) -> GateResult:
+        assert not replaying
+        caller_head = engine.repository.ensure_clean(worktree.path, frame.branch)
+        engine.journal.append(GateCalled(
+            run_id=engine.run_id,
+            frame_id=frame.frame_id,
+            call_index=call_index,
+            call_hash=digest,
+            request=request,
+            caller_head=caller_head,
+        ))
+        rig.tool_entered.set()
+        try:
+            assert release.wait(timeout=5), "test did not release timed-out worker"
+            returned = GateReturned(
+                run_id=engine.run_id,
+                frame_id=frame.frame_id,
+                call_index=call_index,
+                call_hash=digest,
+                result=GateResult(exit_code=0, stdout="late", stderr=""),
+            )
+            engine._append_tool_return(returned)  # noqa: SLF001 - late-return seam
+            return returned.result
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(engine, "_gate", ignore_cancellation)
+    monkeypatch.setattr("wildflows.engine.FRAME_CALL_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        "wildflows.engine.FRAME_CALL_JOIN_RETRY_BACKOFF_S", (0.01,)
+    )
+    try:
+        result = engine.run()
+        assert result.outcome == "failed"
+    finally:
+        release.set()
+        assert stopped.wait(timeout=5), "timed-out MCP worker did not finish"
+
+    events = engine.journal.events()
+    failures = [event for event in events if isinstance(event, CallFailed)]
+    returned = [event for event in events if isinstance(event, GateReturned)]
+    exited = [event for event in events if isinstance(event, FrameExited)]
+    assert len(failures) == len(exited) == 1
+    assert not returned
+    assert failures[0].seq < exited[0].seq
+    call = engine.projection.call("f0", 0)
+    assert call is not None and call.response == failures[0].result
+
+
 def test_cancellation_record_without_confirmed_stop_does_not_close_call_join(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
