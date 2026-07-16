@@ -2075,3 +2075,16 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      kill target. Adapter-written v2 handles may omit the generation and v1 integer
      handles remain readable for explicit compatibility, while live attempts always use
      the engine's in-memory generation-bearing record.
+
+### Hand-43 calls — warm frame relaunch
+
+160. **A relaunched frame receives bounded evidence from its immediately preceding
+     attempt.** Before stale-worktree removal, the engine snapshots that attempt's
+     tracked, staged, and untracked diff; a diff over 24 KiB becomes a bounded Git
+     stat/status summary instead. It also appends at most the last 100 lines and 16 KiB
+     from each adapter-owned `pi.stdout.log`/`pi.stderr.log` (falling back to ScriptRig
+     capture logs), plus human attempt numbers and the exact matching `worker_reaped`
+     reason classified as timeout, crash, operator stop, or generic reap. The complete
+     `EARLIER ATTEMPT` prompt block has a 64 KiB fail-safe cap and explicit truncation
+     markers. This is ephemeral engine-side prompt materialization: no journal or rig
+     contract changes, no durable call-identity changes, and no block on a first launch.

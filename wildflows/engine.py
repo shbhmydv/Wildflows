@@ -56,7 +56,13 @@ from wildflows.journal import Journal
 from wildflows.mcp import MCPServer, ToolProtocolError, ValidatedToolCall
 from wildflows.projection import FrameProjection, RunProjection
 from wildflows.result import CommitReceipt
-from wildflows.rig import RigRegistry, WorkerReap, WorkerSupervisor, run_shell
+from wildflows.rig import (
+    RigRegistry,
+    ScriptRig,
+    WorkerReap,
+    WorkerSupervisor,
+    run_shell,
+)
 from wildflows.shim import write_pi_shim
 from wildflows.skill import SkillLibrary, SkillLibraryError
 from wildflows.workspace import (
@@ -117,6 +123,13 @@ FRAME_CALL_JOIN_TIMEOUT_S = 5.0
 
 FRAME_CALL_JOIN_RETRY_BACKOFF_S = (0.1, 0.25, 0.5)
 """Bounded waits after process-tree reaping before a call is failed durably."""
+
+_EARLIER_ATTEMPT_LOG_LINES = 100
+_EARLIER_ATTEMPT_LOG_BYTES = 16 * 1024
+_EARLIER_ATTEMPT_DIFF_BYTES = 24 * 1024
+_EARLIER_ATTEMPT_SUMMARY_BYTES = 8 * 1024
+_EARLIER_ATTEMPT_BLOCK_BYTES = 64 * 1024
+_EARLIER_ATTEMPT_REASON_BYTES = 512
 
 
 @dataclass(frozen=True)
@@ -1199,6 +1212,291 @@ class Engine:
             for frame in blocked:
                 self._guard_frame_relaunch(projection, frame)
 
+    @staticmethod
+    def _truncate_utf8(value: str, limit: int, marker: str) -> str:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= limit:
+            return value
+        suffix = f"\n{marker}".encode("utf-8")
+        available = max(0, limit - len(suffix))
+        prefix = encoded[:available].decode("utf-8", errors="ignore")
+        return prefix + suffix.decode("utf-8")
+
+    @staticmethod
+    def _tail_attempt_log(path: Path, stream_name: str) -> str:
+        marker = f"[... PRIOR {stream_name.upper()} TRUNCATED ...]\n"
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                read_size = min(size, _EARLIER_ATTEMPT_LOG_BYTES)
+                if read_size:
+                    stream.seek(-read_size, os.SEEK_END)
+                data = stream.read(read_size)
+        except OSError as exc:
+            return f"[prior {stream_name} log unavailable: {exc}]"
+        truncated = size > len(data)
+        if truncated:
+            # A byte-bounded seek may begin midway through a line. Keep only
+            # the complete tail when another newline remains in the window.
+            first_newline = data.find(b"\n")
+            if first_newline >= 0:
+                data = data[first_newline + 1:]
+        lines = data.splitlines(keepends=True)
+        if len(lines) > _EARLIER_ATTEMPT_LOG_LINES:
+            lines = lines[-_EARLIER_ATTEMPT_LOG_LINES:]
+            truncated = True
+        body = b"".join(lines).decode("utf-8", errors="replace")
+        if not body:
+            body = "(empty)"
+        if not truncated:
+            return body
+        marker_bytes = marker.encode("utf-8")
+        body_bytes = body.encode("utf-8")
+        body_budget = _EARLIER_ATTEMPT_LOG_BYTES - len(marker_bytes)
+        if len(body_bytes) > body_budget:
+            body = body_bytes[-body_budget:].decode("utf-8", errors="ignore")
+        return marker + body
+
+    def _attempt_log_tail(
+        self, frame: FrameProjection, stream_name: str
+    ) -> tuple[str, str]:
+        filenames = (
+            f"pi.{stream_name}.log",
+            f"agent.{stream_name}.log",
+        )
+        roots: list[Path] = []
+        rig = (
+            self.registry.resolve(frame.rig)
+            if frame.rig in self.registry
+            else None
+        )
+        if isinstance(rig, ScriptRig):
+            expected = rig.log_dir / Path(frame.worktree).name
+            roots.append(expected)
+            try:
+                siblings = list(rig.log_dir.iterdir())
+            except OSError:
+                siblings = []
+            prefix = f"{expected.name}-"
+            suffixed = sorted(
+                (
+                    candidate
+                    for candidate in siblings
+                    if candidate.is_dir()
+                    and candidate.name.startswith(prefix)
+                    and candidate.name.removeprefix(prefix).isdigit()
+                ),
+                key=lambda candidate: int(candidate.name.removeprefix(prefix)),
+                reverse=True,
+            )
+            roots.extend(suffixed)
+        roots.append(
+            self.run_dir / "runtime" / frame.frame_id
+            / f"attempt-{frame.attempt}"
+        )
+        for root in roots:
+            for filename in filenames:
+                path = root / filename
+                if path.is_file():
+                    return filename, self._tail_attempt_log(path, stream_name)
+        return f"(no prior {stream_name} log found)", "(unavailable)"
+
+    @staticmethod
+    def _bounded_command_output(
+        argv: list[str], cwd: Path, limit: int
+    ) -> tuple[bytes, bool, int]:
+        try:
+            process = _subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdout=_subprocess.PIPE,
+                stderr=_subprocess.DEVNULL,
+            )
+        except OSError:
+            return b"", False, 127
+        assert process.stdout is not None
+        output = process.stdout.read(limit + 1)
+        truncated = len(output) > limit
+        if truncated:
+            process.kill()
+            output = output[:limit]
+        returncode = process.wait()
+        return output, truncated, returncode
+
+    def _diff_summary(self, worktree: Path) -> str:
+        stat, stat_truncated, stat_code = self._bounded_command_output(
+            [
+                "git",
+                "diff",
+                "--stat",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+                ".",
+            ],
+            worktree,
+            _EARLIER_ATTEMPT_SUMMARY_BYTES,
+        )
+        status, status_truncated, status_code = self._bounded_command_output(
+            ["git", "status", "--short", "--untracked-files=all"],
+            worktree,
+            _EARLIER_ATTEMPT_SUMMARY_BYTES,
+        )
+        stat_text = (
+            stat.decode("utf-8", errors="replace").rstrip()
+            if stat_code in (0, -9)
+            else "(unavailable)"
+        )
+        status_text = (
+            status.decode("utf-8", errors="replace").rstrip()
+            if status_code in (0, -9)
+            else "(unavailable)"
+        )
+        if stat_truncated:
+            stat_text += "\n[... DIFF STAT TRUNCATED ...]"
+        if status_truncated:
+            status_text += "\n[... STATUS TRUNCATED ...]"
+        stat_text = self._truncate_utf8(
+            stat_text,
+            _EARLIER_ATTEMPT_SUMMARY_BYTES,
+            "[... DIFF STAT TRUNCATED ...]",
+        )
+        status_text = self._truncate_utf8(
+            status_text,
+            _EARLIER_ATTEMPT_SUMMARY_BYTES,
+            "[... STATUS TRUNCATED ...]",
+        )
+        return (
+            "[... UNCOMMITTED DIFF OMITTED: exceeded bounded evidence limit; "
+            "stat/status summary follows ...]\n"
+            f"git diff --stat HEAD:\n{stat_text or '(no tracked diff stat)'}\n"
+            f"git status --short:\n{status_text or '(clean)'}"
+        )
+
+    def _uncommitted_diff(self, worktree: Path) -> str:
+        if not worktree.is_dir():
+            return "(prior attempt worktree is unavailable)"
+        tracked, tracked_truncated, tracked_code = self._bounded_command_output(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--binary",
+                "HEAD",
+                "--",
+                ".",
+            ],
+            worktree,
+            _EARLIER_ATTEMPT_DIFF_BYTES,
+        )
+        if tracked_truncated:
+            return self._diff_summary(worktree)
+        if tracked_code != 0:
+            return f"(uncommitted diff unavailable: git exited {tracked_code})"
+
+        untracked, names_truncated, names_code = self._bounded_command_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            worktree,
+            _EARLIER_ATTEMPT_DIFF_BYTES,
+        )
+        if names_truncated:
+            return self._diff_summary(worktree)
+        if names_code != 0:
+            return f"(uncommitted diff unavailable: git exited {names_code})"
+
+        combined = bytearray(tracked)
+        for raw_name in untracked.split(b"\0"):
+            if not raw_name:
+                continue
+            separator = b"\n" if combined and not combined.endswith(b"\n") else b""
+            remaining = (
+                _EARLIER_ATTEMPT_DIFF_BYTES - len(combined) - len(separator)
+            )
+            if remaining <= 0:
+                return self._diff_summary(worktree)
+            name = os.fsdecode(raw_name)
+            patch, patch_truncated, patch_code = self._bounded_command_output(
+                [
+                    "git",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--binary",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    name,
+                ],
+                worktree,
+                remaining,
+            )
+            if patch_truncated or patch_code not in (0, 1):
+                return self._diff_summary(worktree)
+            if patch:
+                combined.extend(separator)
+                combined.extend(patch)
+        if not combined:
+            return "(clean; no uncommitted diff)"
+        decoded = combined.decode("utf-8", errors="replace").rstrip()
+        if len(decoded.encode("utf-8")) > _EARLIER_ATTEMPT_DIFF_BYTES:
+            return self._diff_summary(worktree)
+        return decoded
+
+    def _attempt_death_reason(self, frame: FrameProjection) -> str:
+        with self.journal.projection_transaction() as projection:
+            reaped = [
+                event
+                for event in projection.effective_events
+                if isinstance(event, WorkerReaped)
+                and event.frame_id == frame.frame_id
+                and event.attempt == frame.attempt
+            ]
+        if not reaped:
+            return "crash (no worker_reaped cause was recorded)"
+        raw_reason = self._truncate_utf8(
+            reaped[-1].reason.replace("\r", " ").replace("\n", " "),
+            _EARLIER_ATTEMPT_REASON_BYTES,
+            "[... REASON TRUNCATED ...]",
+        )
+        lowered = raw_reason.lower()
+        if "timeout" in lowered:
+            category = "timeout"
+        elif raw_reason.startswith("signal:"):
+            category = "operator reset/stop"
+        elif raw_reason == "engine_resume_sweep" or raw_reason.startswith("fatal:"):
+            category = "crash"
+        else:
+            category = "worker_reaped"
+        return f"{category} (worker_reaped reason={raw_reason})"
+
+    def _earlier_attempt_block(self, frame: FrameProjection) -> str:
+        stdout_name, stdout_tail = self._attempt_log_tail(frame, "stdout")
+        stderr_name, stderr_tail = self._attempt_log_tail(frame, "stderr")
+        dirty_diff = self._uncommitted_diff(Path(frame.worktree))
+        block = (
+            "--- EARLIER ATTEMPT ---\n"
+            f"This is relaunch attempt {frame.push_count + 1} for frame "
+            f"{frame.frame_id}.\n"
+            f"Earlier attempt {frame.attempt + 1} died: "
+            f"{self._attempt_death_reason(frame)}.\n"
+            "Use this bounded evidence to continue rather than re-deriving prior "
+            "work. Logs are tails, not complete transcripts.\n\n"
+            f"--- PRIOR STDOUT ({stdout_name}) ---\n{stdout_tail}\n\n"
+            f"--- PRIOR STDERR ({stderr_name}) ---\n{stderr_tail}\n\n"
+            f"--- UNCOMMITTED WORKTREE DIFF ---\n{dirty_diff}\n"
+            "--- END EARLIER ATTEMPT ---"
+        )
+        return self._truncate_utf8(
+            block,
+            _EARLIER_ATTEMPT_BLOCK_BYTES,
+            "[... EARLIER ATTEMPT BLOCK TRUNCATED ...]",
+        )
+
     def _launch_frame(
         self,
         *,
@@ -1229,9 +1527,11 @@ class Engine:
             if existing is not None and existing.outcome is None:
                 self._guard_frame_relaunch(projection, existing)
             resume = existing is not None
+        earlier_attempt: str | None = None
         if existing is not None:
             # A same-process replay must settle the old call frontier before
-            # stale-owner cleanup can touch its worktree.
+            # stale-owner cleanup can touch its worktree. Capture its surviving
+            # evidence after that join, but before force-removing the stale owner.
             try:
                 self._join_frame_calls(frame_id)
             except FrameCallJoinTimeoutError as exc:
@@ -1247,6 +1547,7 @@ class Engine:
                 return self.journal.projection.frame(frame_id)
             with self._call_condition:
                 self._terminating_frames.discard(frame_id)
+            earlier_attempt = self._earlier_attempt_block(existing)
         with self._workspace_lock:
             worktree = self.repository.create_frame_worktree(
                 frame_id, branch, base_commit, resume=resume
@@ -1329,7 +1630,13 @@ class Engine:
                     worker=worker,
                 )
                 result = self.registry.resolve(rig).run(
-                    self._frame_prompt(frame_id, prompt, skills, worktree.path),
+                    self._frame_prompt(
+                        frame_id,
+                        prompt,
+                        skills,
+                        worktree.path,
+                        earlier_attempt=earlier_attempt,
+                    ),
                     worktree.path,
                     runtime,
                 )
@@ -1402,6 +1709,8 @@ class Engine:
         original: str,
         assigned_skills: list[str],
         worktree: Path,
+        *,
+        earlier_attempt: str | None = None,
     ) -> str:
         skills = self.skill_library.resolve(assigned_skills)
         with self.journal.projection_transaction() as projection:
@@ -1466,6 +1775,8 @@ class Engine:
                 "and content, the engine returns its memoized result.\n"
                 f"RESUME_DIGEST={json.dumps(digest, sort_keys=True, separators=(',', ':'))}\n"
             )
+        if earlier_attempt is not None:
+            preamble += f"\n{earlier_attempt}"
         sections = [skill.text for skill in skills]
         sections.extend([
             f"--- FRAME JOB ---\n{original}",

@@ -147,6 +147,9 @@ def test_relaunch_prompt_includes_prior_log_tails_dirty_diff_and_reap_reason(
         encoding="utf-8",
     )
     (interrupted / "base.txt").write_text("unfinished evidence\n", encoding="utf-8")
+    (interrupted / "new-evidence.txt").write_text(
+        "untracked finding\n", encoding="utf-8"
+    )
 
     resumed = Engine(
         run_dir,
@@ -175,6 +178,8 @@ def test_relaunch_prompt_includes_prior_log_tails_dirty_diff_and_reap_reason(
     assert "--- UNCOMMITTED WORKTREE DIFF ---" in prompt
     assert "-base" in prompt
     assert "+unfinished evidence" in prompt
+    assert "new-evidence.txt" in prompt
+    assert "+untracked finding" in prompt
     assert prompt.endswith("--- END EARLIER ATTEMPT ---")
 
 
