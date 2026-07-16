@@ -2203,3 +2203,45 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      Exact refetch of the refused index returns its durable reason, exit reconciliation
      does not mislabel it `worker_stopped_without_return`, and resume exposes the refusal
      in its digest while replaying a later successful retry normally.
+
+### Hand-48 calls — per-task rigs, safe commits, terminal stops, and attempt clocks
+
+173. **The dispatching frame chooses a rig for each task; kinds have no routing power
+     (supersedes 162).** `rig` is durably preserved as either one registry key for the
+     whole call or an array parallel to `tasks`; null entries and omission inherit the
+     calling frame's own rig. Mixed arrays therefore express cheap fan-out and senior
+     judgment in one parallel call without configuration guessing from labels. `kinds`
+     remain optional free-text semantic labels in the request, replay digest, and
+     dashboard. An unknown selected/inherited rig is a durable pre-effect
+     `call_refused` naming registry keys in operator order. The removed top-level
+     `rigs.yaml` `kinds:` surface fails with the explicit migration message rather than
+     being ignored.
+
+174. **Engine-owned frame commits and integration reject new out-of-tree symlinks.**
+     Before exit auto-commit, Git-visible untracked, staged, and modified symlinks are
+     compared with the frame's current HEAD. A symlink not already tracked as mode
+     120000 is skipped when its live absolute or relative target resolves outside the
+     frame worktree; all other changes commit, and `frame_commit_warning` durably names
+     the leftovers before `frame_exited`. Existing tracked symlinks are untouched. The
+     integration boundary also inspects a directly crafted source commit tree and
+     refuses new absolute/relative escapes before `frame_integrating` or any target-ref
+     move, covering pre-guard history without weakening normal auto-commit.
+
+175. **Every abnormal engine shutdown ends with one terminal interruption fact.**
+     SIGINT/SIGTERM and escaping fatal exceptions synchronously cancel calls, stop the
+     slot scheduler, reap worker sessions, close active slot intervals, and only then
+     append `run_interrupted` with the signal name or bounded exception summary. That
+     event is the final write of the lifecycle; repeated stop signals cannot interrupt
+     the sweep. It is a resumable terminal marker, not a replay barrier: the next event
+     clears the projected interruption, and ordinary completion still ends in
+     `run_finished`. The dashboard renders an explicit interrupted terminal state while
+     pre-field journals that merely stop remain running by design.
+
+176. **Self-time budgets reset at every frame attempt (supersedes 164).** Each first
+     launch, crash relaunch, and parent-requested `retry_frame` starts with the selected
+     rig's full `timeout_s`; parking and reacquisition within that attempt still share
+     one clock. Every `frame_slot_released` already carries an attempt number, so replay
+     now folds both aggregate frame self-time and a per-attempt map, and launch consults
+     only the current attempt's total. A timed-out attempt remains durable evidence and
+     spend, but can no longer make the next attempt fail immediately with its inherited
+     exhaustion.

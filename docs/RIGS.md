@@ -15,9 +15,10 @@ unbounded by Wildflows. `rigs.yaml` supports:
   `log_dir`, with optional positive `timeout_s` (default 900), `env`, and
   `busy_patterns`.
 
-`timeout_s` is the per-frame self-time budget. It advances only while the frame is
-thinking. Dispatch and ask park the frame; gate execution pauses only its self-time
-clock while retaining its active slot lease because the resident worker remains alive.
+`timeout_s` is the per-attempt self-time budget. Every first launch, crash relaunch, and
+parent-requested retry starts with the rig's full budget. It advances only while that
+attempt is thinking. Dispatch and ask park the frame; gate execution pauses only its
+self-time clock while retaining its active slot lease because the resident worker remains alive.
 Gate waits are bounded only when that rig sets `gate_timeout_s`; timeout returns exit 124
 and a clear stderr marker. The engine reaps a worker that exhausts self-time. Adapter
 commands receive a `3 × timeout_s` crash backstop rather than the authoritative budget;
@@ -104,13 +105,22 @@ replacement worktree provisions that new checkout once.
 supply any repository-appropriate bound inside the command when needed. Link paths may
 not be absolute, escape with `..`, name `.git`, or repeat.
 
+At successful frame exit, the engine's auto-commit leaves every new symlink whose live
+target resolves outside that frame worktree untracked and emits `frame_commit_warning`
+with the skipped paths; ordinary changes still commit. Symlinks already tracked at the
+frame base are unchanged by this policy. Integration independently refuses a directly
+crafted commit range containing such a new absolute or relative-escape symlink, closing
+the boundary for history produced before the auto-commit guard.
+
 ## Example YAML
 
 The top level requires `rigs` and may also set one nonblank, single-line `notify`
-command, a `kinds` mapping from free-text task kind to a declared rig, and the repository
-`worktree` section above. A dispatch's
-explicit `rig` wins; otherwise every task needs a kind with a configured default. No
-kind mapping is supplied by Wildflows. `--notify` overrides the YAML notify value. After
+command and the repository `worktree` section above. A dispatch chooses its rig per
+call: one string applies to every task, or an array supplies one string/null entry per
+task. Omission and null entries inherit the caller's rig. `kinds` remain optional
+per-task semantic labels with no routing power. The removed top-level `kinds:` mapping
+fails validation with migration guidance rather than being ignored. `--notify` overrides
+the YAML notify value. After
 each newly journalled owner ask, the engine attempts to launch the command detached from
 the repository root, appending
 the question, frame id, and run id as arguments and setting `WILDFLOWS_QUESTION`,
@@ -123,9 +133,6 @@ worktree:
   setup: python3 -m project_bootstrap --worktree
   link:
     - .cache/dependencies
-kinds:
-  implement: local
-  review: local
 rigs:
   senior:
     kind: script
@@ -143,6 +150,7 @@ rigs:
     slots: 2
 ```
 
-Relative script/log paths resolve from the YAML file. Every dispatch rig name must be in
-this registry; the registry is the per-run allowlist. Rig names are the keys (`senior`,
+Relative script/log paths resolve from the YAML file. Every explicitly selected dispatch
+rig name must be in this registry; the registry is the per-run allowlist. Rig names are
+the keys (`senior`,
 `local` above), not adapter script filenames such as `worker-local.sh`.

@@ -15,8 +15,9 @@ tool surface has only three tools, exposed by the reference Pi shim with
 
 - **`wildflows_dispatch(tasks?, rig?, parallel?, skills?, kinds?, retry_frame?)`**
   (`dispatch` over MCP) pushes child frames, then returns their reports and integrated
-  commits. `kinds` is an optional free-text hint per task; configured kind defaults can
-  supply omitted rigs. A failed result carries its branch/head/diffstat, and
+  commits. `rig` is either one name for every task or a parallel array; omission and
+  null array entries inherit the caller's rig. `kinds` is an optional journalled
+  semantic label per task and has no routing power. A failed result carries its branch/head/diffstat, and
   `retry_frame` alone relaunches that failed direct child on the same branch;
 - **`wildflows_gate(cmd)`** (`gate`) runs a deterministic check in the caller's
   worktree and returns the exit code plus complete stdout and stderr;
@@ -76,10 +77,6 @@ rigs:
     log_dir: /tmp/wildflows/worker
     timeout_s: 900
     slots: 2
-# Optional defaults used only when a dispatch omits its explicit rig:
-kinds:
-  implement: worker
-  review: worker
 EOF
 
 python3 -m wildflows run job.md \
@@ -110,8 +107,9 @@ The durable frame/call history is an append-only stream of fsynced v2 records at
 `run_opened`, `frame_pushed`, `frame_slot_queued`, `frame_slot_acquired`,
 `frame_slot_released`, `worktree_provisioned`, `dispatch_called`, `dispatch_returned`, `gate_called`,
 `gate_returned`, `asked`, `answered`, `call_refused`, `call_failed`, `worker_reaped`,
-`frame_relaunch_blocked`, `frame_exited`, `frame_integrating`, `frame_integrated`,
-`frame_popped`, and `run_finished`. `frame_relaunch_blocked` parks replay when a live frame branch has
+`frame_relaunch_blocked`, `frame_commit_warning`, `frame_exited`, `frame_integrating`,
+`frame_integrated`, `frame_popped`, `run_interrupted`, and `run_finished`.
+`frame_relaunch_blocked` parks replay when a live frame branch has
 advanced beyond the journal-explained tip. Frame ids are structural breadcrumbs. This
 is the opening of the committed dashboard fixture, rendered in the same breadcrumb
 style as the console:
@@ -156,8 +154,9 @@ python3 -m wildflows dash --repo /path/to/clean-git-target
 
 Port **8181** is the default (`--port` overrides it). The local FastAPI/Uvicorn server
 tails complete journal records over SSE; the static console renders running leaves,
-banked callers, auto-collapsed completed frames, queued fan-out, gates, failures, and
-parked asks on a pannable, two-axis canvas with pointer-centered zoom and fit-to-width.
+banked callers, auto-collapsed completed frames, queued fan-out, gates, failures,
+interrupted runs, and parked asks on a pannable, two-axis canvas with pointer-centered
+zoom and fit-to-width.
 Frame color follows its own exit; failed direct children become count chips instead of
 repainting a successful parent. The only mutation is a token-guarded answer to a pending
 owner question.

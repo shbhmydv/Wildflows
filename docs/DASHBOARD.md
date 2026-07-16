@@ -11,8 +11,11 @@ collapses when the run completes. An in-flight caller is **banked**, and only a 
 leaf breathes. A pushed frame waiting for configured rig capacity is **queued**; its
 `frame_slot_queued` event, later lane acquisition, release reason, and accumulated
 self-time are visible in the journal/detail projection. Dispatch headings and journal
-rows show any per-task kind hints. Frame state follows the frame's own exit: an ok frame with failed direct
-children remains **done** and shows an `N failed children` chip.
+rows show any per-task semantic kind labels; they do not imply routing. A terminal
+`run_interrupted` is shown as **interrupted**, not as a live spinner, while legacy
+journals that simply stop retain the existing running display. Frame state follows the
+frame's own exit: an ok frame with failed direct children remains **done** and shows an
+`N failed children` chip.
 
 The call stack keeps its natural intrinsic width on an unbounded surface. Parallel
 siblings never shrink below 280px at 100% and never wrap; the canvas pane scrolls in
