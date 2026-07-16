@@ -2032,3 +2032,37 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      not relaxed: a tip with neither a call-boundary observation nor that integration
      ancestry remains unexplained and blocked. This keeps guard and receipt verification
      consistent without adding a second frame-commit vocabulary.
+
+### Hand-42 calls — engine-owned worker shutdown
+
+157. **Engine shutdown reaps adapter sessions before propagating stop or crash
+     (closes the critical worker-tree leak).** Every frame attempt receives an
+     engine-owned `runtime/<frame>/attempt-<n>/worker.handle`; `_capture` already
+     launches the adapter with `start_new_session=True` and now records PID, PGID,
+     and SID in a versioned JSON handle before waiting. The reader explicitly accepts
+     the former one-integer PGID file as a v1 session-leader record. SIGINT and SIGTERM
+     are converted at the `Engine.run` boundary into synchronous shutdown, and every
+     other escaping `BaseException` uses that same path before propagation. Shutdown
+     cancels live calls, SIGTERMs both the recorded process group and every non-zombie
+     `/proc` member of its session, waits 250ms, then SIGKILLs survivors and verifies
+     the session is empty. Session enumeration catches reparented descendants and
+     descendants that created another process group; only a deliberate nested `setsid`
+     can leave the adapter's containment boundary. Every handle for which a signal was
+     sent appends one `worker_reaped` fact with frame, attempt, PID/PGID/SID, reason,
+     and whether SIGKILL escalation was required. Construction also sweeps handles for
+     outcome-less attempts before replay. Reaping remains kill-only and never mutates
+     Git; the existing parent-death watchdog is retained as SIGKILL-crash backstop and
+     now closes inherited launch descriptors before waiting.
+
+158. **A frame-call join timeout fails its call and frame, never the engine
+     (closes the high-severity join crash).** The existing five-second natural-return
+     and cooperative-cancellation join remains the first bound. If calls are still
+     active, the engine reaps worker sessions for the caller frame and its durable
+     descendants, then retries the closed MCP frontier with 100ms, 250ms, and 500ms
+     backoffs. Exhaustion appends one typed `call_failed` result with
+     `frame_call_join_timeout` for each still-active validated call, converts the
+     adapter result to a failed `frame_exited`, and continues normal pop/run-finish
+     bookkeeping. Late workers cannot append a tool-specific return over an already
+     completed call. `FrameCallJoinTimeoutError` remains only the typed internal
+     escalation between join and frame terminalization; `Run` no longer special-cases
+     it or retains the lifecycle lock.

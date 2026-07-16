@@ -24,7 +24,12 @@ worktree="$(cd "$worktree" && pwd)"
 mkdir -p "$log_dir" "$(dirname "$handle_out")"
 log_dir="$(cd "$log_dir" && pwd)"
 handle_out="$(cd "$(dirname "$handle_out")" && pwd)/$(basename "$handle_out")"
-echo "$(ps -o pgid= -p $$ | tr -d '[:space:]')" > "$handle_out"
+if [[ ! -s "$handle_out" ]]; then
+  pgid="$(ps -o pgid= -p $$ | tr -d '[:space:]')"
+  session_id="$(ps -o sid= -p $$ | tr -d '[:space:]')"
+  printf '{"version":2,"pid":%d,"process_group_id":%d,"session_id":%d}\n' \
+    "$$" "$pgid" "$session_id" > "$handle_out"
+fi
 export GIT_CEILING_DIRECTORIES="$(dirname "$worktree")"
 
 provider="${GRINDSTONE_SENIOR_PROVIDER:-}"

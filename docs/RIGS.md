@@ -22,9 +22,10 @@ The script contract remains:
 The engine additionally supplies `WILDFLOWS_MCP_URL`, `WILDFLOWS_RUN_TOKEN`,
 `WILDFLOWS_FRAME_ID`, `WILDFLOWS_PI_EXTENSION`, and
 `WILDFLOWS_NEXT_CALL_INDEX` in the process environment. Runtime files and the generated
-Pi extension are under the run directory, never the gated worktree. The engine owns the
-outer process-group timeout, captures both streams, and classifies rate/quota signatures
-as `busy`.
+Pi extension are under the run directory, never the gated worktree. The engine launches every adapter as a session leader, owns its durable runtime handle,
+captures both streams, and classifies rate/quota signatures as `busy`. Shutdown sends
+SIGTERM to the recorded process group and every member of its session, waits a bounded
+grace period, then SIGKILLs survivors.
 
 ## Bundled adapters
 
@@ -38,9 +39,11 @@ as `busy`.
   `medium` effort; `GRINDSTONE_SENIOR_PROVIDER` is an explicit operator pin, and
   the model/effort overrides match `worker-picodex.sh`.
 
-Both scripts keep prompts out of argv, write their process-group id to `--handle-out`,
-set a Git ceiling, return final text on stdout, diagnostics on stderr, and propagate the
-transport exit status.
+Both scripts keep prompts out of argv and preserve the `--handle-out` contract. Handles
+are now JSON records containing the adapter PID, process-group ID, and session ID; the
+engine reader also accepts legacy one-integer PGID handles. The scripts set a Git ceiling,
+return final text on stdout, diagnostics on stderr, and propagate the transport exit
+status.
 
 ## Local GPU pool
 

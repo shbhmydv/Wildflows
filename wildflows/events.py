@@ -121,6 +121,19 @@ class CallFailed(_Header):
     result: ToolFailure
 
 
+class WorkerReaped(_Header):
+    """One engine-owned rig process tree was signalled and confirmed stopped."""
+
+    kind: Literal["worker_reaped"] = "worker_reaped"
+    frame_id: str
+    attempt: int
+    pid: int
+    process_group_id: int
+    session_id: int
+    reason: str
+    escalated: bool
+
+
 class FrameRelaunchBlocked(_Header):
     """Durable fail-closed diagnosis for an outcome-less advanced frame branch."""
 
@@ -189,6 +202,7 @@ Event: TypeAlias = Annotated[
     | Asked
     | Answered
     | CallFailed
+    | WorkerReaped
     | FrameRelaunchBlocked
     | FrameExited
     | FrameIntegrating

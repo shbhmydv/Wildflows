@@ -1,14 +1,18 @@
 """Standalone v2 frame supervisor and the three engine tool implementations."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
+import signal
 import subprocess as _subprocess
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 from typing import cast
 
 from wildflows.admission import AdmissionError, AdmissionPolicy, admit_dispatch
@@ -28,6 +32,7 @@ from wildflows.events import (
     GateReturned,
     RunFinished,
     RunOpened,
+    WorkerReaped,
 )
 from wildflows.frame import (
     AskRequest,
@@ -44,13 +49,14 @@ from wildflows.frame import (
     ToolName,
     ToolRequest,
     ToolResponse,
+    WorkerLease,
     call_hash,
 )
 from wildflows.journal import Journal
 from wildflows.mcp import MCPServer, ToolProtocolError, ValidatedToolCall
 from wildflows.projection import FrameProjection, RunProjection
 from wildflows.result import CommitReceipt
-from wildflows.rig import RigRegistry, run_shell
+from wildflows.rig import RigRegistry, WorkerReap, WorkerSupervisor, run_shell
 from wildflows.shim import write_pi_shim
 from wildflows.skill import SkillLibrary, SkillLibraryError
 from wildflows.workspace import (
@@ -85,6 +91,12 @@ class FrameCallJoinTimeoutError(RuntimeError):
     """A frame's effectful MCP worker did not acknowledge cancellation."""
 
 
+class _EngineSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(signal.Signals(signum).name)
+
+
 class FrameRelaunchBlockedError(RuntimeError):
     """An outcome-less frame branch contains effects the journal cannot explain."""
 
@@ -102,6 +114,9 @@ class FrameRelaunchBlockedError(RuntimeError):
 
 FRAME_CALL_JOIN_TIMEOUT_S = 5.0
 """Maximum natural-return plus confirmed-cancellation wait at frame exit."""
+
+FRAME_CALL_JOIN_RETRY_BACKOFF_S = (0.1, 0.25, 0.5)
+"""Bounded waits after process-tree reaping before a call is failed durably."""
 
 
 @dataclass(frozen=True)
@@ -222,11 +237,47 @@ class Engine:
             self._verify_integrations()
         self.skill_library = SkillLibrary(self.repository.root)
         self._restore_dispatch_reservations()
+        self._workers = WorkerSupervisor(self._record_worker_reap)
+        self._sweep_outstanding_worker_handles()
         self.server = MCPServer(self)
 
     @property
     def projection(self) -> RunProjection:
         return self.journal.projection
+
+    def _record_worker_reap(self, reaped: WorkerReap) -> None:
+        self.journal.append(WorkerReaped(
+            run_id=self.run_id,
+            frame_id=reaped.frame_id,
+            attempt=reaped.attempt,
+            pid=reaped.pid,
+            process_group_id=reaped.process_group_id,
+            session_id=reaped.session_id,
+            reason=reaped.reason,
+            escalated=reaped.escalated,
+        ))
+
+    def _sweep_outstanding_worker_handles(self) -> None:
+        reaped_attempts = {
+            (event.frame_id, event.attempt)
+            for event in self.journal.projection.effective_events
+            if isinstance(event, WorkerReaped)
+        }
+        for frame in self.journal.projection.frames.values():
+            key = (frame.frame_id, frame.attempt)
+            if frame.outcome is not None or key in reaped_attempts:
+                continue
+            handle_path = (
+                self.run_dir / "runtime" / frame.frame_id
+                / f"attempt-{frame.attempt}" / "worker.handle"
+            )
+            if handle_path.is_file():
+                self._workers.adopt_and_reap(
+                    frame.frame_id,
+                    frame.attempt,
+                    handle_path,
+                    "engine_resume_sweep",
+                )
 
     def _sweep_integration_refs(self) -> None:
         with self.journal.projection_transaction() as projection:
@@ -262,7 +313,62 @@ class Engine:
                         f"integrated frame {frame.frame_id!r} is absent from its target branch"
                     )
 
+    @contextmanager
+    def _signal_shutdown(self) -> Iterator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        watched = (signal.SIGINT, signal.SIGTERM)
+        previous = {item: signal.getsignal(item) for item in watched}
+
+        def raise_signal(signum: int, frame: FrameType | None) -> None:
+            del frame
+            raise _EngineSignal(signum)
+
+        try:
+            for item in watched:
+                signal.signal(item, raise_signal)
+            yield
+        finally:
+            for item, handler in previous.items():
+                signal.signal(item, handler)
+
+    def shutdown(self, reason: str) -> None:
+        """Cancel live calls and synchronously reap every owned rig session."""
+        with self._active_lock:
+            frame_ids = set(self._active)
+        with self._call_condition:
+            frame_ids.update(owner for owner, _ in self._inflight_calls)
+        for frame_id in frame_ids:
+            self._cancel_frame_calls(frame_id)
+        self._workers.shutdown(reason)
+
+    def _shutdown_preserving(self, reason: str, original: BaseException) -> None:
+        try:
+            self.shutdown(reason)
+        except BaseException as cleanup_error:
+            original.add_note(f"worker shutdown also failed: {cleanup_error!r}")
+
     def run(self) -> FrameResult:
+        """Drive the root stack with fatal and signal-safe worker shutdown."""
+        with self._signal_shutdown():
+            try:
+                return self._drive_root()
+            except _EngineSignal as exc:
+                caught = signal.Signals(exc.signum)
+                self._shutdown_preserving(f"signal:{caught.name}", exc)
+                if caught == signal.SIGINT:
+                    interrupted = KeyboardInterrupt()
+                    interrupted.__notes__ = list(getattr(exc, "__notes__", ()))
+                    raise interrupted from None
+                stopped = SystemExit(128 + exc.signum)
+                stopped.__notes__ = list(getattr(exc, "__notes__", ()))
+                raise stopped from None
+            except BaseException as exc:
+                self._shutdown_preserving(f"fatal:{type(exc).__name__}", exc)
+                raise
+
+    def _drive_root(self) -> FrameResult:
         """Start or replay the root stack and return its terminal frame result."""
         finished = self.journal.projection.finished
         if finished is not None:
@@ -424,8 +530,13 @@ class Engine:
         with self._answer_condition:
             self._answer_condition.notify_all()
 
-    def _durabilize_stopped_calls(
-        self, frame_id: str, calls: tuple[ValidatedToolCall, ...]
+    def _durabilize_failed_calls(
+        self,
+        frame_id: str,
+        calls: tuple[ValidatedToolCall, ...],
+        *,
+        error_code: str,
+        message: str,
     ) -> None:
         unique: dict[tuple[int, str], ValidatedToolCall] = {}
         for call in calls:
@@ -449,14 +560,21 @@ class Engine:
                     call_hash=digest,
                     tool=call.tool,
                     request=call.request,
-                    result=ToolFailure(
-                        error_code="worker_stopped_without_return",
-                        message=(
-                            "validated MCP worker stopped without a durable "
-                            "tool-specific return"
-                        ),
-                    ),
+                    result=ToolFailure(error_code=error_code, message=message),
                 ))
+
+    def _durabilize_stopped_calls(
+        self, frame_id: str, calls: tuple[ValidatedToolCall, ...]
+    ) -> None:
+        self._durabilize_failed_calls(
+            frame_id,
+            calls,
+            error_code="worker_stopped_without_return",
+            message=(
+                "validated MCP worker stopped without a durable "
+                "tool-specific return"
+            ),
+        )
 
     def _join_frame_calls(self, frame_id: str) -> None:
         started = time.monotonic()
@@ -469,6 +587,26 @@ class Engine:
             )
             joined = self.server.join_frame(frame_id, remaining)
         if joined.active:
+            with self.journal.projection_transaction() as projection:
+                frame_ids = {frame_id}
+                frame_ids.update(
+                    frame.frame_id for frame in projection.descendants(frame_id)
+                )
+            self._workers.reap_frames(frame_ids, "frame_call_join_timeout")
+            for backoff in FRAME_CALL_JOIN_RETRY_BACKOFF_S:
+                joined = self.server.join_frame(frame_id, backoff)
+                if not joined.active:
+                    break
+        if joined.active:
+            self._durabilize_failed_calls(
+                frame_id,
+                joined.active,
+                error_code="frame_call_join_timeout",
+                message=(
+                    "validated MCP worker did not confirm execution stop after "
+                    "process-tree reaping and join retries"
+                ),
+            )
             identities = ", ".join(
                 f"{call.frame_id}:{call.call_index}" for call in joined.active
             )
@@ -485,6 +623,15 @@ class Engine:
                 return self._active[frame_id]
             except KeyError as exc:
                 raise FrameNotActiveError(f"frame {frame_id!r} is not active") from exc
+
+    def _append_tool_return(
+        self, event: DispatchReturned | GateReturned | Answered
+    ) -> None:
+        with self.journal.projection_transaction() as projection:
+            call = projection.call(event.frame_id, event.call_index)
+            if call is not None and call.completed:
+                return
+            self.journal.append(event)
 
     def _dispatch(
         self,
@@ -524,7 +671,7 @@ class Engine:
                     error_code=exc.code,
                     message=str(exc),
                 )
-                self.journal.append(DispatchReturned(
+                self._append_tool_return(DispatchReturned(
                     run_id=self.run_id,
                     frame_id=frame.frame_id,
                     call_index=call_index,
@@ -539,7 +686,7 @@ class Engine:
         except SkillLibraryError as exc:
             self._clear_dispatch_reservation(frame.frame_id, call_index)
             failed = DispatchResult(outcome="failed", message=str(exc))
-            self.journal.append(DispatchReturned(
+            self._append_tool_return(DispatchReturned(
                 run_id=self.run_id,
                 frame_id=frame.frame_id,
                 call_index=call_index,
@@ -560,7 +707,7 @@ class Engine:
             "ok" if all(result.outcome == "ok" for result in results) else "failed"
         )
         returned = DispatchResult(outcome=outcome, children=results)
-        self.journal.append(DispatchReturned(
+        self._append_tool_return(DispatchReturned(
             run_id=self.run_id,
             frame_id=frame.frame_id,
             call_index=call_index,
@@ -1083,9 +1230,21 @@ class Engine:
                 self._guard_frame_relaunch(projection, existing)
             resume = existing is not None
         if existing is not None:
-            # A same-process retry after a bounded join timeout must rejoin the
-            # old attempt before stale-owner cleanup can touch its worktree.
-            self._join_frame_calls(frame_id)
+            # A same-process replay must settle the old call frontier before
+            # stale-owner cleanup can touch its worktree.
+            try:
+                self._join_frame_calls(frame_id)
+            except FrameCallJoinTimeoutError as exc:
+                self.journal.append(FrameExited(
+                    run_id=self.run_id,
+                    frame_id=frame_id,
+                    attempt=existing.attempt,
+                    outcome="failed",
+                    text=f"frame call join failed after retries: {exc}",
+                    stderr=str(exc),
+                    head=self.repository.branch_tip(branch),
+                ))
+                return self.journal.projection.frame(frame_id)
             with self._call_condition:
                 self._terminating_frames.discard(frame_id)
         with self._workspace_lock:
@@ -1125,6 +1284,7 @@ class Engine:
             self._active[frame_id] = worktree
         capability = self.server.register_frame(frame_id)
         terminalized = False
+        worker: WorkerLease | None = None
         try:
             try:
                 if start_barrier is not None:
@@ -1155,6 +1315,9 @@ class Engine:
                     next_call_index,
                     replay_calls,
                 )
+                worker = self._workers.prepare(
+                    frame_id, attempt, runtime_dir / "worker.handle"
+                )
                 runtime = FrameRuntime(
                     endpoint=self.server.endpoint,
                     token=capability,
@@ -1163,13 +1326,17 @@ class Engine:
                     runtime_dir=runtime_dir,
                     next_call_index=next_call_index,
                     cancellation=cancellation,
+                    worker=worker,
                 )
                 result = self.registry.resolve(rig).run(
                     self._frame_prompt(frame_id, prompt, skills, worktree.path),
                     worktree.path,
                     runtime,
                 )
+                worker.finished()
             except Exception as exc:
+                if worker is not None:
+                    worker.stop("rig_exception")
                 result = FrameResult(
                     outcome="failed",
                     text=f"frame rig failed: {exc}",
@@ -1177,8 +1344,18 @@ class Engine:
                 )
 
             # MCP validation transfers lifetime ownership to the engine. No frame
-            # effect below may race a detached worker from this attempt.
-            self._join_frame_calls(frame_id)
+            # effect below may race a detached worker from this attempt. Exhausting
+            # the retried join is terminal only for this call and frame.
+            try:
+                self._join_frame_calls(frame_id)
+            except FrameCallJoinTimeoutError as exc:
+                result = FrameResult(
+                    outcome="failed",
+                    text=f"frame call join failed after retries: {exc}",
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=str(exc),
+                )
             self._raise_active_relaunch_block()
             if result.outcome == "ok":
                 try:
@@ -1445,7 +1622,7 @@ class Engine:
                     stdout=result.stdout,
                     stderr=result.stderr,
                 )
-        self.journal.append(GateReturned(
+        self._append_tool_return(GateReturned(
             run_id=self.run_id,
             frame_id=frame.frame_id,
             call_index=call_index,
@@ -1496,7 +1673,7 @@ class Engine:
             ))
             return failure
         answer = answer_path.read_text(encoding="utf-8")
-        self.journal.append(Answered(
+        self._append_tool_return(Answered(
             run_id=self.run_id,
             frame_id=frame.frame_id,
             call_index=call_index,

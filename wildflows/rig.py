@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import re
 import shlex
@@ -14,11 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, TextIO, runtime_checkable
 
-from wildflows.frame import FrameOutcome, FrameResult, FrameRuntime
+from wildflows.frame import FrameOutcome, FrameResult, FrameRuntime, WorkerLease
 
 __all__ = [
     "DEFAULT_BUSY_PATTERNS",
     "ExternalResult",
+    "WorkerReap",
+    "WorkerSupervisor",
     "run_shell",
     "Rig",
     "EchoRig",
@@ -56,6 +59,15 @@ def _guarded_child(parent_pid: int) -> None:
     watchdog_pid = os.fork()
     if watchdog_pid != 0:
         return
+    # Popen waits for its exec-error pipe to close. The watchdog never execs,
+    # so it must drop every inherited descriptor or parent launch deadlocks.
+    for name in os.listdir("/proc/self/fd"):
+        descriptor = int(name)
+        if descriptor > 2:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     while os.getppid() == leader_pid:
         time.sleep(0.02)
     try:
@@ -86,11 +98,302 @@ class ExternalResult:
     cancelled: bool = False
 
 
-def _kill_group(process: subprocess.Popen[str]) -> None:
+@dataclass(frozen=True)
+class _WorkerProcess:
+    pid: int
+    process_group_id: int
+    session_id: int
+
+
+@dataclass(frozen=True)
+class WorkerReap:
+    """A signalled adapter session and the durable identity that owned it."""
+
+    frame_id: str
+    attempt: int
+    pid: int
+    process_group_id: int
+    session_id: int
+    reason: str
+    escalated: bool
+
+
+def _process_identity(pid: int) -> tuple[str, int, int] | None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    closing = raw.rfind(")")
+    if closing < 0:
+        return None
+    fields = raw[closing + 2:].split()
+    if len(fields) < 4:
+        return None
+    try:
+        return fields[0], int(fields[2]), int(fields[3])
+    except ValueError:
+        return None
+
+
+def _session_members(session_id: int) -> set[int]:
+    members: set[int] = set()
+    try:
+        entries = Path("/proc").iterdir()
+    except FileNotFoundError:
+        return members
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        identity = _process_identity(pid)
+        if identity is not None and identity[0] != "Z" and identity[2] == session_id:
+            members.add(pid)
+    return members
+
+
+def _signal_process_tree(record: _WorkerProcess, sig: signal.Signals) -> bool:
+    own_session = os.getsid(0)
+    if record.session_id <= 1 or record.session_id == own_session:
+        raise RuntimeError(
+            f"refusing to signal unsafe worker session {record.session_id}"
+        )
+    sent = False
+    try:
+        os.killpg(record.process_group_id, sig)
+        sent = True
     except ProcessLookupError:
         pass
+    for pid in _session_members(record.session_id):
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, sig)
+            sent = True
+        except ProcessLookupError:
+            pass
+    return sent
+
+
+def _wait_for_session_exit(session_id: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _session_members(session_id):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.02, remaining))
+    return True
+
+
+def _reap_process_tree(
+    record: _WorkerProcess, *, grace_s: float
+) -> tuple[bool, bool]:
+    term_sent = _signal_process_tree(record, signal.SIGTERM)
+    if not term_sent:
+        return False, False
+    if _wait_for_session_exit(record.session_id, grace_s):
+        return True, False
+    escalated = _signal_process_tree(record, signal.SIGKILL)
+    if not _wait_for_session_exit(record.session_id, 1.0):
+        # Repeat once for descendants forked during the first session snapshot.
+        _signal_process_tree(record, signal.SIGKILL)
+        if not _wait_for_session_exit(record.session_id, 1.0):
+            raise RuntimeError(
+                f"worker session {record.session_id} survived SIGKILL"
+            )
+    return True, escalated
+
+
+def _write_worker_handle(path: Path, record: _WorkerProcess) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    data = json.dumps({
+        "version": 2,
+        "pid": record.pid,
+        "process_group_id": record.process_group_id,
+        "session_id": record.session_id,
+    }, sort_keys=True)
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(data + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _read_worker_handle(path: Path) -> _WorkerProcess | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        # v1 adapters wrote one PGID. Their launch group was also their session
+        # leader, so treating that value as pid/pgid/sid preserves old handles.
+        try:
+            legacy = int(raw)
+        except ValueError:
+            return None
+        return _WorkerProcess(legacy, legacy, legacy)
+    if type(decoded) is int and decoded > 0:
+        return _WorkerProcess(decoded, decoded, decoded)
+    if not isinstance(decoded, dict):
+        return None
+    pid = decoded.get("pid")
+    process_group_id = decoded.get("process_group_id")
+    session_id = decoded.get("session_id")
+    if not all(type(value) is int and value > 0 for value in (
+        pid, process_group_id, session_id
+    )):
+        return None
+    assert isinstance(pid, int)
+    assert isinstance(process_group_id, int)
+    assert isinstance(session_id, int)
+    return _WorkerProcess(pid, process_group_id, session_id)
+
+
+class _SupervisorLease:
+    def __init__(
+        self,
+        supervisor: "WorkerSupervisor",
+        frame_id: str,
+        attempt: int,
+        handle_path: Path,
+    ) -> None:
+        self._supervisor = supervisor
+        self.frame_id = frame_id
+        self.attempt = attempt
+        self.handle_path = handle_path
+        self.record: _WorkerProcess | None = None
+        self.stop_reason: str | None = None
+
+    def started(self, pid: int, process_group_id: int, session_id: int) -> None:
+        self._supervisor._started(
+            self, _WorkerProcess(pid, process_group_id, session_id)
+        )
+
+    def stop(self, reason: str) -> None:
+        self._supervisor._stop(self, reason)
+
+    def finished(self) -> None:
+        self._supervisor._finished(self)
+
+
+class WorkerSupervisor:
+    """Engine-owned registry and synchronous reaper for rig adapter sessions."""
+
+    def __init__(
+        self,
+        on_reaped: Callable[[WorkerReap], None],
+        *,
+        grace_s: float = 0.25,
+    ) -> None:
+        self._on_reaped = on_reaped
+        self._grace_s = grace_s
+        self._lock = threading.RLock()
+        self._leases: dict[tuple[str, int], _SupervisorLease] = {}
+        self._shutdown_reason: str | None = None
+
+    def prepare(
+        self, frame_id: str, attempt: int, handle_path: Path
+    ) -> WorkerLease:
+        key = (frame_id, attempt)
+        with self._lock:
+            if key in self._leases:
+                raise RuntimeError(f"worker handle already active for {frame_id}:{attempt}")
+            lease = _SupervisorLease(self, frame_id, attempt, handle_path)
+            lease.stop_reason = self._shutdown_reason
+            self._leases[key] = lease
+            return lease
+
+    def adopt_and_reap(
+        self, frame_id: str, attempt: int, handle_path: Path, reason: str
+    ) -> None:
+        lease = self.prepare(frame_id, attempt, handle_path)
+        lease.stop(reason)
+
+    def _started(self, lease: _SupervisorLease, record: _WorkerProcess) -> None:
+        if record.pid <= 0 or record.process_group_id <= 0 or record.session_id <= 0:
+            raise ValueError("worker process identity must be positive")
+        _write_worker_handle(lease.handle_path, record)
+        with self._lock:
+            lease.record = record
+            reason = lease.stop_reason
+        if reason is not None:
+            self._stop(lease, reason)
+
+    def _record(self, lease: _SupervisorLease) -> _WorkerProcess | None:
+        return lease.record or _read_worker_handle(lease.handle_path)
+
+    def _stop(self, lease: _SupervisorLease, reason: str) -> None:
+        key = (lease.frame_id, lease.attempt)
+        with self._lock:
+            if key not in self._leases:
+                return
+            lease.stop_reason = reason
+            record = self._record(lease)
+            if record is None:
+                return
+            self._leases.pop(key, None)
+        self._reap(lease, record, reason)
+
+    def _finished(self, lease: _SupervisorLease) -> None:
+        key = (lease.frame_id, lease.attempt)
+        with self._lock:
+            if key not in self._leases:
+                return
+            record = self._record(lease)
+            self._leases.pop(key, None)
+        if record is not None:
+            self._reap(lease, record, "worker_exit_cleanup")
+
+    def _reap(
+        self, lease: _SupervisorLease, record: _WorkerProcess, reason: str
+    ) -> None:
+        signalled, escalated = _reap_process_tree(record, grace_s=self._grace_s)
+        if signalled:
+            self._on_reaped(WorkerReap(
+                frame_id=lease.frame_id,
+                attempt=lease.attempt,
+                pid=record.pid,
+                process_group_id=record.process_group_id,
+                session_id=record.session_id,
+                reason=reason,
+                escalated=escalated,
+            ))
+
+    @staticmethod
+    def _stop_all(leases: list[_SupervisorLease], reason: str) -> None:
+        first_error: BaseException | None = None
+        for lease in leases:
+            try:
+                lease.stop(reason)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise RuntimeError("one or more worker sessions could not be reaped") from first_error
+
+    def reap_frames(self, frame_ids: set[str], reason: str) -> None:
+        with self._lock:
+            leases = [
+                lease for lease in self._leases.values()
+                if lease.frame_id in frame_ids
+            ]
+        self._stop_all(leases, reason)
+
+    def shutdown(self, reason: str) -> None:
+        with self._lock:
+            if self._shutdown_reason is None:
+                self._shutdown_reason = reason
+            leases = list(self._leases.values())
+        self._stop_all(leases, reason)
+
+
+def _kill_unmanaged_process(process: subprocess.Popen[str]) -> None:
+    record = _WorkerProcess(process.pid, process.pid, process.pid)
+    _reap_process_tree(record, grace_s=0.25)
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
@@ -106,6 +409,7 @@ def _capture(
     shell: bool,
     env: dict[str, str] | None = None,
     cancellation: threading.Event | None = None,
+    worker: WorkerLease | None = None,
 ) -> ExternalResult:
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
@@ -123,6 +427,14 @@ def _capture(
             start_new_session=True,
             preexec_fn=(lambda: _guarded_child(parent_pid)) if _PRCTL else None,
         )
+        try:
+            process_group_id = os.getpgid(process.pid)
+            session_id = os.getsid(process.pid)
+        except ProcessLookupError:
+            process_group_id = process.pid
+            session_id = process.pid
+        if worker is not None:
+            worker.started(process.pid, process_group_id, session_id)
         timed_out = False
         cancelled = False
         returncode: int | None = None
@@ -140,8 +452,25 @@ def _capture(
                     returncode = process.wait(timeout=min(0.05, remaining))
                 except subprocess.TimeoutExpired:
                     continue
-        finally:
-            _kill_group(process)
+        except BaseException:
+            if worker is None:
+                _kill_unmanaged_process(process)
+            raise
+        if returncode is None:
+            reason = "worker_cancelled" if cancelled else "worker_timeout"
+            if worker is None:
+                _kill_unmanaged_process(process)
+            else:
+                worker.stop(reason)
+            try:
+                returncode = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait()
+        elif worker is not None:
+            worker.finished()
+        else:
+            _kill_unmanaged_process(process)
         stdout.seek(0)
         stderr.seek(0)
         return ExternalResult(
@@ -155,6 +484,7 @@ def run_shell(
     timeout_s: float,
     env: dict[str, str] | None = None,
     cancellation: threading.Event | None = None,
+    worker: WorkerLease | None = None,
 ) -> ExternalResult:
     return _capture(
         command,
@@ -163,6 +493,7 @@ def run_shell(
         shell=True,
         env=env,
         cancellation=cancellation,
+        worker=worker,
     )
 
 
@@ -211,6 +542,7 @@ class ShellRig:
             self.timeout_s,
             env={**os.environ, **_runtime_env(runtime)},
             cancellation=runtime.cancellation,
+            worker=runtime.worker,
         )
         if result.cancelled:
             return FrameResult(
@@ -281,7 +613,11 @@ class ScriptRig:
                 suffix += 1
         prompt_file = dispatch_dir / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
-        handle_out = dispatch_dir / "handle"
+        handle_out = (
+            dispatch_dir / "handle"
+            if runtime.worker is None
+            else runtime.worker.handle_path
+        )
         argv = [
             str(self.script),
             "--worktree",
@@ -302,6 +638,7 @@ class ScriptRig:
             shell=False,
             env={**os.environ, **self.env, **_runtime_env(runtime)},
             cancellation=runtime.cancellation,
+            worker=runtime.worker,
         )
         (dispatch_dir / "agent.stdout.log").write_text(result.stdout, encoding="utf-8")
         (dispatch_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")

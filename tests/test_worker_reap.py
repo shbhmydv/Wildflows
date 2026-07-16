@@ -16,7 +16,7 @@ from tests.conftest import executable
 from wildflows.engine import Engine
 from wildflows.events import WorkerReaped
 from wildflows.frame import FrameResult, FrameRuntime
-from wildflows.rig import RigRegistry
+from wildflows.rig import RigRegistry, WorkerReap, WorkerSupervisor
 
 
 class _FatalEngineError(BaseException):
@@ -132,6 +132,18 @@ while True:
         child = int(escaped_pid.read_text(encoding="utf-8"))
         assert os.getpgid(parent) != os.getpgid(child)
         assert os.getsid(parent) == os.getsid(child)
+        handle = (
+            repo / ".wildflows" / "runs" / run_id / "runtime" / "f0"
+            / "attempt-0" / "worker.handle"
+        )
+        _wait_for_path(handle)
+        handle_record = json.loads(handle.read_text(encoding="utf-8"))
+        assert handle_record == {
+            "version": 2,
+            "pid": parent,
+            "process_group_id": os.getpgid(parent),
+            "session_id": os.getsid(parent),
+        }
 
         process.send_signal(engine_signal)
         stdout, stderr = process.communicate(timeout=10)
@@ -161,6 +173,43 @@ while True:
                     pass
 
 
+def test_supervisor_reaps_all_handles_and_reads_legacy_pgid(
+    tmp_path: Path,
+) -> None:
+    """Shutdown drains every lease; a v1 integer remains a readable SID record."""
+    reports: list[WorkerReap] = []
+    supervisor = WorkerSupervisor(reports.append, grace_s=0.01)
+    processes: list[subprocess.Popen[str]] = []
+    for index in range(2):
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import signal,time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "time.sleep(60)"
+                ),
+            ],
+            start_new_session=True,
+            text=True,
+        )
+        processes.append(process)
+        handle = tmp_path / f"worker-{index}.handle"
+        lease = supervisor.prepare(f"f{index}", 0, handle)
+        if index == 0:
+            lease.started(process.pid, process.pid, process.pid)
+        else:
+            handle.write_text(f"{process.pid}\n", encoding="utf-8")
+    supervisor.shutdown("test_shutdown")
+
+    assert {report.frame_id for report in reports} == {"f0", "f1"}
+    assert all(report.reason == "test_shutdown" for report in reports)
+    for process in processes:
+        _wait_stopped(process.pid)
+        process.wait(timeout=5)
+
+
 @dataclass
 class _FatalRig:
     pid_file: Path
@@ -183,6 +232,7 @@ class _FatalRig:
                 ),
             ],
             start_new_session=True,
+            text=True,
         )
         self.processes.append(process)
         runtime.worker.started(

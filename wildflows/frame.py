@@ -6,7 +6,7 @@ import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -152,6 +152,18 @@ def call_hash(tool: ToolName, request: ToolRequest) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+class WorkerLease(Protocol):
+    """Engine-owned lifecycle record for one rig adapter process tree."""
+
+    handle_path: Path
+
+    def started(self, pid: int, process_group_id: int, session_id: int) -> None: ...
+
+    def stop(self, reason: str) -> None: ...
+
+    def finished(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class FrameRuntime:
     """Ephemeral capabilities supplied to one resident frame process."""
@@ -163,3 +175,4 @@ class FrameRuntime:
     runtime_dir: Path
     next_call_index: int
     cancellation: threading.Event | None = None
+    worker: WorkerLease | None = None
