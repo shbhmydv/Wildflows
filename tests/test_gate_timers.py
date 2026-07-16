@@ -9,11 +9,13 @@ import pytest
 from tests.conftest import executable
 from wildflows.engine import Engine
 from wildflows.events import (
+    FramePushed,
     FrameSlotAcquired,
     FrameSlotReleased,
     GateCalled,
     GateReturned,
 )
+from wildflows.frame import GateRequest, GateResult, call_hash
 from wildflows.journal import Journal
 from wildflows.rig import RigRegistry, ShellRig
 
@@ -115,6 +117,82 @@ def test_slow_gate_pauses_self_time_and_replays_identically(
     assert acquired.seq < called.seq < returned.seq < released.seq
     assert released.reason == "exit"
     assert released.slot == acquired.slot == 0
+
+
+def test_resume_uses_gate_timestamps_to_exclude_an_orphaned_wait(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = RigRegistry({"gate": ShellRig("true", timeout_s=30)})
+    run_dir = tmp_path / "orphan-run"
+    initial = Engine(
+        run_dir,
+        repo,
+        registry,
+        run_id="orphan-gate",
+        root_rig="gate",
+        root_prompt="resume an interrupted gate",
+        worktrees_root=tmp_path / "orphan-worktrees",
+    )
+    base = initial.repository.branch_tip()
+    request = GateRequest(cmd="sleep forever")
+    digest = call_hash("gate", request)
+    initial.journal.append(FramePushed(
+        run_id=initial.run_id,
+        frame_id="f0",
+        attempt=0,
+        depth=0,
+        rig="gate",
+        prompt="resume an interrupted gate",
+        branch=initial.repository.frame_branch("f0"),
+        base_commit=base,
+        worktree=str(tmp_path / "interrupted-worktree"),
+        subtree_deadline=200.0,
+        ts=100.0,
+    ))
+    initial.journal.append(FrameSlotAcquired(
+        run_id=initial.run_id,
+        frame_id="f0",
+        attempt=0,
+        rig="gate",
+        ts=101.0,
+    ))
+    initial.journal.append(GateCalled(
+        run_id=initial.run_id,
+        frame_id="f0",
+        call_index=0,
+        call_hash=digest,
+        request=request,
+        caller_head=base,
+        ts=103.0,
+    ))
+    initial.journal.append(GateReturned(
+        run_id=initial.run_id,
+        frame_id="f0",
+        call_index=0,
+        call_hash=digest,
+        result=GateResult(exit_code=0, stdout="", stderr=""),
+        ts=110.0,
+    ))
+
+    monkeypatch.setattr("wildflows.engine.time.time", lambda: 113.0)
+    resumed = Engine(
+        run_dir,
+        repo,
+        registry,
+        run_id="orphan-gate",
+        root_rig="gate",
+        root_prompt="resume an interrupted gate",
+    )
+
+    release = next(
+        event
+        for event in resumed.journal.events()
+        if isinstance(event, FrameSlotReleased)
+    )
+    assert release.reason == "engine_resume_sweep"
+    assert release.active_s == 5.0  # 12s leased minus the journalled 7s gate wait.
+    assert resumed.projection.frame("f0").self_time_s == 5.0
+    assert Journal.load(run_dir).projection.frame("f0").self_time_s == 5.0
 
 
 def test_configured_gate_timeout_returns_124_without_killing_frame(

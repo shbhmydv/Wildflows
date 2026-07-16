@@ -2069,7 +2069,7 @@ class Engine:
             return combined
         marker = b"[... PROVISIONING OUTPUT TRUNCATED ...]\n"
         tail = encoded[-(_PROVISION_OUTPUT_BYTES - len(marker)):]
-        return (marker + tail).decode("utf-8", errors="replace")
+        return (marker + tail).decode("utf-8", errors="ignore")
 
     def _provisioning_recorded(
         self, worktree: FrameWorktree, mechanism: str
