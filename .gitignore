@@ -12,3 +12,7 @@ handoff.md
 # Transient run state; repository skill bundles under .wildflows/skills stay trackable.
 .wildflows/runs/
 /tmp-runs/
+# Local-only agent context; never public.
+CLAUDE.md
+CLAUDE.local.md
+.claude/
