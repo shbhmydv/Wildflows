@@ -20,6 +20,8 @@ Choose a loop when the next task cannot be scoped until a result or gate is insp
 
 **Example:** with a retry budget of two, dispatch one implementation, run the acceptance gate, and only on failure dispatch `fix this failure: <command, exit code, relevant output>`; stop after a pass or two corrections. Loops pay only for observed defects, but an unbounded loop can spend indefinitely.
 
+When the budget exhausts and the gate still fails, choose a failed-child disposition deliberately. Never silently extend the loop. Finish inline if the residual is small; re-tier to a stronger worker with the concrete failure evidence and salvage branch if the task was under-tiered; otherwise fail honestly upward with the concrete evidence. A truthful failure gives the parent something actionable; fake success does not.
+
 ## Composite shape
 
 Compose shapes with sequential calls: finish one call, inspect its combined branch, then make the next call.

@@ -2144,3 +2144,38 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      The frame-stack panel is width-contained and owns horizontal overflow; page-level
      overflow is suppressed, so future uncontained content stays scrollable inside the
      canvas instead of widening the document.
+
+### Hand-46 calls — gate clocks, worktree provisioning, and child disposition
+
+167. **Gate execution has an owner-configured clock and pauses caller self-time without
+     releasing residency.** A gate pauses the frame timer between its existing
+     `gate_called`/`gate_returned` boundaries while retaining the active rig lane; the
+     eventual slot release records only thinking time, and resume subtracts an
+     interrupted gate wait before closing an orphan interval. Optional positive
+     per-rig `gate_timeout_s` is the only Wildflows gate deadline; omission is unbounded,
+     and expiry returns 124 with a clear stderr marker. No hardcoded gate ceiling or
+     caller-remaining-time derivation remains.
+
+168. **Fresh-worktree provisioning is repository-wide, generic, and journalled once per
+     checkout.** Top-level `worktree.setup` runs after checkout and before adapter launch;
+     failure records bounded output, terminalizes the frame, and removes the worktree.
+     Top-level `worktree.link` symlinks validated repo-relative primary-checkout paths,
+     warning and skipping missing sources. `worktree_provisioned` records mechanism,
+     duration, outcome, and bounded details; `run_opened` pins the config. Shared links
+     suit mutable caches/dependencies, never frame-owned source or build outputs.
+
+169. **A failed direct child returns bounded branch salvage and may be explicitly warm
+     retried.** Its result names the short frame branch, exit head, and an 8-KiB-bounded
+     diffstat against the branch point. `dispatch(retry_frame=...)`, exclusive with new
+     task fields, accepts only the caller's failed direct child and relaunches that same
+     frame id/branch through the existing attempt-evidence path, preserving commits,
+     bounded log tails, saved dirty diff, attempt number, and death reason. The request
+     is durable/replayable; ok children remain auto-integrated and are not retryable.
+
+170. **Failed-child and exhausted-loop handling is explicit doctrine, not hidden engine
+     policy.** Choose retry for a plausible transient, inline merge/finish for a small
+     residual, stronger-tier redispatch with concrete evidence for mis-tiered work, or
+     owner ask/park for a human blocker. A bounded loop never silently grows after its
+     budget: finish inline, re-tier deliberately, or fail honestly upward with the gate
+     evidence. The engine performs no automatic salvage merge, escalation, or fake
+     success conversion.

@@ -8,3 +8,12 @@ Use delegation only when it buys more than doing the work in this frame. The sys
 - Treat a returned child report and integrated commits as authoritative. Inspect only the evidence needed to integrate or resolve a concrete contradiction; do not reflexively redo the child's work.
 - Keep work in-frame when it is smaller than roughly one file plus its focused tests. Prefer one coherent, well-scoped child over many parallel micro-tasks. Bound both dispatch depth and fan-out to the minimum that closes the task.
 - All delegation goes through `wildflows_dispatch`. Out-of-band workers are not journalled, integrated, replayable, or covered by the engine's lifecycle controls.
+
+## When a child fails
+
+The failed result names its salvage branch, head, and bounded diffstat. Choose one disposition; do not discard useful committed work by reflex.
+
+- **Retry** a transient or plausibly one-more-go failure with `retry_frame` alone. The same child branch relaunches with its prior commits and bounded earlier-attempt evidence.
+- **Inline** when only a sliver remains: merge the salvage branch into this worktree yourself and finish here.
+- **Escalate** a mis-tiered task to a stronger kind, quoting the concrete failure evidence and salvage branch in the new task.
+- **Ask/park** when only the human can unblock progress: use `wildflows_ask` rather than spinning or claiming success.

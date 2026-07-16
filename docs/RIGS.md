@@ -5,7 +5,9 @@ CWD, can call the run's MCP tools, and exits with final text. Every entry may se
 optional, nonblank, single-line `description`; when that rig is currently dispatchable,
 the engine shows it beside the registry key in frame resource preambles. An entry
 without `description` renders name-only. Every rig may also set a positive integer
-`slots`; omission preserves unlimited active execution. `rigs.yaml` supports:
+`slots`; omission preserves unlimited active execution. Optional positive
+`gate_timeout_s` bounds only gates called by that rig; omission leaves gate execution
+unbounded by Wildflows. `rigs.yaml` supports:
 
 - `echo`: deterministic no-tool test rig with no kind-specific fields;
 - `shell`: a bounded shell command requiring `template` and positive `timeout_s`;
@@ -13,10 +15,13 @@ without `description` renders name-only. Every rig may also set a positive integ
   `log_dir`, with optional positive `timeout_s` (default 900), `env`, and
   `busy_patterns`.
 
-`timeout_s` is the per-frame self-time budget. It advances only while the frame owns an
-active rig lease; dispatch and ask park the frame and pause it, while gate execution
-continues to charge it. The engine reaps an exhausted worker. Adapter commands receive a
-`3 × timeout_s` crash backstop rather than the authoritative budget.
+`timeout_s` is the per-frame self-time budget. It advances only while the frame is
+thinking. Dispatch and ask park the frame; gate execution pauses only its self-time
+clock while retaining its active slot lease because the resident worker remains alive.
+Gate waits are bounded only when that rig sets `gate_timeout_s`; timeout returns exit 124
+and a clear stderr marker. The engine reaps a worker that exhausts self-time. Adapter
+commands receive a `3 × timeout_s` crash backstop rather than the authoritative budget;
+run/subtree backstops also remain independent of gate configuration.
 
 The script contract remains:
 
@@ -72,10 +77,31 @@ frame. The former advisory-flock helper and its blocking fallback no longer exis
 Keep explicit `local-a`/`local-b` rigs only for operator diagnosis or reservation. An
 explicit `GRINDSTONE_SENIOR_PROVIDER` still takes precedence over the engine lane.
 
+## Fresh-worktree provisioning
+
+The optional top-level `worktree` section belongs to the target repository, not a rig:
+
+- `setup` is one shell command run in each newly created frame worktree after checkout
+  and before its adapter launches. A nonzero exit terminalizes that frame launch, records
+  bounded stdout/stderr in the failure, and removes the worktree cleanly.
+- `link` is a list of repository-relative paths. Each existing source in the primary
+  checkout is symlinked at the same path in every new frame worktree; a missing source is
+  skipped with a journalled warning. Links share mutable state, which suits caches and
+  dependency directories but not frame-owned source or build outputs.
+
+Each configured mechanism records `worktree_provisioned` with its worktree, duration,
+outcome, linked paths/warnings, and bounded setup output. Provisioning is once per fresh
+worktree path. Replay returns completed calls without provisioning again; a resumed
+attempt that must create a replacement worktree provisions that new checkout once.
+`setup` runs with no Wildflows hard timeout, so owners should make it deterministic and
+supply any repository-appropriate bound inside the command when needed. Link paths may
+not be absolute, escape with `..`, name `.git`, or repeat.
+
 ## Example YAML
 
 The top level requires `rigs` and may also set one nonblank, single-line `notify`
-command and a `kinds` mapping from free-text task kind to a declared rig. A dispatch's
+command, a `kinds` mapping from free-text task kind to a declared rig, and the repository
+`worktree` section above. A dispatch's
 explicit `rig` wins; otherwise every task needs a kind with a configured default. No
 kind mapping is supplied by Wildflows. `--notify` overrides the YAML notify value. After
 each newly journalled owner ask, the engine attempts to launch the command detached from
@@ -86,6 +112,10 @@ spawn failure and notifier exit status cannot affect the run.
 
 ```yaml
 # notify: /path/to/owner-notify
+worktree:
+  setup: python3 -m project_bootstrap --worktree
+  link:
+    - .cache/dependencies
 kinds:
   implement: local
   review: local
@@ -96,6 +126,7 @@ rigs:
     script: rigs/worker-picodex.sh
     log_dir: /tmp/wildflows-logs/senior
     timeout_s: 1800
+    gate_timeout_s: 7200
   local:
     kind: script
     description: pooled dual-GPU Qwen lane for concretely-specced junior work

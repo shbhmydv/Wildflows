@@ -13,9 +13,11 @@ bank*—the caller stays alive while the engine does the durable work below it. 
 tool surface has only three tools, exposed by the reference Pi shim with
 `wildflows_`-prefixed names:
 
-- **`wildflows_dispatch(tasks, rig?, parallel?, skills?, kinds?)`** (`dispatch` over
-  MCP) pushes child frames, then returns their reports and integrated commits. `kinds`
-  is an optional free-text hint per task; configured kind defaults can supply omitted rigs;
+- **`wildflows_dispatch(tasks?, rig?, parallel?, skills?, kinds?, retry_frame?)`**
+  (`dispatch` over MCP) pushes child frames, then returns their reports and integrated
+  commits. `kinds` is an optional free-text hint per task; configured kind defaults can
+  supply omitted rigs. A failed result carries its branch/head/diffstat, and
+  `retry_frame` alone relaunches that failed direct child on the same branch;
 - **`wildflows_gate(cmd)`** (`gate`) runs a deterministic check in the caller's
   worktree and returns the exit code plus complete stdout and stderr;
 - **`wildflows_ask(question)`** (`ask`) parks the frame until the owner answers.
@@ -55,6 +57,10 @@ EOF
 cat > rigs.yaml <<'EOF'
 # Optional owner wakeup after a frame asks:
 # notify: /path/to/owner-notify
+# Optional repository-wide provisioning for every fresh frame checkout:
+worktree:
+  setup: python3 -m project_bootstrap --worktree
+  link: [.cache/dependencies]
 rigs:
   senior:
     kind: script
@@ -62,6 +68,7 @@ rigs:
     script: rigs/worker-picodex.sh
     log_dir: /tmp/wildflows/senior
     timeout_s: 1800
+    gate_timeout_s: 7200
   worker:
     kind: script
     description: bounded implementation lane
@@ -101,7 +108,7 @@ For a small two-leaf example, see [`examples/toy-run`](examples/toy-run/).
 The durable frame/call history is an append-only stream of fsynced v2 records at
 `<target>/.wildflows/runs/<run-id>/events.ndjson`. The current event kinds are
 `run_opened`, `frame_pushed`, `frame_slot_queued`, `frame_slot_acquired`,
-`frame_slot_released`, `dispatch_called`, `dispatch_returned`, `gate_called`,
+`frame_slot_released`, `worktree_provisioned`, `dispatch_called`, `dispatch_returned`, `gate_called`,
 `gate_returned`, `asked`, `answered`, `call_failed`, `worker_reaped`,
 `frame_relaunch_blocked`, `frame_exited`, `frame_integrating`, `frame_integrated`,
 `frame_popped`, and `run_finished`. `frame_relaunch_blocked` parks replay when a live frame branch has

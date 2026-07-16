@@ -28,6 +28,8 @@ def test_pi_shim_is_private_and_outside_worktree(tmp_path: Path) -> None:
     assert 'const token = "secret-token"' in source
     assert "let nextCallIndex = 3" in source
     assert "wildflows_dispatch" in source
+    assert "retry_frame" in source
+    assert "tasks: Type.Optional" in source
     assert "wildflows_gate" in source
     assert "wildflows_ask" in source
 
