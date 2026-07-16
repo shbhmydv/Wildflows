@@ -1165,6 +1165,17 @@ class Engine:
                     or (replaying and child.outcome in (None, "ok"))
                 )
             )
+            durable_call = projection.call(frame.frame_id, call_index)
+            retry_attempt_started = (
+                replaying
+                and durable_call is not None
+                and any(
+                    isinstance(event, FramePushed)
+                    and event.frame_id == retry_frame
+                    and event.seq > durable_call.started_seq
+                    for event in projection.effective_events
+                )
+            )
         if not direct_child or child is None:
             return self._retry_refused(
                 frame,
@@ -1182,7 +1193,9 @@ class Engine:
                 f"frame {retry_frame!r} is not a failed direct child",
             )
         cancellation = self._current_call_cancellation()
-        if child.outcome == "failed":
+        if child.outcome is None or (
+            child.outcome == "failed" and not retry_attempt_started
+        ):
             temporary_ref = self.repository.integration_ref(child.frame_id)
             if child.integrating is not None and self.repository.ref_exists(temporary_ref):
                 self.repository.delete_integration_ref(temporary_ref)
@@ -2477,8 +2490,10 @@ class Engine:
             f"{self.skill_library.manifest()}\n\n"
             "TOOLS:\n"
             "The only engine tools are wildflows_dispatch, wildflows_gate, and "
-            "wildflows_ask. Tool calls block; child commits are present in your branch "
-            "when dispatch returns. Dispatch skills is optional and contains one "
+            "wildflows_ask. Tool calls block; successful child commits are present in "
+            "your branch when dispatch returns. A failed child result includes its "
+            "salvage branch, head, and diffstat; pass retry_frame alone to relaunch a "
+            "failed direct child on that branch. Dispatch skills is optional and contains one "
             "ordered skill-name list per task. Dispatch kinds is an optional parallel "
             "list of free-text hints; when every kind has a configured default, rig may "
             "be omitted. Shapes are your control flow: a sequence "

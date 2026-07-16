@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
 from tests.conftest import executable
 from wildflows.engine import Engine
-from wildflows.events import DispatchCalled, FramePushed
-from wildflows.frame import DispatchRequest
-from wildflows.rig import RigRegistry, ScriptRig
+from wildflows.events import (
+    DispatchCalled,
+    FrameExited,
+    FramePopped,
+    FramePushed,
+)
+from wildflows.frame import DispatchRequest, call_hash
+from wildflows.rig import EchoRig, RigRegistry, ScriptRig
 
 
 _RETRY_ADAPTER = r'''#!/usr/bin/env python3
@@ -171,6 +177,138 @@ def test_failed_result_surfaces_salvage_and_retry_reuses_branch_and_evidence(
         if isinstance(event, DispatchCalled) and event.request.retry_frame is not None
     ]
     assert [event.request.retry_frame for event in retry_calls] == [child.frame_id]
+
+
+def test_pending_retry_replay_does_not_relaunch_an_already_failed_attempt(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = Engine(
+        tmp_path / "run-retry-replay",
+        repo,
+        RigRegistry({"echo": EchoRig()}),
+        run_id="retry-replay",
+        root_rig="echo",
+        root_prompt="replay pending retry",
+        worktrees_root=tmp_path / "worktrees-retry-replay",
+    )
+    base = engine.repository.branch_tip()
+    root_branch = engine.repository.frame_branch("f0")
+    root_worktree = engine.repository.create_frame_worktree(
+        "f0", root_branch, base, resume=False
+    )
+    engine.journal.append(FramePushed(
+        run_id=engine.run_id,
+        frame_id="f0",
+        attempt=0,
+        depth=0,
+        rig="echo",
+        prompt="replay pending retry",
+        branch=root_branch,
+        base_commit=base,
+        worktree=str(root_worktree.path),
+        subtree_deadline=4_102_444_800.0,
+    ))
+    child_id = "f0.c7.t0"
+    child_branch = engine.repository.frame_branch(child_id)
+    first_worktree = engine.repository.create_frame_worktree(
+        child_id, child_branch, base, resume=False
+    )
+    engine.journal.append(FramePushed(
+        run_id=engine.run_id,
+        frame_id=child_id,
+        parent_frame_id="f0",
+        parent_call_index=7,
+        task_index=0,
+        attempt=0,
+        depth=1,
+        rig="echo",
+        prompt="retry me",
+        branch=child_branch,
+        base_commit=base,
+        worktree=str(first_worktree.path),
+        subtree_deadline=4_102_444_800.0,
+    ))
+    engine.journal.append(FrameExited(
+        run_id=engine.run_id,
+        frame_id=child_id,
+        attempt=0,
+        outcome="failed",
+        text="first failure",
+        head=base,
+    ))
+    engine.journal.append(FramePopped(
+        run_id=engine.run_id,
+        frame_id=child_id,
+        attempt=0,
+        outcome="failed",
+    ))
+    engine.repository.remove_worktree(first_worktree)
+
+    request = DispatchRequest(retry_frame=child_id)
+    digest = call_hash("dispatch", request)
+    engine.journal.append(DispatchCalled(
+        run_id=engine.run_id,
+        frame_id="f0",
+        call_index=0,
+        call_hash=digest,
+        request=request,
+        caller_head=base,
+    ))
+    retry_worktree = engine.repository.create_frame_worktree(
+        child_id, child_branch, base, resume=True
+    )
+    engine.journal.append(FramePushed(
+        run_id=engine.run_id,
+        frame_id=child_id,
+        parent_frame_id="f0",
+        parent_call_index=7,
+        task_index=0,
+        attempt=1,
+        depth=1,
+        rig="echo",
+        prompt="retry me",
+        branch=child_branch,
+        base_commit=base,
+        worktree=str(retry_worktree.path),
+        subtree_deadline=4_102_444_800.0,
+    ))
+    engine.journal.append(FrameExited(
+        run_id=engine.run_id,
+        frame_id=child_id,
+        attempt=1,
+        outcome="failed",
+        text="retry also failed",
+        head=base,
+    ))
+    engine.repository.remove_worktree(retry_worktree)
+
+    def unexpected_launch(**kwargs: object) -> object:
+        del kwargs
+        raise AssertionError("completed retry attempt relaunched during replay")
+
+    monkeypatch.setattr(engine, "_launch_frame", unexpected_launch)
+    engine._call_context.cancellation = threading.Event()  # noqa: SLF001
+    try:
+        result = engine._dispatch_retry(  # noqa: SLF001 - pending retry replay seam
+            engine.projection.frame("f0"),
+            root_worktree,
+            0,
+            digest,
+            request,
+            True,
+        )
+    finally:
+        del engine._call_context.cancellation  # noqa: SLF001
+        engine.repository.remove_worktree(root_worktree)
+
+    assert result.outcome == "failed"
+    assert result.children[0].text == "retry also failed"
+    pushes = [
+        event
+        for event in engine.journal.events()
+        if isinstance(event, FramePushed) and event.frame_id == child_id
+    ]
+    assert len(pushes) == 2
 
 
 def test_retry_refuses_non_child_and_successful_child(
