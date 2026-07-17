@@ -94,9 +94,12 @@ The optional top-level `worktree` section belongs to the target repository, not 
   skipped with a journalled warning. Every configured link path is also added once as an
   anchored, no-trailing-slash `/<path>` pattern in Git's repository exclude file. Unlike
   a directory-only `<path>/` pattern, this hides both a symlink and a directory, and the
-  shared exclude entry is idempotent across concurrent provisioning and resume. Links
-  share mutable state, which suits caches and dependency directories but not frame-owned
-  source or build outputs.
+  shared exclude entry is idempotent across concurrent provisioning and resume. A link
+  shares mutable state with the primary checkout and is safe only for content that no
+  worker will mutate. In particular, do not link package-manager install directories:
+  installers such as `npm ci` may delete through the symlink and empty the primary
+  checkout's directory. Create those directories per worktree with `worktree.setup`
+  instead (for example, `npm ci`, about 5 seconds with a warm package cache).
 
 Each configured mechanism records `worktree_provisioned` with its worktree, duration,
 outcome, linked paths/warnings, and bounded setup output. Provisioning is once per fresh
@@ -134,9 +137,9 @@ spawn failure and notifier exit status cannot affect the run.
 ```yaml
 # notify: /path/to/owner-notify
 worktree:
-  setup: python3 -m project_bootstrap --worktree
+  setup: npm ci
   link:
-    - .cache/dependencies
+    - .toolchains/read-only-sdk
 rigs:
   senior:
     kind: script

@@ -2312,3 +2312,10 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      The complete registry allowlist remains appended in operator order. A caller and a
      journal reader can therefore correct or dispose the request without engine-source
      lookup.
+
+185. **Worktree links are read-only-by-convention shared state (supersedes 168's
+     cache/dependency recommendation).** A link aliases the primary checkout and is safe
+     only when no worker mutates its content. Package-manager install directories must
+     be independently materialized with `worktree.setup`; for example, warm-cache
+     `npm ci` takes about five seconds and cannot delete the primary checkout's
+     `node_modules` through a symlink.

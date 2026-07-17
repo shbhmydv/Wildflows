@@ -31,16 +31,17 @@ separate. A configured timeout returns exit 124 with
 
 ```yaml
 worktree:
-  setup: python3 -m project_bootstrap --worktree
+  setup: npm ci
   link:
-    - .cache/dependencies
+    - .toolchains/read-only-sdk
 ```
 
 `setup` runs once after each checkout and before adapter launch. Nonzero exit records
 bounded output, terminalizes the frame, and removes the checkout. Each `link` source is a
 validated repository-relative path in the primary checkout; existing sources are
-symlinked at the same destination and missing sources become journalled warnings. Shared
-mutable links suit caches/dependencies, not source or build outputs.
+symlinked at the same destination and missing sources become journalled warnings. Links
+are safe only for content no worker mutates. Package-manager install directories belong
+in `setup`: an installer may delete through a link into the primary checkout.
 
 A `worktree_provisioned` event records frame/attempt/path, mechanism, duration, outcome,
 and bounded details. `run_opened` pins the provisioning config. A completed/replayed
