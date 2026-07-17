@@ -162,7 +162,9 @@ function renderRunPicker() {
     return;
   }
   for (const run of state.runs) {
-    const option = new Option(`${run.repo_name} / ${run.run_short} · ${run.state}`, run.key);
+    const compatibility = Number(run.not_understood_count || 0);
+    const warning = compatibility ? ` · ⚠ ${compatibility} not understood` : "";
+    const option = new Option(`${run.repo_name} / ${run.run_short} · ${run.state}${warning}`, run.key);
     option.disabled = run.state === "invalid";
     select.append(option);
   }
@@ -182,7 +184,9 @@ function renderLiveRuns() {
     button.disabled = run.state === "invalid";
     button.title = `${run.repository} / ${run.run_id}${run.error ? `\n${run.error}` : ""}`;
     const copy = el("span", "live-run-copy");
-    copy.append(el("span", "live-run-id", `${run.repo_name} / ${run.run_short}`), el("span", "live-run-meta", `${run.state} · ${run.frames} frames · ${run.event_count} events`));
+    const compatibility = Number(run.not_understood_count || 0);
+    const warning = compatibility ? ` · ⚠ ${compatibility} not understood` : "";
+    copy.append(el("span", "live-run-id", `${run.repo_name} / ${run.run_short}`), el("span", "live-run-meta", `${run.state} · ${run.frames} frames · ${run.event_count} events${warning}`));
     button.append(dot(runTone(run.state)), copy);
     if (!button.disabled) button.addEventListener("click", () => selectRun(run.key).catch(error => toast(error.message, true)));
     target.append(button);
@@ -217,7 +221,7 @@ async function selectRun(key, updateUrl = true) {
 
 function openStream() {
   if (!state.run) return;
-  const last = state.run.events.at(-1)?.seq ?? -1;
+  const last = Number(state.run.last_event_seq ?? -1);
   const source = new EventSource(`${detailUrl()}/events?after=${last}`);
   state.source = source;
   source.onopen = () => { if (state.source === source) setConnection(true); };
@@ -284,6 +288,14 @@ function renderHeader() {
   ];
   const target = $("#cap-list");
   target.replaceChildren();
+  const compatibility = Number(run.not_understood_count || 0);
+  if (compatibility) {
+    const noun = compatibility === 1 ? "item" : "items";
+    const chip = el("span", "cap-chip compatibility-warning", `${compatibility} journal ${noun} not understood — dashboard may be out of date`);
+    const versions = run.newer_journal_versions || [];
+    if (versions.length) chip.title = `Newer journal version${versions.length === 1 ? "" : "s"}: ${versions.join(", ")}`;
+    target.append(chip);
+  }
   for (const [label, value] of caps) {
     const chip = el("span", "cap-chip");
     chip.append(document.createTextNode(`${label} `), el("b", "", String(value ?? "open")));
@@ -688,7 +700,9 @@ function renderJournal() {
   const target = $("#journal");
   target.replaceChildren();
   const events = state.run?.events || [];
-  $("#event-count").textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
+  const total = Number(state.run?.event_count ?? events.length);
+  const count = events.length === total ? `${total}` : `${events.length} / ${total}`;
+  $("#event-count").textContent = `${count} event${total === 1 ? "" : "s"}`;
   if (!events.length) {
     target.append(el("div", "empty-state", "Journal events appear here."));
     return;
@@ -731,9 +745,12 @@ function eventInfo(event) {
   if (event.kind === "run_finished") return { kind: "run result", tone: event.outcome === "ok" ? "result" : "failure", detail: event.text || event.outcome, ref: `result / ${short(event.root_head)}`, expandable: String(event.text).length > 120 };
   if (event.kind === "run_interrupted") return { kind: "interrupted", tone: "owner", detail: event.reason, ref: `seq / ${event.seq}`, expandable: String(event.reason).length > 120 };
   if (event.kind === "frame_pushed") return { kind: "frame push", tone: "frame", detail: `${event.rig} started · ${firstLine(event.prompt)}`, ref: `attempt ${event.attempt}`, expandable: String(event.prompt).length > 120 };
+  if (event.kind === "worktree_provisioned") return { kind: "worktree", tone: event.outcome === "ok" ? "frame" : "failure", detail: `${event.mechanism} · ${event.outcome} · ${formatDuration(event.duration_s)}`, ref: `attempt ${event.attempt}` };
   if (event.kind === "frame_slot_queued") return { kind: "slot queue", tone: "owner", detail: `${event.rig} waiting for an active slot`, ref: `attempt ${event.attempt}` };
   if (event.kind === "frame_slot_acquired") return { kind: "slot acquired", tone: "frame", detail: `${event.rig}${event.slot == null ? " active" : ` lane ${event.slot}`}`, ref: `attempt ${event.attempt}` };
   if (event.kind === "frame_slot_released") return { kind: "slot released", tone: "", detail: `${event.reason} · ${formatDuration(event.active_s)} self-time`, ref: `attempt ${event.attempt}` };
+  if (event.kind === "worker_reaped") return { kind: "worker reaped", tone: "owner", detail: `${event.reason}${event.escalated ? " · escalated" : ""}`, ref: `pid / ${event.pid}` };
+  if (event.kind === "frame_relaunch_blocked") return { kind: "relaunch blocked", tone: "failure", detail: event.message, ref: `found / ${short(event.found_tip)}`, expandable: String(event.message).length > 100 };
   if (event.kind === "frame_commit_warning") return { kind: "commit warning", tone: "owner", detail: event.message, ref: `attempt ${event.attempt}`, expandable: String(event.message).length > 100 };
   if (event.kind === "frame_exited") {
     const frame = state.run.frames[event.frame_id];
@@ -755,6 +772,7 @@ function eventInfo(event) {
   if (event.kind === "asked") return { kind: "ask", tone: "owner", detail: event.request.question, ref: `${ref} / request`, expandable: String(event.request.question).length > 100 };
   if (event.kind === "answered") return { kind: "answer", tone: "owner", detail: event.answer, ref: `${ref} / result`, expandable: String(event.answer).length > 100 };
   if (event.kind === "call_refused") return { kind: "call refused", tone: "failure", detail: event.reason, ref, expandable: String(event.reason).length > 100 };
+  if (event.kind === "call_failed") return { kind: "call failed", tone: "failure", detail: event.result.message, ref, expandable: String(event.result.message).length > 100 };
   return { kind: event.kind, tone: "", detail: event.kind, ref: `seq / ${event.seq}` };
 }
 

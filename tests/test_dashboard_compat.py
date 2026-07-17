@@ -130,7 +130,7 @@ def test_newer_journal_degrades_visibly_without_hiding_understood_state(
     listing = _objects(_payload(client.get("/api/runs"))["runs"])
     assert len(listing) == 1
     assert listing[0]["state"] == "parked"
-    assert listing[0]["frames"] == 9
+    assert listing[0]["frames"] == 10
     assert listing[0]["event_count"] == 51
     assert listing[0]["understood_event_count"] == 50
     assert listing[0]["not_understood_count"] == 2
@@ -174,7 +174,7 @@ def test_malformed_known_event_counts_as_not_understood_and_replay_continues(
     assert detail["not_understood_count"] == 1
     assert detail["understood_event_count"] == 49
     assert len(_objects(detail["events"])) == 49
-    assert len(_object(detail["frames"])) == 9
+    assert len(_object(detail["frames"])) == 10
 
 
 def test_wholly_newer_journal_version_is_one_visible_compatibility_issue(
@@ -194,7 +194,7 @@ def test_wholly_newer_journal_version_is_one_visible_compatibility_issue(
     assert detail["not_understood_count"] == 1
     assert detail["newer_journal_versions"] == [3]
     assert detail["understood_event_count"] == 50
-    assert len(_object(detail["frames"])) == 9
+    assert len(_object(detail["frames"])) == 10
 
 
 def _every_dashboard_event() -> list[Event]:

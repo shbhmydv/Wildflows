@@ -149,6 +149,7 @@ h1 span { color: var(--muted); font-weight: 400; }
 .cap-chip, .count-chip, .rig-chip, .state-chip, .failed-children-chip, .call-chip, .kind-badge { border: 1px solid var(--hairline); border-radius: 999px; background: var(--surface); font-family: var(--mono); }
 .cap-chip { --pill-pad-y: 7px; --pill-pad-x: 9px; gap: 5px; color: var(--muted); font-size: 9px; }
 .cap-chip b { color: var(--ink); }
+.cap-chip.compatibility-warning { border-color: var(--amber); background: var(--amber-chip); color: var(--amber); font-weight: 700; }
 .console-grid { min-height: 0; display: grid; grid-template-columns: minmax(570px, 1.62fr) minmax(350px, .88fr); gap: 14px; }
 .panel { min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--hairline); border-radius: 6px; background: var(--surface); box-shadow: 0 1px 1px var(--shadow); }
 .canvas-panel, .journal-panel { display: grid; grid-template-rows: 48px minmax(0, 1fr); }

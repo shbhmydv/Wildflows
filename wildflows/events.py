@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import time
-from typing import Annotated, Literal, TypeAlias
+from types import MappingProxyType
+from typing import Annotated, Literal, Mapping, TypeAlias, cast, get_args
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from wildflows.admission import AdmissionPolicy
 from wildflows.frame import (
@@ -22,6 +23,8 @@ from wildflows.result import CommitReceipt
 
 
 class _Header(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     version: Literal[2] = 2
     seq: int = -1
     ts: float = Field(default_factory=time.time)
@@ -296,6 +299,41 @@ Event: TypeAlias = Annotated[
     Field(discriminator="kind"),
 ]
 _EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(Event)
+
+
+def _registered_event_types() -> tuple[type[BaseModel], ...]:
+    annotated = get_args(Event)
+    if not annotated:
+        raise RuntimeError("Event must remain an Annotated discriminated union")
+    candidates = get_args(annotated[0])
+    if not candidates or not all(
+        isinstance(candidate, type) and issubclass(candidate, BaseModel)
+        for candidate in candidates
+    ):
+        raise RuntimeError("Event union members must be pydantic event models")
+    return cast(tuple[type[BaseModel], ...], candidates)
+
+
+def event_kind(event_type: type[BaseModel]) -> str:
+    """Return one registered event model's literal discriminator."""
+    kind = event_type.model_fields["kind"].default
+    if not isinstance(kind, str):
+        raise RuntimeError(f"{event_type.__name__}.kind must have a string default")
+    return kind
+
+
+# Every event model accepted by the engine journal, derived from ``Event``.
+EVENT_TYPES: tuple[type[BaseModel], ...] = _registered_event_types()
+
+_EVENT_TYPES_BY_KIND = {event_kind(event_type): event_type for event_type in EVENT_TYPES}
+if len(_EVENT_TYPES_BY_KIND) != len(EVENT_TYPES):
+    raise RuntimeError("registered journal event kinds must be unique")
+# The engine event registry. The ``Event`` union is its single source of truth.
+EVENT_TYPES_BY_KIND: Mapping[str, type[BaseModel]] = MappingProxyType(
+    _EVENT_TYPES_BY_KIND
+)
+
+SUPPORTED_JOURNAL_VERSION = cast(int, _Header.model_fields["version"].default)
 
 
 def parse_event(data: dict[str, object]) -> Event:

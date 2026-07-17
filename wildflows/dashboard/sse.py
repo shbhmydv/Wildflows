@@ -9,23 +9,23 @@ from pathlib import Path
 import time
 from typing import cast
 
-from wildflows.events import Event, parse_event
+from wildflows.dashboard.journal import DashboardJournalRecord, decode_dashboard_record
 
 
 DEFAULT_POLL_INTERVAL = 0.2
 DEFAULT_HEARTBEAT_INTERVAL = 15.0
 
 
-def _parse_record(record: bytes) -> Event:
+def _parse_record(record: bytes, position: int) -> DashboardJournalRecord:
     decoded = json.loads(record)
     if not isinstance(decoded, dict):
         raise ValueError("journal record is not an event object")
-    return parse_event(cast(dict[str, object], decoded))
+    return decode_dashboard_record(cast(dict[str, object], decoded), position)
 
 
-def _message(event: Event) -> str:
-    payload = event.model_dump_json(exclude_computed_fields=True)
-    return f"id: {event.seq}\nevent: journal\ndata: {payload}\n\n"
+def _message(record: DashboardJournalRecord) -> str:
+    payload = json.dumps(record.raw, separators=(",", ":"), ensure_ascii=False)
+    return f"id: {record.position}\nevent: journal\ndata: {payload}\n\n"
 
 
 async def tail_events(
@@ -80,17 +80,12 @@ async def tail_events(
             if complete_end >= 0:
                 records = pending[:complete_end].split(b"\n")
                 pending = pending[complete_end + 1 :]
-                for record in records:
-                    event = _parse_record(record)
-                    if event.seq != expected:
-                        raise ValueError(
-                            f"journal seq {event.seq} is not contiguous "
-                            f"(expected {expected})"
-                        )
+                for record_bytes in records:
+                    record = _parse_record(record_bytes, expected)
                     expected += 1
-                    if event.seq > last:
-                        last = event.seq
-                        yield _message(event)
+                    if record.position > last:
+                        last = record.position
+                        yield _message(record)
                         last_activity = time.monotonic()
 
         now = time.monotonic()

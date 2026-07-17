@@ -11,7 +11,11 @@ from typing import cast
 
 from fastapi import HTTPException, status
 
-from wildflows.events import Event, FrameExited, FramePushed, parse_event
+from wildflows.dashboard.journal import (
+    DashboardEventDisposition,
+    decode_dashboard_record,
+)
+from wildflows.events import Event, FrameExited, FramePushed
 from wildflows.frame import DispatchRequest, FrameOutcome, GateResult, child_frame_id
 from wildflows.projection import CallProjection, FrameProjection, RunProjection
 
@@ -40,6 +44,28 @@ class WatchedRepo:
 class JournalSnapshot:
     projection: RunProjection
     events: list[Event]
+    record_count: int
+    not_understood_event_kinds: tuple[str, ...]
+    newer_journal_versions: tuple[int, ...]
+    understood_event_kinds: frozenset[str]
+    no_op_event_kinds: frozenset[str]
+
+    @property
+    def not_understood_count(self) -> int:
+        return len(self.not_understood_event_kinds) + len(self.newer_journal_versions)
+
+    @property
+    def last_event_seq(self) -> int:
+        return self.record_count - 1
+
+    def compatibility_data(self) -> dict[str, object]:
+        return {
+            "event_count": self.record_count,
+            "understood_event_count": len(self.events),
+            "not_understood_count": self.not_understood_count,
+            "newer_journal_versions": list(self.newer_journal_versions),
+            "last_event_seq": self.last_event_seq,
+        }
 
 
 class DashboardModel:
@@ -79,23 +105,50 @@ class DashboardModel:
     def snapshot(run_dir: Path) -> JournalSnapshot:
         projection = RunProjection()
         events: list[Event] = []
+        not_understood_kinds: list[str] = []
+        newer_versions: set[int] = set()
+        understood_kinds: set[str] = set()
+        no_op_kinds: set[str] = set()
         path = run_dir / "events.ndjson"
         if not path.exists():
-            return JournalSnapshot(projection, events)
+            return JournalSnapshot(
+                projection,
+                events,
+                0,
+                (),
+                (),
+                frozenset(),
+                frozenset(),
+            )
         raw = path.read_bytes()
         complete = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
-        for position, line in enumerate(raw[:complete].splitlines()):
+        lines = raw[:complete].splitlines()
+        for position, line in enumerate(lines):
             decoded = json.loads(line)
             if not isinstance(decoded, dict):
                 raise ValueError(f"journal record {position} is not an object")
-            event = parse_event(cast(dict[str, object], decoded))
-            if event.seq != position:
-                raise ValueError(
-                    f"non-contiguous journal seq {event.seq} at position {position}"
-                )
-            projection.apply(event)
+            record = decode_dashboard_record(cast(dict[str, object], decoded), position)
+            if record.newer_version is not None:
+                newer_versions.add(record.newer_version)
+            if record.event is None or record.disposition is None:
+                not_understood_kinds.append(record.kind)
+                continue
+            event = record.event
             events.append(event)
-        return JournalSnapshot(projection, events)
+            understood_kinds.add(event.kind)
+            if record.disposition is DashboardEventDisposition.PROJECT:
+                projection.apply(event)
+            else:
+                no_op_kinds.add(event.kind)
+        return JournalSnapshot(
+            projection,
+            events,
+            len(lines),
+            tuple(not_understood_kinds),
+            tuple(sorted(newer_versions)),
+            frozenset(understood_kinds),
+            frozenset(no_op_kinds),
+        )
 
     @staticmethod
     def _run_state(projection: RunProjection) -> str:
@@ -132,7 +185,7 @@ class DashboardModel:
                         "state": self._run_state(snapshot.projection),
                         "frames": len(snapshot.projection.frames),
                         "started_at": None if opened is None else opened.started_at,
-                        "event_count": len(snapshot.events),
+                        **snapshot.compatibility_data(),
                     })
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
                     values.append({
@@ -497,6 +550,7 @@ class DashboardModel:
                 }
                 for call in projection.pending_questions()
             ],
+            **snapshot.compatibility_data(),
             "events": [event.model_dump(mode="json") for event in snapshot.events],
             "artifacts": self._artifacts(repo, run_id, run_dir),
             "controls": {"answer": controls},
