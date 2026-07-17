@@ -7,7 +7,11 @@ the engine shows it beside the registry key in frame resource preambles. An entr
 without `description` renders name-only. Every rig may also set a positive integer
 `slots`; omission preserves unlimited active execution. Optional positive
 `gate_timeout_s` bounds only gates called by that rig; omission leaves gate execution
-unbounded by Wildflows. `rigs.yaml` supports:
+unbounded by Wildflows. Treat `slots` as both a capacity control and a spend boundary:
+API-metered rigs on remote or otherwise priced backends should set `slots` to cap
+concurrent spend; omission means unbounded active execution. Local, throughput-bound
+rigs should size `slots` to the hardware that can actually run them concurrently.
+`rigs.yaml` supports:
 
 - `echo`: deterministic no-tool test rig with no kind-specific fields;
 - `shell`: a bounded shell command requiring `template` and positive `timeout_s`;

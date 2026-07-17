@@ -2245,3 +2245,41 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      only the current attempt's total. A timed-out attempt remains durable evidence and
      spend, but can no longer make the next attempt fail immediately with its inherited
      exhaustion.
+
+### Hand-49 calls — forward-readable journals and bounded orchestration spend
+
+177. **A stale dashboard degrades per run instead of rejecting newer journals.** The
+     read-only decoder keeps physical sequence validation, ignores additive fields,
+     projects every known valid event, and skips only unknown or malformed event
+     records. It counts skipped records plus each distinct newer journal version,
+     exposes understood/total counts and newer versions in list/detail payloads, and
+     shows a prominent per-run out-of-date warning. A newer version is normalized only
+     for dashboard parsing; the engine's resume loader remains strict. SSE forwards
+     structurally valid future records and continues tailing without mutating journals.
+
+178. **The engine event union is the dashboard schema-coverage source of truth.** The
+     public event registry is derived from the discriminated `Event` union rather than
+     a copied kind list. Dashboard support is an explicit per-event registration as
+     projected state or a review-visible no-op. One synthetic journal uses every event
+     model's constructor and serializer, exercises every registration, and requires a
+     zero not-understood count; a missing kind fails by name with instructions that the
+     dashboard must learn it before the suite can pass.
+
+179. **CLI rig-schema failures are concise operator errors.** The shared run/resume rig
+     load boundary catches Pydantic validation failures, prints one stderr line naming
+     the resolved config path and every validation message, and returns nonzero without
+     a traceback. Library config loading remains typed and exception-based, and runtime
+     engine failures are not hidden by a broad CLI catch.
+
+180. **Delegation budgets price the complete tree, and verification is a leaf.** A
+     dispatching frame states its intended total fan-out frame count in its own
+     reasoning and stops when that budget is spent. Audit and verification children do
+     not receive subtrees; needing one means the verification task was scoped
+     incorrectly. This makes the existing no-audits-of-audits rule measurable before a
+     seemingly small review grows recursively.
+
+181. **Priced rig slots are concurrent-spend limits; local slots are hardware limits.**
+     Remote or otherwise API-metered rigs set positive `slots` to bound simultaneous
+     cost rather than relying on an unlimited default. Local throughput rigs size the
+     same control to usable hardware concurrency, preserving the scheduler's one
+     capacity vocabulary without conflating price and throughput policy.
