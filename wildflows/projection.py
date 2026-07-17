@@ -49,7 +49,6 @@ class FrameProjection:
     branch: str
     base_commit: str
     worktree: str
-    subtree_deadline: float
     attempt: int = 0
     push_count: int = 0
     outcome: FrameOutcome | None = None
@@ -119,7 +118,6 @@ class RunProjection:
                     branch=event.branch,
                     base_commit=event.base_commit,
                     worktree=event.worktree,
-                    subtree_deadline=event.subtree_deadline,
                 )
                 self.frames[event.frame_id] = current
             current.attempt = event.attempt

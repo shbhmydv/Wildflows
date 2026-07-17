@@ -21,8 +21,8 @@ self-time. On resume, an orphaned active interval subtracts journalled gate wait
 the existing gate timestamps are sufficient and no second gate-clock vocabulary exists.
 
 Each rig may set an optional positive `gate_timeout_s`. It bounds only gates called by
-that rig. Unset means no Wildflows gate ceiling; adapter, subtree, run, and operator
-backstops remain separate. A configured timeout returns exit 124 with
+that rig. Unset means no Wildflows gate ceiling; adapter and operator backstops remain
+separate. A configured timeout returns exit 124 with
 `[timeout] gate exceeded <seconds>s` on stderr.
 
 ### B. Repository-wide fresh-worktree provisioning

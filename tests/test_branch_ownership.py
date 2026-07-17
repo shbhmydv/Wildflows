@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +70,6 @@ def test_fresh_frame_rejects_preexisting_branch_without_adopting_it(
             prompt="must not execute",
             skills=[],
             base_commit=base,
-            subtree_deadline=time.time() + 30,
         )
 
     assert not marker.exists()

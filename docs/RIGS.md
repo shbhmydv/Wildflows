@@ -26,7 +26,7 @@ self-time clock while retaining its active slot lease because the resident worke
 Gate waits are bounded only when that rig sets `gate_timeout_s`; timeout returns exit 124
 and a clear stderr marker. The engine reaps a worker that exhausts self-time. Adapter
 commands receive a `3 × timeout_s` crash backstop rather than the authoritative budget;
-run/subtree backstops also remain independent of gate configuration.
+that adapter crash backstop remains independent of gate configuration.
 
 The script contract remains:
 

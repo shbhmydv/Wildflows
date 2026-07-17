@@ -56,7 +56,6 @@ def test_parallel_owned_paths_include_pre_move_intents(
             branch=engine.repository.frame_branch(frame_id),
             base_commit=base,
             worktree=str(tmp_path / frame_id),
-            subtree_deadline=9999999999.0,
         ))
     receipt = CommitReceipt(sha="a" * 40, paths=["shared.txt"])
     engine.journal.append(FrameIntegrating(

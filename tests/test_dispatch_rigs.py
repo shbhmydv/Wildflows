@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -44,7 +43,6 @@ def _active_root(
         branch=branch,
         base_commit=base,
         worktree=str(worktree.path),
-        subtree_deadline=time.time() + 60,
     ))
     with engine._active_lock:  # noqa: SLF001 - establish a live tool caller
         engine._active[Engine.ROOT_FRAME_ID] = worktree  # noqa: SLF001

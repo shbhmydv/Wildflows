@@ -166,7 +166,6 @@ def test_crash_relaunch_starts_fresh_clock_after_prior_attempt_exhaustion(
         branch=branch,
         base_commit=base,
         worktree=str(tmp_path / "lost-crash-worktree"),
-        subtree_deadline=time.time() + 60,
     ))
     first.journal.append(FrameSlotAcquired(
         run_id=first.run_id,

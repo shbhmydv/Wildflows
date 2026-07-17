@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,7 +115,6 @@ def test_integration_refuses_directly_crafted_new_out_of_tree_symlink_commit(
         branch=parent_branch,
         base_commit=base,
         worktree=str(parent.path),
-        subtree_deadline=time.time() + 60,
     ))
     child_id = "f0.c0.t0"
     child_branch = engine.repository.frame_branch(child_id)
@@ -136,7 +134,6 @@ def test_integration_refuses_directly_crafted_new_out_of_tree_symlink_commit(
         branch=child_branch,
         base_commit=base,
         worktree=str(child.path),
-        subtree_deadline=time.time() + 60,
     ))
     outside = tmp_path / "outside"
     outside.mkdir()

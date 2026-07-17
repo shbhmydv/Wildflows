@@ -60,7 +60,6 @@ class FramePushed(_Header):
     branch: str
     base_commit: str
     worktree: str
-    subtree_deadline: float
 
 
 class WorktreeProvisioned(_Header):

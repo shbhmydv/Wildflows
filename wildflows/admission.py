@@ -1,7 +1,6 @@
 """Admission rails enforced at every v2 dispatch call boundary."""
 from __future__ import annotations
 
-import time
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -14,7 +13,6 @@ AdmissionCode = Literal[
     "breadth_cap",
     "subtree_frame_cap",
     "subtree_spend_cap",
-    "subtree_time_cap",
     "rig_not_allowed",
 ]
 
@@ -24,7 +22,6 @@ class AdmissionPolicy(BaseModel):
     max_breadth: int = Field(default=8, ge=1)
     max_subtree_frames: int = Field(default=64, ge=1)
     max_subtree_spend: float = Field(default=64.0, gt=0)
-    subtree_timeout_s: float = Field(default=3600.0, gt=0)
     rig_costs: dict[str, float] = Field(default_factory=dict)
 
     @field_validator("rig_costs")
@@ -62,36 +59,38 @@ def admit_dispatch(
     caller_rig: str | None = None,
     subtree_frames: int,
     subtree_spend: float,
-    subtree_deadline: float,
     policy: AdmissionPolicy,
     registry: RigRegistry,
-    now: float | None = None,
 ) -> tuple[str, ...]:
     """Refuse a dispatch before effects and return each task's resolved rig."""
-    observed = time.time() if now is None else now
     child_depth = caller_depth + 1
     if child_depth > policy.max_depth:
         raise _refusal(
             "depth_cap",
-            f"child depth {child_depth} exceeds cap {policy.max_depth}",
+            (
+                f"child depth {child_depth} exceeds max_depth={policy.max_depth} "
+                "(--max-depth)"
+            ),
             registry,
         )
     if len(request.tasks) > policy.max_breadth:
         raise _refusal(
             "breadth_cap",
-            f"dispatch breadth {len(request.tasks)} exceeds cap {policy.max_breadth}",
+            (
+                f"dispatch breadth {len(request.tasks)} exceeds "
+                f"max_breadth={policy.max_breadth} (--max-breadth)"
+            ),
             registry,
         )
-    if subtree_frames + len(request.tasks) > policy.max_subtree_frames:
+    projected_frames = subtree_frames + len(request.tasks)
+    if projected_frames > policy.max_subtree_frames:
         raise _refusal(
             "subtree_frame_cap",
-            f"subtree frames would exceed cap {policy.max_subtree_frames}",
-            registry,
-        )
-    if observed >= subtree_deadline:
-        raise _refusal(
-            "subtree_time_cap",
-            "caller subtree deadline has elapsed",
+            (
+                f"subtree frames {projected_frames} would exceed "
+                f"max_subtree_frames={policy.max_subtree_frames} "
+                "(--max-subtree-frames)"
+            ),
             registry,
         )
     try:
@@ -101,12 +100,24 @@ def admit_dispatch(
             request.rig, caller_rig or "", len(request.tasks)
         )
     except KeyError as exc:
-        raise _refusal("rig_not_allowed", exc.args[0], registry) from exc
-    unknown = [rig for rig in task_rigs if rig not in registry]
-    if unknown:
+        allowed = ", ".join(registry.ordered_names) or "(none)"
         raise _refusal(
             "rig_not_allowed",
-            f"rig {unknown[0]!r} is not in this run's allowlist",
+            (
+                f"selected rig {request.rig!r} cannot resolve against "
+                f"rig_allowlist=[{allowed}] (rigs.yaml): {exc.args[0]}"
+            ),
+            registry,
+        ) from exc
+    unknown = [rig for rig in task_rigs if rig not in registry]
+    if unknown:
+        allowed = ", ".join(registry.ordered_names) or "(none)"
+        raise _refusal(
+            "rig_not_allowed",
+            (
+                f"selected rig {unknown[0]!r} is not in "
+                f"rig_allowlist=[{allowed}] (rigs.yaml)"
+            ),
             registry,
         )
     projected = subtree_spend + sum(
@@ -115,7 +126,11 @@ def admit_dispatch(
     if projected > policy.max_subtree_spend:
         raise _refusal(
             "subtree_spend_cap",
-            f"subtree spend {projected:g} would exceed cap {policy.max_subtree_spend:g}",
+            (
+                f"subtree spend {projected:g} would exceed "
+                f"max_subtree_spend={policy.max_subtree_spend:g} "
+                "(--max-subtree-spend)"
+            ),
             registry,
         )
     return task_rigs

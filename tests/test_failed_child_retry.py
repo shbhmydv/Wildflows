@@ -206,7 +206,6 @@ def test_pending_retry_replay_does_not_relaunch_an_already_failed_attempt(
         branch=root_branch,
         base_commit=base,
         worktree=str(root_worktree.path),
-        subtree_deadline=4_102_444_800.0,
     ))
     child_id = "f0.c7.t0"
     child_branch = engine.repository.frame_branch(child_id)
@@ -226,7 +225,6 @@ def test_pending_retry_replay_does_not_relaunch_an_already_failed_attempt(
         branch=child_branch,
         base_commit=base,
         worktree=str(first_worktree.path),
-        subtree_deadline=4_102_444_800.0,
     ))
     (first_worktree.path / "prior.txt").write_text("prior commit\n")
     first_head = engine.repository.commit_all(
@@ -274,7 +272,6 @@ def test_pending_retry_replay_does_not_relaunch_an_already_failed_attempt(
         branch=child_branch,
         base_commit=base,
         worktree=str(retry_worktree.path),
-        subtree_deadline=4_102_444_800.0,
     ))
     # A retry interrupted after push must accept the prior attempt's journalled
     # exit head as branch evidence and warm-relaunch from it on resume.

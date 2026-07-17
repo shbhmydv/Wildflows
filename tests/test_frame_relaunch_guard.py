@@ -24,8 +24,6 @@ from wildflows.rig import RigRegistry
 from wildflows.workspace import FrameWorktree, Repository
 
 
-_FUTURE_DEADLINE = 4_102_444_800.0
-
 
 class ObservableRig:
     """Records any relaunch that reaches a rig."""
@@ -71,7 +69,6 @@ def _push(
         branch=branch,
         base_commit=base_commit,
         worktree=str(worktree),
-        subtree_deadline=_FUTURE_DEADLINE,
     ))
 
 

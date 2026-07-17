@@ -45,7 +45,6 @@ def _pushed(
         branch=worktree.branch,
         base_commit=worktree.base_commit,
         worktree=str(worktree.path),
-        subtree_deadline=9_999_999_999.0,
     ))
 
 

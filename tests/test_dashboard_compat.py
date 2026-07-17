@@ -245,7 +245,6 @@ def _every_dashboard_event() -> list[Event]:
             branch="wildflows/frame",
             base_commit="a" * 40,
             worktree="/worktrees/f0",
-            subtree_deadline=100.0,
         ),
         WorktreeProvisioned(
             run_id=run_id,

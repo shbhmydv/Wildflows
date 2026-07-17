@@ -58,7 +58,6 @@ def _push_root(engine: Engine, worktree: Path) -> str:
         branch=engine.repository.frame_branch(Engine.ROOT_FRAME_ID),
         base_commit=base,
         worktree=str(worktree),
-        subtree_deadline=9_999_999_999.0,
     ))
     return base
 
@@ -220,7 +219,6 @@ def test_frame_prompt_orders_assigned_skill_texts_before_job_and_resources(
             prompt="implement the assigned task",
             skills=assigned,
             base_commit=base,
-            subtree_deadline=9_999_999_999.0,
         )
 
     preamble = (
@@ -319,7 +317,6 @@ def test_child_resource_preamble_uses_effective_attenuated_rigs_and_limits(
         branch=engine.repository.frame_branch(Engine.ROOT_FRAME_ID),
         base_commit=base,
         worktree=str(repo),
-        subtree_deadline=9_999_999_999.0,
     ))
     root_prompt = engine._frame_prompt(  # noqa: SLF001 - prompt contract regression
         Engine.ROOT_FRAME_ID, "root job", [], repo
@@ -342,7 +339,6 @@ def test_child_resource_preamble_uses_effective_attenuated_rigs_and_limits(
         branch=engine.repository.frame_branch(child_id),
         base_commit=base,
         worktree=str(repo),
-        subtree_deadline=9_999_999_999.0,
     ))
     child_prompt = engine._frame_prompt(  # noqa: SLF001 - attenuation regression
         child_id, "bounded child task", [], repo
@@ -402,6 +398,11 @@ def test_pre_resources_journal_fixture_replays_without_call_hash_conflict(
     request = DispatchRequest(
         tasks=["bounded child"], rig="capture", skills=[["long"]]
     )
+    opened = engine.projection.opened
+    assert opened is not None
+    assert "subtree_timeout_s" not in opened.policy.model_dump()
+    root = engine.projection.frame(Engine.ROOT_FRAME_ID)
+    assert not hasattr(root, "subtree_deadline")
     durable_call = engine.projection.call(Engine.ROOT_FRAME_ID, 0)
     assert durable_call is not None
     assert durable_call.call_hash == call_hash("dispatch", request)

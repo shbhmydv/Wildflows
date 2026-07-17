@@ -267,7 +267,6 @@ def _durably_pending_ask(
         branch=branch,
         base_commit=base,
         worktree=str(worktree.path),
-        subtree_deadline=time.time() + 60,
     ))
     first.journal.append(Asked(
         run_id=first.run_id,

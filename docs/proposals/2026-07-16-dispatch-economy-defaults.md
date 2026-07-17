@@ -162,10 +162,9 @@ Two engine changes that are resource facts, not orchestration policy:
 4. ~~Rig concurrency as an AdmissionPolicy cap?~~ Superseded by F: per-rig
    `slots:` in rigs.yaml with an engine-side queue. Admission rails stay
    structural (depth/breadth/subtree); scheduling is the engine's job.
-5. Self-time accounting (F) interacts with `subtree_timeout_s` in
-   AdmissionPolicy: subtree wall-clock caps should probably stay wall-clock
-   (they bound owner waiting time), while per-frame budgets become self-time.
-   Confirm both coexist.
+5. ~~Keep a subtree wall-clock cap alongside self-time accounting?~~ Resolved by
+   Hand-50: no. Time containment belongs to each rig attempt's self-time budget;
+   legitimate long-running trees have no ancestor-age deadline.
 6. **Deadlock evidence for F** (found live, 2026-07-16 smoke): the local rig's
    flock lane pinning (`_pin_backend.sh`) holds a frame's backend lane for the
    frame's whole lifetime, INCLUDING while parked on dispatch. At depth 3 on

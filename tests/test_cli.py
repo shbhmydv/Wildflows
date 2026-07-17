@@ -5,6 +5,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from wildflows.__main__ import _parser
+
+
+def test_cli_rejects_removed_subtree_timeout_flag() -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args([
+            "run",
+            "job.md",
+            "--repo",
+            "repo",
+            "--subtree-timeout",
+            "3600",
+        ])
+
 
 def test_cli_rig_validation_error_is_one_clear_line_without_traceback(
     repo: Path, tmp_path: Path

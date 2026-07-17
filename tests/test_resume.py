@@ -128,7 +128,6 @@ def test_resume_accepts_stopped_and_run_interrupted_journals(
         branch=branch,
         base_commit=base,
         worktree=str(tmp_path / "lost-worktree"),
-        subtree_deadline=time.time() + 60,
     ))
     if terminal_event:
         first.journal.append(RunInterrupted(
@@ -347,7 +346,6 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
         branch=root_branch,
         base_commit=base,
         worktree=str(worktrees / "lost-root"),
-        subtree_deadline=9_999_999_999.0,
     ))
     digest = call_hash("dispatch", request)
     child_rig = request.rig
@@ -387,7 +385,6 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
         branch=completed_branch,
         base_commit=base,
         worktree=str(completed_worktree.path),
-        subtree_deadline=9_999_999_999.0,
     ))
     first.journal.append(FrameExited(
         run_id=first.run_id,
@@ -416,7 +413,6 @@ def test_resume_replays_only_unfinished_parallel_child_without_barrier(
         branch=unfinished_branch,
         base_commit=base,
         worktree=str(worktrees / "lost-unfinished-child"),
-        subtree_deadline=9_999_999_999.0,
     ))
 
     def unexpected_barrier(parties: int) -> NoReturn:

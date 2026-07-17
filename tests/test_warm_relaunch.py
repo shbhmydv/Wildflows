@@ -10,8 +10,6 @@ from wildflows.frame import FrameResult, FrameRuntime
 from wildflows.rig import RigRegistry, ScriptRig
 
 
-_FUTURE_DEADLINE = 4_102_444_800.0
-
 
 class _PromptRig:
     timeout_s = 30.0
@@ -84,7 +82,6 @@ print("relaunched")
         branch=branch,
         base_commit=base,
         worktree=str(interrupted.path),
-        subtree_deadline=_FUTURE_DEADLINE,
     ))
     initial.journal.append(WorkerReaped(
         run_id=run_id,

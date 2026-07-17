@@ -103,7 +103,7 @@ def _engine(
         run_id=f"scheduler-{mode}",
         root_rig="local",
         root_prompt=mode,
-        policy=AdmissionPolicy(max_depth=4, subtree_timeout_s=10),
+        policy=AdmissionPolicy(max_depth=4),
         worktrees_root=tmp_path / f"worktrees-{mode}",
     )
 

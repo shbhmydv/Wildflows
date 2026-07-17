@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -70,7 +69,6 @@ def test_nested_admission_holds_projection_lock_through_reservation(
         worktrees_root=tmp_path / "worktrees",
     )
     base = engine.repository.branch_tip()
-    deadline = time.time() + 60
 
     def push(frame_id: str, parent_frame_id: str | None, depth: int) -> None:
         engine.journal.append(FramePushed(
@@ -86,7 +84,6 @@ def test_nested_admission_holds_projection_lock_through_reservation(
             branch=engine.repository.frame_branch(frame_id),
             base_commit=base,
             worktree=str(tmp_path / frame_id),
-            subtree_deadline=deadline,
         ))
 
     push(root_frame_id, None, 0)

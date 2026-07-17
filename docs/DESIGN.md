@@ -2290,3 +2290,25 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      missing projection state. It adds another not-understood count and replay proceeds;
      unrelated frames, calls, and events continue to project without copying the growing
      projection or hiding the run.
+
+### Hand-50 calls — per-attempt time containment and self-describing boundaries
+
+183. **No subtree wall-clock deadline (supersedes the time-cap portions of 101, 110,
+     and 164).** Time containment belongs only to each rig attempt's self-time budget:
+     it rescues a stuck worker/model, resets for every attempt, and excludes parked
+     dispatch/ask and gate waits as already specified. A healthy tree may run for any
+     wall-clock duration. The subtree timeout policy/CLI surface, admission code,
+     frame-event/projection deadline, inheritance, prompt filtering, and relaunch check
+     are deleted; structural frame/spend/depth/breadth rails remain. Old v2 journals
+     carrying the removed policy and frame fields resume through Pydantic's existing
+     extra-field-ignore path (`_Header` explicitly configures `extra="ignore"`, and the
+     nested policy model uses the same default behavior); no compatibility shadow field
+     is retained. The unchanged event-kind union keeps dashboard schema coverage intact.
+
+184. **Admission refusals carry their own policy diagnosis.** Every remaining typed
+     admission refusal states the observed depth, breadth, projected subtree frame/spend,
+     or selected rig; names the governing policy field (or rig allowlist); gives its
+     configured value; and identifies the corresponding CLI flag or `rigs.yaml` source.
+     The complete registry allowlist remains appended in operator order. A caller and a
+     journal reader can therefore correct or dispose the request without engine-source
+     lookup.

@@ -146,7 +146,6 @@ def test_resume_uses_gate_timestamps_to_exclude_an_orphaned_wait(
         branch=initial.repository.frame_branch("f0"),
         base_commit=base,
         worktree=str(tmp_path / "interrupted-worktree"),
-        subtree_deadline=200.0,
         ts=100.0,
     ))
     initial.journal.append(FrameSlotAcquired(

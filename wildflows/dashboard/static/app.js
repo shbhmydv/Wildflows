@@ -284,7 +284,6 @@ function renderHeader() {
     ["breadth", policy.max_breadth],
     ["frames", policy.max_subtree_frames],
     ["spend", policy.max_subtree_spend],
-    ["subtree", formatDuration(policy.subtree_timeout_s)],
   ];
   const target = $("#cap-list");
   target.replaceChildren();

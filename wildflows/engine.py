@@ -814,7 +814,6 @@ class Engine:
                     prompt=opened.root_prompt,
                     skills=root_skills,
                     base_commit=opened.base_commit,
-                    subtree_deadline=opened.started_at + self.policy.subtree_timeout_s,
                 )
             if root.outcome == "ok" and root.integrated is None:
                 try:
@@ -1311,7 +1310,6 @@ class Engine:
                 prompt=child.prompt,
                 skills=list(child.skills),
                 base_commit=child.base_commit,
-                subtree_deadline=child.subtree_deadline,
                 cancellation=cancellation,
             )
         result = self._finish_child(child, frame, worktree, owned=set())
@@ -1369,11 +1367,7 @@ class Engine:
         frame: FrameProjection,
         headroom: _AdmissionHeadroom,
     ) -> tuple[str, ...]:
-        if (
-            headroom.remaining_depth == 0
-            or headroom.remaining_frames == 0
-            or time.time() >= frame.subtree_deadline
-        ):
+        if headroom.remaining_depth == 0 or headroom.remaining_frames == 0:
             return ()
         return tuple(
             name
@@ -1442,7 +1436,6 @@ class Engine:
                     caller_rig=frame.rig,
                     subtree_frames=frames,
                     subtree_spend=spend,
-                    subtree_deadline=ancestor.subtree_deadline,
                     policy=self.policy,
                     registry=self.registry,
                 )
@@ -1669,7 +1662,6 @@ class Engine:
             prompt=task,
             skills=skills,
             base_commit=existing.base_commit if existing is not None else base_commit,
-            subtree_deadline=parent.subtree_deadline,
             start_barrier=start_barrier,
             cancellation=cancellation,
         )
@@ -2328,7 +2320,6 @@ class Engine:
         prompt: str,
         skills: list[str],
         base_commit: str,
-        subtree_deadline: float,
         start_barrier: threading.Barrier | None = None,
         cancellation: threading.Event | None = None,
     ) -> FrameProjection:
@@ -2386,7 +2377,6 @@ class Engine:
             branch=branch,
             base_commit=base_commit,
             worktree=str(worktree.path),
-            subtree_deadline=subtree_deadline,
         )
         if (
             existing is None

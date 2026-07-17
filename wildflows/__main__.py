@@ -27,7 +27,6 @@ def _common(parser: argparse.ArgumentParser, *, resume: bool) -> None:
     parser.add_argument("--max-breadth", type=int, default=8)
     parser.add_argument("--max-subtree-frames", type=int, default=64)
     parser.add_argument("--max-subtree-spend", type=float, default=64.0)
-    parser.add_argument("--subtree-timeout", type=float, default=3600.0)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -105,7 +104,6 @@ def main(argv: list[str] | None = None) -> int:
         max_breadth=args.max_breadth,
         max_subtree_frames=args.max_subtree_frames,
         max_subtree_spend=args.max_subtree_spend,
-        subtree_timeout_s=args.subtree_timeout,
     )
     run = Run(
         workdir=args.repo,
