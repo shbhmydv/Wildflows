@@ -2283,3 +2283,10 @@ in-context senior; disk-journal "resume" of a mind is not resume (owner:
      cost rather than relying on an unlimited default. Local throughput rigs size the
      same control to usable hardware concurrency, preserving the scheduler's one
      capacity vocabulary without conflating price and throughput policy.
+
+182. **Tolerant replay contains dependency loss as well as parse loss.** If a skipped
+     malformed or future record supplied a frame or call prerequisite, a later known
+     return/lifecycle event is still retained for journal display but is not applied to
+     missing projection state. It adds another not-understood count and replay proceeds;
+     unrelated frames, calls, and events continue to project without copying the growing
+     projection or hiding the run.

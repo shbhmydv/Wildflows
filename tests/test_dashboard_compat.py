@@ -177,6 +177,25 @@ def test_malformed_known_event_counts_as_not_understood_and_replay_continues(
     assert len(_object(detail["frames"])) == 10
 
 
+def test_projection_dependency_on_malformed_event_also_degrades_without_dying(
+    tmp_path: Path,
+) -> None:
+    records = _fixture_records()
+    malformed = next(record for record in records if record["kind"] == "gate_called")
+    malformed.pop("request")
+    repo = tmp_path / "repo"
+    _write_records(repo, records)
+    client = TestClient(create_app(repo))
+
+    listing = _objects(_payload(client.get("/api/runs"))["runs"])
+    assert listing[0]["state"] == "parked"
+    assert listing[0]["not_understood_count"] == 2
+    detail = _payload(client.get(_run_url(client)))
+    assert detail["not_understood_count"] == 2
+    assert detail["understood_event_count"] == 49
+    assert len(_object(detail["frames"])) == 10
+
+
 def test_wholly_newer_journal_version_is_one_visible_compatibility_issue(
     tmp_path: Path,
 ) -> None:

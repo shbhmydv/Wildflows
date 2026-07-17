@@ -13,6 +13,7 @@ from fastapi import HTTPException, status
 
 from wildflows.dashboard.journal import (
     DashboardEventDisposition,
+    dashboard_projection_ready,
     decode_dashboard_record,
 )
 from wildflows.events import Event, FrameExited, FramePushed
@@ -135,11 +136,14 @@ class DashboardModel:
                 continue
             event = record.event
             events.append(event)
-            understood_kinds.add(event.kind)
             if record.disposition is DashboardEventDisposition.PROJECT:
+                if not dashboard_projection_ready(projection, event):
+                    not_understood_kinds.append(event.kind)
+                    continue
                 projection.apply(event)
             else:
                 no_op_kinds.add(event.kind)
+            understood_kinds.add(event.kind)
         return JournalSnapshot(
             projection,
             events,

@@ -36,6 +36,7 @@ from wildflows.events import (
     WorktreeProvisioned,
     parse_event,
 )
+from wildflows.projection import RunProjection
 
 
 class DashboardEventDisposition(Enum):
@@ -73,6 +74,24 @@ DASHBOARD_EVENT_DISPOSITIONS: Mapping[
     RunFinished: DashboardEventDisposition.PROJECT,
 })
 # Review-visible registration of every event the dashboard understands.
+
+
+def dashboard_projection_ready(projection: RunProjection, event: Event) -> bool:
+    """Whether state required by a dependent event survived tolerant replay."""
+    if isinstance(event, (DispatchReturned, GateReturned, Answered)):
+        return (event.frame_id, event.call_index) in projection.calls
+    if isinstance(event, (
+        FrameSlotQueued,
+        FrameSlotAcquired,
+        FrameSlotReleased,
+        FrameRelaunchBlocked,
+        FrameExited,
+        FrameIntegrating,
+        FrameIntegrated,
+        FramePopped,
+    )):
+        return event.frame_id in projection.frames
+    return True
 
 
 @dataclass(frozen=True)
