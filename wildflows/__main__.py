@@ -4,7 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+import sys
 from pathlib import Path
+
+from pydantic import ValidationError
 
 from wildflows.admission import AdmissionPolicy
 from wildflows.rigconfig import load_rigs_config
@@ -44,6 +47,15 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _config_validation_message(path: Path, error: ValidationError) -> str:
+    details: list[str] = []
+    for item in error.errors(include_url=False):
+        location = ".".join(str(part) for part in item["loc"])
+        message = " ".join(item["msg"].splitlines())
+        details.append(f"{location}: {message}" if location else message)
+    return f"rig config error in {path.resolve()}: {'; '.join(details)}"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "dash":
@@ -79,7 +91,11 @@ def main(argv: list[str] | None = None) -> int:
 
     job: Path = args.job
     rigs: Path = args.rigs or job.parent / "rigs.yaml"
-    registry, configured_notify = load_rigs_config(rigs)
+    try:
+        registry, configured_notify = load_rigs_config(rigs)
+    except ValidationError as exc:
+        print(_config_validation_message(rigs, exc), file=sys.stderr)
+        return 2
     notify = args.notify if args.notify is not None else configured_notify
     notify_command = None if notify is None else shlex.split(notify)
     if notify is not None and not notify_command:
