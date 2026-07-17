@@ -6,6 +6,44 @@ import sys
 from pathlib import Path
 
 
+def test_cli_rig_validation_error_is_one_clear_line_without_traceback(
+    repo: Path, tmp_path: Path
+) -> None:
+    job = tmp_path / "job.md"
+    job.write_text("Do the root job.\n", encoding="utf-8")
+    rigs = tmp_path / "rigs.yaml"
+    rigs.write_text(
+        "kinds:\n  review: local\nrigs:\n  echo:\n    kind: echo\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "wildflows",
+            "run",
+            str(job),
+            "--repo",
+            str(repo),
+            "--rigs",
+            str(rigs),
+            "--root-rig",
+            "echo",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr.count("\n") == 1
+    assert str(rigs) in result.stderr
+    assert "kinds routing was removed; pass rig per task in dispatch" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_cli_starts_root_frame_and_resume_reuses_finished_run(
     repo: Path, tmp_path: Path
 ) -> None:

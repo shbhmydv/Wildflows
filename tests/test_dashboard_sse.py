@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from pydantic import ValidationError
 
 from wildflows.dashboard.sse import tail_events
 from wildflows.events import RunFinished
@@ -154,13 +153,45 @@ def test_tail_rejects_invalid_complete_record(tmp_path: Path) -> None:
         stream = tail_events(path, poll_interval=0.001, heartbeat_interval=1.0)
         try:
             assert await asyncio.wait_for(anext(stream), timeout=1)
-            with pytest.raises(ValidationError):
+            with pytest.raises(ValueError, match="kind"):
                 await anext(stream)
             return "validated"
         finally:
             await stream.aclose()
 
     assert asyncio.run(scenario()) == "validated"
+
+
+def test_tail_emits_unknown_future_kind_and_continues(tmp_path: Path) -> None:
+    path = tmp_path / "events.ndjson"
+    future = {
+        "version": 3,
+        "seq": 1,
+        "ts": 2.0,
+        "run_id": "run",
+        "kind": "future_quantum_checkpoint",
+        "payload": {"opaque": True},
+    }
+    future_record = (json.dumps(future, separators=(",", ":")) + "\n").encode()
+    path.write_bytes(_record(0, "before") + future_record + _record(2, "after"))
+
+    async def scenario() -> list[str]:
+        stream = tail_events(path, poll_interval=0.001, heartbeat_interval=1.0)
+        try:
+            return [
+                await asyncio.wait_for(anext(stream), timeout=1)
+                for _ in range(3)
+            ]
+        finally:
+            await stream.aclose()
+
+    messages = asyncio.run(scenario())
+    assert [_payload(message)["kind"] for message in messages] == [
+        "run_finished",
+        "future_quantum_checkpoint",
+        "run_finished",
+    ]
+    assert [_payload(message)["seq"] for message in messages] == [0, 1, 2]
 
 
 def test_tail_heartbeats_for_absent_journal_and_allows_cancellation(tmp_path: Path) -> None:
